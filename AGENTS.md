@@ -58,12 +58,30 @@ plan in `docs/agents/plans/`.
 
 - **Rust edition 2024.** Workspace lints in `Cargo.toml` are authoritative
   (`unsafe_code = deny`, `clippy::all = warn`). Don't relax them locally.
-- **Errors:** `thiserror` for library errors at crate boundaries. No `anyhow` in
-  library code; `anyhow` is acceptable only in the top-level `kino` binary.
+- **Errors:** Each library crate defines its own `Error` enum with `thiserror`.
+  Variant `#[error("...")]` messages start lowercase, no trailing period. No
+  `anyhow` in library code; it's allowed only in the top-level `kino` binary.
+  No `unwrap`/`expect` outside tests — clippy's `unwrap_used` and `expect_used`
+  workspace lints enforce this. There is no shared workspace-wide `Error` type;
+  errors at crate boundaries are the boundary.
 - **Logging:** `tracing` for everything. Human-readable in dev, JSON in prod,
   env-controlled. Don't `println!` in non-binary crates.
-- **Time + ids:** UUID v7 for ids, UTC `OffsetDateTime` for timestamps. These types
-  live in `kino-core` once added — depend on them, don't redefine them.
+- **Time + ids:** Use `kino_core::Id` (UUID v7) and `kino_core::Timestamp` (UTC).
+  Don't redefine them, don't construct ids with `Uuid::new_v4`, don't read clocks
+  with `OffsetDateTime::now_utc()` directly — the newtypes own the invariants.
+- **Docstrings & comments:** Every public item in a library crate gets a `///`
+  doc comment — purpose and any non-obvious invariant ("always UTC", "always
+  v7"), not the type signature. Every library crate gets a `//!` crate-level
+  doc explaining its role. Inline `//` comments stay rare: the default is none,
+  and one is added only when *why* is non-obvious (a constraint, a workaround,
+  a surprising choice). Don't narrate *what* the code does. Tests and the
+  top-level `kino` binary follow a lighter standard.
+- **Configuration:** `kino_core::Config` is the single config type. The loader
+  reads a TOML file (path: `KINO_CONFIG` env var, else `./kino.toml`) and layers
+  `KINO_`-prefixed env vars on top. Nesting uses double underscores. Documented
+  env vars: `KINO_CONFIG`, `KINO_DATABASE_PATH`, `KINO_LIBRARY_ROOT`,
+  `KINO_LOG_LEVEL`, `KINO_SERVER__LISTEN`. The reference TOML lives at
+  `kino.toml.example` in the repo root.
 - **Tests:** colocated with the code (`#[cfg(test)] mod tests`) or under a crate's
   `tests/` directory for integration. A change isn't done until tests pass.
 

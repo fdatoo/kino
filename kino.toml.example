@@ -1,0 +1,13 @@
+# Path to the SQLite database file. Required.
+database_path = "/var/lib/kino/kino.db"
+
+# Root directory of the on-disk media library. Required.
+library_root = "/srv/media"
+
+# Logging filter. Optional. Defaults to "info".
+# Accepts any tracing-subscriber EnvFilter expression.
+log_level = "info"
+
+[server]
+# Address the server binds to. Optional. Defaults to 127.0.0.1:7777.
+listen = "127.0.0.1:7777"
