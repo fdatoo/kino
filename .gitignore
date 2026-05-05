@@ -1,2 +1,26 @@
-/target
+# Rust
+/target/
+**/*.rs.bk
+
+# macOS
 .DS_Store
+
+# IDEs / editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local SQLite databases
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local config / env
+.env
+.env.local
