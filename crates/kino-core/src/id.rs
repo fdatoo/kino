@@ -15,14 +15,9 @@ pub struct Id(uuid::Uuid);
 
 impl Id {
     /// Generate a fresh UUID v7 id from the current time.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7())
-    }
-}
-
-impl Default for Id {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
