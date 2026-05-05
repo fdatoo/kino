@@ -2,8 +2,8 @@
 
 // pub mod config;
 pub mod id;
-// pub mod time;
+pub mod time;
 
 // pub use config::Config;
 pub use id::Id;
-// pub use time::Timestamp;
+pub use time::Timestamp;
