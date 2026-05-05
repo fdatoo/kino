@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/kino-core",
+    "crates/kino-db",
+    "crates/kino-fulfillment",
+    "crates/kino-library",
+    "crates/kino-transcode",
+    "crates/kino-server",
+    "crates/kino-admin",
+    "crates/kino-cli",
+    "crates/kino",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_imports = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
