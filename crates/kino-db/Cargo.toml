@@ -8,8 +8,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+kino-core = { path = "../kino-core" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true }
