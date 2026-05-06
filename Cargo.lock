@@ -689,7 +689,9 @@ dependencies = [
 name = "kino-db"
 version = "0.1.0"
 dependencies = [
+ "kino-core",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
