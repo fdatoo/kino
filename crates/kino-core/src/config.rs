@@ -34,6 +34,22 @@ pub struct Config {
     /// Defaults to `"info"`.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Logging output format. Defaults to [`LogFormat::Pretty`].
+    #[serde(default)]
+    pub log_format: LogFormat,
+}
+
+/// Supported tracing subscriber output formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable formatter for local development.
+    #[default]
+    Pretty,
+
+    /// Newline-delimited JSON formatter for production.
+    Json,
 }
 
 /// HTTP/gRPC server settings.
@@ -108,9 +124,13 @@ impl Config {
             })?;
             fig = fig.merge(Toml::file(&path));
         }
-        fig.merge(Env::prefixed("KINO_").split("__").ignore(&["CONFIG"]))
-            .extract::<Config>()
-            .map_err(|e| ConfigError::Invalid(Box::new(e)))
+        fig.merge(
+            Env::prefixed("KINO_")
+                .split("__")
+                .ignore(&["CONFIG", "LOG"]),
+        )
+        .extract::<Config>()
+        .map_err(|e| ConfigError::Invalid(Box::new(e)))
     }
 
     /// Load configuration from an explicit file path (skips `KINO_CONFIG`).
@@ -123,7 +143,11 @@ impl Config {
         })?;
         Figment::new()
             .merge(Toml::file(path))
-            .merge(Env::prefixed("KINO_").split("__").ignore(&["CONFIG"]))
+            .merge(
+                Env::prefixed("KINO_")
+                    .split("__")
+                    .ignore(&["CONFIG", "LOG"]),
+            )
             .extract::<Config>()
             .map_err(|e| ConfigError::Invalid(Box::new(e)))
     }
@@ -158,6 +182,7 @@ mod tests {
             assert_eq!(cfg.database_path, PathBuf::from("/var/lib/kino/kino.db"));
             assert_eq!(cfg.library_root, PathBuf::from("/srv/media"));
             assert_eq!(cfg.log_level, "debug");
+            assert_eq!(cfg.log_format, LogFormat::Pretty);
             assert_eq!(
                 cfg.server.listen,
                 "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
@@ -172,6 +197,7 @@ mod tests {
             jail.create_file("kino.toml", REQUIRED_ONLY_TOML)?;
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.log_level, "info");
+            assert_eq!(cfg.log_format, LogFormat::Pretty);
             assert_eq!(
                 cfg.server.listen,
                 "127.0.0.1:7777".parse::<SocketAddr>().unwrap()
@@ -228,6 +254,28 @@ mod tests {
                 cfg.server.listen,
                 "0.0.0.0:8080".parse::<SocketAddr>().unwrap()
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn env_override_selects_log_format() {
+        Jail::expect_with(|jail| {
+            jail.create_file("kino.toml", REQUIRED_ONLY_TOML)?;
+            jail.set_env("KINO_LOG_FORMAT", "json");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.log_format, LogFormat::Json);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn kino_log_is_runtime_filter_not_config_field() {
+        Jail::expect_with(|jail| {
+            jail.create_file("kino.toml", REQUIRED_ONLY_TOML)?;
+            jail.set_env("KINO_LOG", "debug");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.log_level, "info");
             Ok(())
         });
     }

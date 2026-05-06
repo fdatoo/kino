@@ -83,7 +83,8 @@ plan in `docs/agents/plans/`.
   reads a TOML file (path: `KINO_CONFIG` env var, else `./kino.toml`) and layers
   `KINO_`-prefixed env vars on top. Nesting uses double underscores. Documented
   env vars: `KINO_CONFIG`, `KINO_DATABASE_PATH`, `KINO_LIBRARY_ROOT`,
-  `KINO_LOG_LEVEL`, `KINO_SERVER__LISTEN`. The reference TOML lives at
+  `KINO_LOG_LEVEL`, `KINO_LOG_FORMAT`, `KINO_LOG`, `RUST_LOG`,
+  `KINO_SERVER__LISTEN`. The reference TOML lives at
   `kino.toml.example` in the repo root.
 - **Tests:** colocated with the code (`#[cfg(test)] mod tests`) or under a crate's
   `tests/` directory for integration. A change isn't done until tests pass.

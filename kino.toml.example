@@ -6,7 +6,12 @@ library_root = "/srv/media"
 
 # Logging filter. Optional. Defaults to "info".
 # Accepts any tracing-subscriber EnvFilter expression.
+# Runtime overrides: RUST_LOG, then KINO_LOG, then this value.
 log_level = "info"
+
+# Logging output format. Optional. Defaults to "pretty".
+# Use "json" for newline-delimited production logs.
+log_format = "pretty"
 
 [server]
 # Address the server binds to. Optional. Defaults to 127.0.0.1:7777.
