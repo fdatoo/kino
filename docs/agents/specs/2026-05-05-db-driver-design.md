@@ -8,7 +8,7 @@
 
 - The workspace depends on `sqlx` 0.8 with the SQLite + tokio + macros + migrate features.
 - `kino-db` defines its `Error` enum and a smoke test that uses `sqlx::query!` against an in-memory SQLite, exercising the offline-cache path at compile time.
-- The repo carries a checked-in `.sqlx/` query cache; a fresh checkout builds with no env vars set.
+- The repo carries a checked-in `.sqlx/` query cache and a `.cargo/config.toml` that pins `SQLX_OFFLINE=true`; a fresh checkout builds with no env vars set, and IDE rust-analyzer reads the cache without complaint.
 - The repo has an ADR system under `docs/adrs/` and ADR-0001 records the sqlx choice.
 - CLAUDE.md points at `docs/adrs/` for architecture decisions.
 - `cargo build --workspace`, `cargo test --workspace`, `cargo fmt --all -- --check`, and `cargo clippy --workspace --all-targets -- -D warnings` all pass.
@@ -38,7 +38,7 @@ The ADR itself owns the rationale; this section is the summary the spec needs to
 - **Driver:** `sqlx` 0.8.
 - **Features:** `runtime-tokio`, `macros`, `sqlite`, `migrate`. `default-features = false` to drop the TLS stack we do not use for SQLite.
 - **Query style:** compile-time-checked via `sqlx::query!` / `query_as!`. Runtime `sqlx::query` is allowed for genuinely dynamic SQL but should be the exception.
-- **Offline cache:** `.sqlx/` at the workspace root, regenerated with `cargo sqlx prepare --workspace -- --tests` against a local dev DB and committed. sqlx 0.7+ auto-detects offline mode when `.sqlx/` is present and `DATABASE_URL` is unset, so fresh checkouts and CI need no extra env.
+- **Offline cache:** `.sqlx/` at the workspace root, regenerated with `cargo sqlx prepare --workspace -- --tests` against a local dev DB and committed. Offline mode is forced via `.cargo/config.toml` (`[env] SQLX_OFFLINE = "true"`) so every cargo invocation — IDE rust-analyzer, CI, plain `cargo build` — uses the cache without env tweaks. `cargo sqlx prepare` overrides `SQLX_OFFLINE` to `false` in the env it passes to cargo, so cache regeneration still works.
 - **Rejected alternative:** `rusqlite`. Synchronous (would need `spawn_blocking` everywhere off the request path), no compile-time checking, and would require rewriting every query if the Postgres question (vision §8) ever resolves yes.
 
 ---
@@ -162,7 +162,7 @@ The four CLAUDE.md commands, with no env vars set:
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 
-Auto-offline kicks in because `.sqlx/` is present and `DATABASE_URL` is unset.
+`.cargo/config.toml` pins `SQLX_OFFLINE=true`, so the macro reads from `.sqlx/` regardless of inherited env.
 
 ---
 

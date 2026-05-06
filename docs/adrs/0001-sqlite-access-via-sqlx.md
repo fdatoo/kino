@@ -44,8 +44,15 @@ CI build with no environment configuration.
 
 ## Consequences
 
-- **Fresh checkouts and CI** need nothing. sqlx 0.7+ auto-detects offline mode
-  when `.sqlx/` is present and `DATABASE_URL` is unset.
+- **Offline mode is forced via `.cargo/config.toml`** — `[env] SQLX_OFFLINE = "true"`.
+  sqlx's auto-detection (cache present + `DATABASE_URL` unset) works on the
+  command line but is unreliable inside IDE rust-analyzer, where the env
+  inherited by the language-server's `cargo check` differs from a shell. An
+  explicit env var via cargo config avoids the surprise. `cargo sqlx prepare`
+  still works because it sets `SQLX_OFFLINE=false` in the process env it
+  passes to cargo, which overrides cargo config.
+- **Fresh checkouts and CI** need nothing. The `.cargo/config.toml` setting
+  means every cargo invocation runs in offline mode by default.
 - **Local dev workflow** for changing a macro query:
   1. Install sqlx-cli once: `cargo install sqlx-cli --no-default-features --features sqlite,native-tls`.
   2. Point `DATABASE_URL` at a local SQLite file (`.env.example` documents the
