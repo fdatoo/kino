@@ -7,6 +7,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-helpers = []
+
 [dependencies]
 kino-core = { path = "../kino-core" }
 sqlx = { workspace = true }
