@@ -49,6 +49,9 @@ Two rules:
     `fdatoo/f-XXX-short-slug` format.
 - **Vision:** `docs/kino-vision.md` — read this if anything below is unclear.
 - **Roadmap context:** `docs/agents/specs/2026-05-05-linear-roadmap-design.md`.
+- **ADRs:** `docs/adrs/` — cross-cutting architecture decisions (driver
+  choices, wire formats, runtime model, etc.). See `docs/adrs/README.md`
+  for when to write one.
 
 For non-trivial issues, write a design spec in `docs/agents/specs/` (named
 `YYYY-MM-DD-short-slug.md`) before writing code. For multi-step execution, write a

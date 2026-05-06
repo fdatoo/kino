@@ -1,0 +1,7 @@
+[env]
+# Force sqlx's `query!` macros to use the checked-in `.sqlx/` query cache
+# instead of trying to reach a live database at build time. This is what
+# every cargo invocation should do — IDE rust-analyzer, CI, plain
+# `cargo build`. `cargo sqlx prepare` overrides this to `false` from the
+# process env it passes to cargo, so cache regeneration still works.
+SQLX_OFFLINE = "true"
