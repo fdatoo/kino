@@ -7,6 +7,7 @@
 pub mod config;
 pub mod id;
 pub mod time;
+pub mod tracing;
 
 pub use config::Config;
 pub use id::Id;
