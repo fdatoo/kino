@@ -1,0 +1,1 @@
+-- Initial schema marker. The migration runner owns `schema_migrations`.
