@@ -17,6 +17,9 @@
 //! - one writer connection and eight read-only reader connections, matching
 //!   SQLite's single-writer/many-reader concurrency model.
 
+use std::path::Path;
+#[cfg(any(test, feature = "test-helpers"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kino_core::Config;
@@ -31,6 +34,8 @@ const READER_CONNECTIONS: u32 = 8;
 const WRITER_CONNECTIONS: u32 = 1;
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+#[cfg(any(test, feature = "test-helpers"))]
+static TEST_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Errors produced by `kino_db`.
 #[derive(Debug, Error)]
@@ -110,6 +115,22 @@ pub enum Error {
 /// Crate-local `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Open a fresh, fully migrated in-memory SQLite database for tests.
+///
+/// Each call uses a unique shared-cache database name, so tests can run in
+/// parallel without sharing state.
+#[cfg(any(test, feature = "test-helpers"))]
+pub async fn test_db() -> Result<Db> {
+    let sequence = TEST_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let filename =
+        std::path::PathBuf::from(format!("file:kino-test-{}-{sequence}", std::process::id()));
+    let options = connect_options_for_filename(filename)
+        .in_memory(true)
+        .shared_cache(true);
+
+    Db::open_with_options(options, None).await
+}
+
 /// SQLite connection pools for Kino.
 #[derive(Clone)]
 pub struct Db {
@@ -123,9 +144,17 @@ impl Db {
     /// The writer pool is opened first to create the database file if needed
     /// and enable WAL mode before read-only connections are established.
     pub async fn open(config: &Config) -> Result<Self> {
-        let writer_options = connect_options(config)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
+        Db::open_with_options(connect_options(config), Some(SqliteJournalMode::Wal)).await
+    }
+
+    async fn open_with_options(
+        options: SqliteConnectOptions,
+        journal_mode: Option<SqliteJournalMode>,
+    ) -> Result<Self> {
+        let mut writer_options = options.clone().create_if_missing(true);
+        if let Some(journal_mode) = journal_mode {
+            writer_options = writer_options.journal_mode(journal_mode);
+        }
 
         let writer = SqlitePoolOptions::new()
             .max_connections(WRITER_CONNECTIONS)
@@ -135,7 +164,7 @@ impl Db {
 
         run_migrations(&writer, &MIGRATOR).await?;
 
-        let reader_options = connect_options(config).read_only(true);
+        let reader_options = options.read_only(true);
         let readers = SqlitePoolOptions::new()
             .max_connections(READER_CONNECTIONS)
             .min_connections(WRITER_CONNECTIONS)
@@ -168,8 +197,12 @@ impl Db {
 }
 
 fn connect_options(config: &Config) -> SqliteConnectOptions {
+    connect_options_for_filename(&config.database_path)
+}
+
+fn connect_options_for_filename(filename: impl AsRef<Path>) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
-        .filename(&config.database_path)
+        .filename(filename)
         .foreign_keys(true)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(BUSY_TIMEOUT)
@@ -498,6 +531,41 @@ mod tests {
         assert_eq!(recorded, 0);
 
         db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_db_returns_fresh_migrated_in_memory_db()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let first = super::test_db().await?;
+        let second = super::test_db().await?;
+
+        let applied: Vec<(i64, String)> =
+            sqlx::query_as("SELECT version, description FROM schema_migrations ORDER BY version")
+                .fetch_all(first.write_pool())
+                .await?;
+        assert_eq!(applied, vec![(1, String::from("initial"))]);
+
+        sqlx::query("CREATE TABLE fixture_test (id INTEGER PRIMARY KEY)")
+            .execute(first.write_pool())
+            .await?;
+
+        let visible_from_first_reader: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fixture_test'",
+        )
+        .fetch_one(first.read_pool())
+        .await?;
+        let visible_from_second_db: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fixture_test'",
+        )
+        .fetch_one(second.write_pool())
+        .await?;
+
+        assert_eq!(visible_from_first_reader, 1);
+        assert_eq!(visible_from_second_db, 0);
+
+        first.close().await;
+        second.close().await;
         Ok(())
     }
 

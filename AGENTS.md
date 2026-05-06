@@ -87,6 +87,11 @@ plan in `docs/agents/plans/`.
   `kino.toml.example` in the repo root.
 - **Tests:** colocated with the code (`#[cfg(test)] mod tests`) or under a crate's
   `tests/` directory for integration. A change isn't done until tests pass.
+- **DB tests:** DB-touching tests use `kino_db::test_db().await?`, which returns
+  a fresh, fully migrated in-memory SQLite `Db`. Each call is isolated, so tests
+  can run in parallel. Tests outside `kino-db` should enable the
+  `kino-db/test-helpers` dev-dependency feature and use `write_pool()` for
+  mutations plus `read_pool()` for read-path assertions.
 
 ## Commit messages
 
