@@ -24,15 +24,19 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/git
-            ~/.cargo/registry
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          key: cargo-lock-${{ hashFiles('Cargo.lock') }}
+          cache-workspace-crates: "true"
+
+      - name: Log Cargo cache result
+        run: |
+          if [[ "${{ steps.cargo-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "Cargo cache: hit"
+          else
+            echo "Cargo cache: miss"
+          fi
 
       - name: Check formatting
         run: cargo fmt --all -- --check
