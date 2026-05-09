@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    name: release-linux-x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$RUST_TARGET"
+          rustup default stable
+
+      - name: Cache Cargo
+        id: cargo-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-lock-${{ hashFiles('Cargo.lock') }}
+          cache-workspace-crates: "true"
+
+      - name: Log Cargo cache result
+        run: |
+          if [[ "${{ steps.cargo-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "Cargo cache: hit"
+          else
+            echo "Cargo cache: miss"
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --package kino --target "$RUST_TARGET"
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "target/$RUST_TARGET/release/kino" dist/kino
+
+      - name: Upload kino binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kino-linux-x86_64
+          path: dist/kino
+          if-no-files-found: error
