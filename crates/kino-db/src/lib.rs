@@ -448,6 +448,7 @@ mod tests {
             vec![
                 (1, String::from("initial")),
                 (2, String::from("request status events")),
+                (3, String::from("request list index")),
             ]
         );
 
@@ -488,7 +489,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            3,
+            4,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -501,7 +502,7 @@ mod tests {
         .fetch_one(db.write_pool())
         .await?;
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 4")
                 .fetch_one(db.write_pool())
                 .await?;
 
@@ -518,22 +519,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(3, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(4, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 4")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 3, .. }
+            super::Error::MigrationFailed { version: 4, .. }
         ));
-        assert!(err.to_string().contains("database migration 3 failed"));
+        assert!(err.to_string().contains("database migration 4 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -555,6 +556,7 @@ mod tests {
             vec![
                 (1, String::from("initial")),
                 (2, String::from("request status events")),
+                (3, String::from("request list index")),
             ]
         );
 

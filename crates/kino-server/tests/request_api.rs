@@ -2,8 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request as HttpRequest, StatusCode, header},
 };
-use kino_fulfillment::{RequestDetail, RequestState};
-use kino_server::ListRequestsResponse;
+use kino_fulfillment::{RequestDetail, RequestListPage, RequestState};
 use serde::de::DeserializeOwned;
 use tower::util::ServiceExt;
 
@@ -55,10 +54,11 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
         )
         .await?;
     assert_eq!(list_response.status(), StatusCode::OK);
-    let listed: ListRequestsResponse = response_json(list_response).await?;
+    let listed: RequestListPage = response_json(list_response).await?;
     assert_eq!(listed.requests.len(), 1);
     assert_eq!(listed.requests[0].id, created.request.id);
     assert_eq!(listed.requests[0].state, RequestState::Pending);
+    assert_eq!(listed.next_offset, None);
 
     let delete_response = app
         .oneshot(
@@ -80,6 +80,69 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
     assert_eq!(cancelled.status_events[1].to_state, RequestState::Cancelled);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let first = create_request(&app, "first").await?;
+    let second = create_request(&app, "second").await?;
+    create_request(&app, "third").await?;
+
+    let first_page_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/requests?state=pending&limit=2&offset=0")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(first_page_response.status(), StatusCode::OK);
+    let first_page: RequestListPage = response_json(first_page_response).await?;
+    assert_eq!(
+        first_page
+            .requests
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>(),
+        vec![first.request.id, second.request.id]
+    );
+    assert_eq!(first_page.next_offset, Some(2));
+
+    let bad_limit_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/requests?limit=0")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(bad_limit_response.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+async fn create_request(
+    app: &axum::Router,
+    message: &str,
+) -> Result<RequestDetail, Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"message":"{message}"}}"#)))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response_json(response).await
 }
 
 #[tokio::test]
