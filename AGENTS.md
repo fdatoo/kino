@@ -8,18 +8,23 @@ If you're a human, this doc still applies.
 
 ## Setup
 
-A clean clone needs nothing beyond a working Rust toolchain. Standard commands:
+First run `just setup`. Skipping this means your commits will likely be rejected.
+This activates the mandatory Git hooks via `core.hooksPath`.
 
-| Action  | Command                                                |
-|---------|--------------------------------------------------------|
-| Build   | `cargo build --workspace`                              |
-| Run     | `cargo run`                                            |
-| Test    | `cargo test --workspace`                               |
-| Format  | `cargo fmt --all`                                      |
-| Lint    | `cargo clippy --workspace --all-targets -- -D warnings` |
+A clean clone also needs a working Rust toolchain and `just`. Standard commands:
 
-Run all four (build, test, fmt-check, clippy) before claiming work is done — they
-are what CI runs.
+| Action      | Command                                                |
+|-------------|--------------------------------------------------------|
+| Setup       | `just setup`                                           |
+| Build       | `just build`                                           |
+| Run         | `just run`                                             |
+| Test        | `just test`                                            |
+| Format      | `just fmt`                                             |
+| Format check | `just fmt-check`                                      |
+| Lint        | `just lint`                                            |
+
+Run all four (`just build`, `just test`, `just fmt-check`, `just lint`) before
+claiming work is done — they are what CI runs.
 
 ## Repo layout
 
