@@ -659,9 +659,11 @@ dependencies = [
  "kino-library",
  "kino-server",
  "kino-transcode",
+ "sqlx",
+ "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

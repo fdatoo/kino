@@ -1,36 +1,92 @@
-use tracing::Instrument;
+use std::{error::Error as StdError, process::ExitCode};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use kino_core::Config;
+use kino_db::Db;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    init_tracing()?;
-
-    async {
-        startup::run();
+async fn main() -> ExitCode {
+    match start().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            report_error(&err);
+            ExitCode::FAILURE
+        }
     }
-    .instrument(tracing::info_span!(
-        "kino::startup::run",
-        request_id = tracing::field::Empty,
-        binary = "kino"
-    ))
-    .await;
+}
 
+async fn start() -> Result<(), Error> {
+    let config = Config::load()?;
+    kino_core::tracing::init(&config)?;
+    run(config).await
+}
+
+async fn run(config: Config) -> Result<(), Error> {
+    let db = Db::open(&config).await?;
+    tracing::info!("ready");
+    db.close().await;
     Ok(())
 }
 
-fn init_tracing() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(tracing::Level::INFO.into())
-                .from_env_lossy(),
-        )
-        .try_init()
+fn report_error(err: &Error) {
+    eprintln!("error: {err}");
+
+    let mut source = err.source();
+    while let Some(err) = source {
+        eprintln!("caused by: {err}");
+        source = err.source();
+    }
 }
 
-mod startup {
-    pub(super) fn run() {
-        tracing::info!("ready");
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error(transparent)]
+    Config(#[from] kino_core::config::ConfigError),
+
+    #[error(transparent)]
+    Tracing(#[from] kino_core::tracing::Error),
+
+    #[error(transparent)]
+    Db(#[from] kino_db::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use kino_core::config::ServerConfig;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn run_opens_database_and_applies_migrations() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let database_path = dir.path().join("kino.db");
+        let config = Config {
+            database_path: database_path.clone(),
+            library_root: PathBuf::from("/srv/media"),
+            server: ServerConfig::default(),
+            log_level: "info".into(),
+            log_format: Default::default(),
+        };
+
+        run(config).await?;
+
+        let db = Db::open(&Config {
+            database_path,
+            library_root: PathBuf::from("/srv/media"),
+            server: ServerConfig::default(),
+            log_level: "info".into(),
+            log_format: Default::default(),
+        })
+        .await?;
+        let applied: Vec<(i64, String)> =
+            sqlx::query_as("SELECT version, description FROM schema_migrations ORDER BY version")
+                .fetch_all(db.write_pool())
+                .await?;
+
+        assert_eq!(applied, vec![(1, String::from("initial"))]);
+
+        db.close().await;
+        Ok(())
     }
 }
