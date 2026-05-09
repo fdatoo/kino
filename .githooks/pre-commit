@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+staged_rust_files="$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')"
+
+if [ -z "$staged_rust_files" ]; then
+  exit 0
+fi
+
+echo "pre-commit: checking Rust formatting"
+cargo fmt --all -- --check
+
+echo "pre-commit: running clippy"
+cargo clippy --workspace --all-targets -- -D warnings
