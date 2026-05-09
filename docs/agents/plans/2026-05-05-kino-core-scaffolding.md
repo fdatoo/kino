@@ -1062,8 +1062,6 @@ Each deferred item is tracked. Don't do these in this plan; they have homes.
 
 - **Wiring `Config::load()` into `crates/kino/src/main.rs`.** Tracked by **F-195** ("Implement kino binary entry point"). F-195 was previously marked Done alongside F-186 but its acceptance criteria are not met; it has been reopened to Backlog with a comment explaining what's missing. F-195 is blocked on this issue (F-187), F-200 (DB driver), and F-201/F-188 (migrations).
 
-- **DB encode/decode for `Id` and `Timestamp`** (sqlx `Type`/`Encode`/`Decode` impls or equivalent). The done-when on F-199 ("Define shared time and id types") technically covers it ("Serde *and DB serialization* work consistently"), but it is blocked on **F-200** ("Pick DB driver and commit"). Treat F-199 as "serde now, DB serialization once F-200 lands." Add a comment to F-199 to that effect when this work is done.
-
 - **Runtime validation of config paths** (e.g. `library_root` exists, `database_path`'s parent is writable). Tracked by **F-291** ("Validate config paths at startup"), filed as a sub-issue of F-187. Deliberately out of scope here so the scaffolding stays focused on types + loader.
 
 Adjacent context (not deferred from F-187 — just intersects):
