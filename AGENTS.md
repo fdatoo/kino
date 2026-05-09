@@ -68,7 +68,23 @@ plan in `docs/agents/plans/`.
   workspace lints enforce this. There is no shared workspace-wide `Error` type;
   errors at crate boundaries are the boundary.
 - **Logging:** `tracing` for everything. Human-readable in dev, JSON in prod,
-  env-controlled. Don't `println!` in non-binary crates.
+  env-controlled. Don't `println!` in non-binary crates. Log at the lowest level
+  that still reaches the right operator:
+  - `info`: process and service lifecycle events, durable state transitions, and
+    rare operational milestones that should be visible at the default log level
+    (`server listening`, `database migrations complete`, `library scan started`).
+    Don't use `info` for per-request chatter, tight loops, or expected branches.
+  - `debug`: per-operation detail, branch decisions, retry attempts, counts, ids,
+    and timings useful while diagnosing one request or job. Debug logs may be
+    noisy when enabled, but they still need structured fields and bounded values.
+  - `warn`: recoverable degradation where Kino continues but behavior changed or
+    latency/correctness may be affected (`provider unavailable; using cache`,
+    `scan skipped unreadable file`). Don't use `warn` for normal cache misses or
+    other expected control flow.
+  - `error`: bugs, invariant violations, data corruption, startup failures, and
+    operation failures that the caller or supervisor must handle. Attach the
+    error as a field (`error = %err` or `error = ?err`) and return/propagate it;
+    logging is not a substitute for handling the error.
 - **Time + ids:** Use `kino_core::Id` (UUID v7) and `kino_core::Timestamp` (UTC).
   Don't redefine them, don't construct ids with `Uuid::new_v4`, don't read clocks
   with `OffsetDateTime::now_utc()` directly — the newtypes own the invariants.
