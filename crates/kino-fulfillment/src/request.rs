@@ -377,6 +377,21 @@ impl RequestService {
         })
     }
 
+    /// List requests using the default projection ordered by creation time.
+    pub async fn list(&self) -> Result<Vec<Request>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, state, created_at, updated_at, failure_reason
+            FROM requests
+            ORDER BY created_at, id
+            "#,
+        )
+        .fetch_all(self.db.read_pool())
+        .await?;
+
+        rows.iter().map(request_from_row).collect()
+    }
+
     /// Apply a validated state transition and append its status event.
     pub async fn transition(
         &self,
@@ -589,6 +604,25 @@ mod tests {
             detail.status_events[1].message.as_deref(),
             Some("matched canonical media")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_returns_default_projection_in_creation_order()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let first = service.create(None, Some("first")).await?;
+        let second = service.create(None, Some("second")).await?;
+
+        let requests = service.list().await?;
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].id, first.request.id);
+        assert_eq!(requests[1].id, second.request.id);
+        assert_eq!(requests[0].state, RequestState::Pending);
+        assert_eq!(requests[1].state, RequestState::Pending);
 
         Ok(())
     }
