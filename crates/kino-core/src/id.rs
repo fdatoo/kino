@@ -3,6 +3,12 @@
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+use sqlx::{
+    Decode, Encode, Sqlite, Type,
+    encode::IsNull,
+    error::BoxDynError,
+    sqlite::{SqliteArgumentValue, SqliteTypeInfo, SqliteValueRef},
+};
 
 /// A UUID v7 identifier, used for every entity persisted by Kino.
 ///
@@ -61,6 +67,29 @@ impl FromStr for Id {
 #[error("invalid id: {0}")]
 pub struct ParseIdError(#[from] uuid::Error);
 
+impl Type<Sqlite> for Id {
+    fn type_info() -> SqliteTypeInfo {
+        <String as Type<Sqlite>>::type_info()
+    }
+
+    fn compatible(ty: &SqliteTypeInfo) -> bool {
+        <String as Type<Sqlite>>::compatible(ty)
+    }
+}
+
+impl<'q> Encode<'q, Sqlite> for Id {
+    fn encode_by_ref(&self, buf: &mut Vec<SqliteArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        Encode::<Sqlite>::encode(self.to_string(), buf)
+    }
+}
+
+impl<'r> Decode<'r, Sqlite> for Id {
+    fn decode(value: SqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+        let value = <&str as Decode<Sqlite>>::decode(value)?;
+        value.parse::<Self>().map_err(Into::into)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -108,5 +137,31 @@ mod tests {
         let raw = uuid::Uuid::now_v7();
         let id = Id::from_uuid(raw);
         assert_eq!(id.as_uuid(), raw);
+    }
+
+    #[tokio::test]
+    async fn sqlx_roundtrip_uses_text_uuid() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+        let id = Id::new();
+
+        sqlx::query("CREATE TABLE ids (id TEXT NOT NULL)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO ids (id) VALUES (?1)")
+            .bind(id)
+            .execute(&pool)
+            .await?;
+
+        let stored: String = sqlx::query_scalar("SELECT id FROM ids")
+            .fetch_one(&pool)
+            .await?;
+        let decoded: Id = sqlx::query_scalar("SELECT id FROM ids")
+            .fetch_one(&pool)
+            .await?;
+
+        assert_eq!(stored, id.to_string());
+        assert_eq!(decoded, id);
+
+        Ok(())
     }
 }

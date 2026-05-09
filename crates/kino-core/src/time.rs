@@ -3,6 +3,12 @@
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sqlx::{
+    Decode, Encode, Sqlite, Type,
+    encode::IsNull,
+    error::BoxDynError,
+    sqlite::{SqliteArgumentValue, SqliteTypeInfo, SqliteValueRef},
+};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 /// A UTC timestamp.
@@ -69,6 +75,29 @@ impl<'de> Deserialize<'de> for Timestamp {
     }
 }
 
+impl Type<Sqlite> for Timestamp {
+    fn type_info() -> SqliteTypeInfo {
+        <String as Type<Sqlite>>::type_info()
+    }
+
+    fn compatible(ty: &SqliteTypeInfo) -> bool {
+        <String as Type<Sqlite>>::compatible(ty)
+    }
+}
+
+impl<'q> Encode<'q, Sqlite> for Timestamp {
+    fn encode_by_ref(&self, buf: &mut Vec<SqliteArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        Encode::<Sqlite>::encode(self.0.format(&Rfc3339)?, buf)
+    }
+}
+
+impl<'r> Decode<'r, Sqlite> for Timestamp {
+    fn decode(value: SqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+        let value = <&str as Decode<Sqlite>>::decode(value)?;
+        value.parse::<Self>().map_err(Into::into)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -128,5 +157,34 @@ mod tests {
             err.to_string().starts_with("invalid timestamp:"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlx_roundtrip_uses_utc_rfc3339_text() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+        let ts = Timestamp::from_offset(OffsetDateTime::parse(
+            "2026-05-05T12:00:00+02:00",
+            &Rfc3339,
+        )?);
+
+        sqlx::query("CREATE TABLE timestamps (at TEXT NOT NULL)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO timestamps (at) VALUES (?1)")
+            .bind(ts)
+            .execute(&pool)
+            .await?;
+
+        let stored: String = sqlx::query_scalar("SELECT at FROM timestamps")
+            .fetch_one(&pool)
+            .await?;
+        let decoded: Timestamp = sqlx::query_scalar("SELECT at FROM timestamps")
+            .fetch_one(&pool)
+            .await?;
+
+        assert_eq!(stored, "2026-05-05T10:00:00Z");
+        assert_eq!(decoded, ts);
+
+        Ok(())
     }
 }
