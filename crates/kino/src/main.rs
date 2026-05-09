@@ -84,7 +84,13 @@ mod tests {
                 .fetch_all(db.write_pool())
                 .await?;
 
-        assert_eq!(applied, vec![(1, String::from("initial"))]);
+        assert_eq!(
+            applied,
+            vec![
+                (1, String::from("initial")),
+                (2, String::from("request status events")),
+            ]
+        );
 
         db.close().await;
         Ok(())

@@ -705,6 +705,14 @@ dependencies = [
 [[package]]
 name = "kino-fulfillment"
 version = "0.1.0"
+dependencies = [
+ "kino-core",
+ "kino-db",
+ "serde",
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "kino-library"

@@ -443,7 +443,13 @@ mod tests {
                 .fetch_all(db.write_pool())
                 .await?;
 
-        assert_eq!(applied, vec![(1, String::from("initial"))]);
+        assert_eq!(
+            applied,
+            vec![
+                (1, String::from("initial")),
+                (2, String::from("request status events")),
+            ]
+        );
 
         db.close().await;
         Ok(())
@@ -482,7 +488,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            2,
+            3,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -495,7 +501,7 @@ mod tests {
         .fetch_one(db.write_pool())
         .await?;
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 2")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
                 .fetch_one(db.write_pool())
                 .await?;
 
@@ -512,22 +518,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(2, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(3, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 2")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 2, .. }
+            super::Error::MigrationFailed { version: 3, .. }
         ));
-        assert!(err.to_string().contains("database migration 2 failed"));
+        assert!(err.to_string().contains("database migration 3 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -544,7 +550,13 @@ mod tests {
             sqlx::query_as("SELECT version, description FROM schema_migrations ORDER BY version")
                 .fetch_all(first.write_pool())
                 .await?;
-        assert_eq!(applied, vec![(1, String::from("initial"))]);
+        assert_eq!(
+            applied,
+            vec![
+                (1, String::from("initial")),
+                (2, String::from("request status events")),
+            ]
+        );
 
         sqlx::query("CREATE TABLE fixture_test (id INTEGER PRIMARY KEY)")
             .execute(first.write_pool())
