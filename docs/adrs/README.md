@@ -40,3 +40,4 @@ monotonic, and the slug describes the decision in a few words.
 ## Index
 
 - [ADR-0001 — SQLite access via sqlx with offline mode](0001-sqlite-access-via-sqlx.md)
+- [ADR-0002 — Request UX semantics: visible-on-demand fulfillment](0002-request-ux-semantics.md)
