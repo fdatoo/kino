@@ -22,8 +22,7 @@ async fn start() -> Result<(), Error> {
 
 async fn run(config: Config) -> Result<(), Error> {
     let db = Db::open(&config).await?;
-    tracing::info!("ready");
-    db.close().await;
+    kino_server::serve(&config, db).await?;
     Ok(())
 }
 
@@ -47,6 +46,9 @@ enum Error {
 
     #[error(transparent)]
     Db(#[from] kino_db::Error),
+
+    #[error(transparent)]
+    Server(#[from] kino_server::Error),
 }
 
 #[cfg(test)]
@@ -58,7 +60,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn run_opens_database_and_applies_migrations() -> Result<(), Box<dyn std::error::Error>> {
+    async fn database_startup_applies_migrations() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let database_path = dir.path().join("kino.db");
         let config = Config {
@@ -69,7 +71,8 @@ mod tests {
             log_format: Default::default(),
         };
 
-        run(config).await?;
+        let db = Db::open(&config).await?;
+        db.close().await;
 
         let db = Db::open(&Config {
             database_path,
