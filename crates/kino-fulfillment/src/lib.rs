@@ -2,8 +2,9 @@
 
 mod request;
 
+pub use kino_core::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use request::{
-    Error, REQUEST_LIST_DEFAULT_LIMIT, REQUEST_LIST_MAX_LIMIT, Request, RequestDetail,
-    RequestEventActor, RequestFailureReason, RequestListPage, RequestListQuery, RequestService,
-    RequestState, RequestStatusEvent, RequestTransition, Result,
+    Error, NewRequest, REQUEST_LIST_DEFAULT_LIMIT, REQUEST_LIST_MAX_LIMIT, RequestDetail,
+    RequestEventActor, RequestListPage, RequestListQuery, RequestModelUpdate, RequestService,
+    RequestStatusEvent, RequestTransition, Result,
 };

@@ -2,7 +2,9 @@
 
 use std::fmt;
 
-use kino_core::{Id, Timestamp};
+use kino_core::{
+    Id, Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget, Timestamp,
+};
 use kino_db::Db;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
@@ -56,6 +58,10 @@ pub enum Error {
     #[error("request event actor is invalid")]
     InvalidEventActor,
 
+    /// A persisted requester is malformed.
+    #[error("request requester is invalid")]
+    InvalidRequester,
+
     /// A request list limit is outside the accepted range.
     #[error("request list limit {limit} is invalid; expected 1..={max}")]
     InvalidListLimit {
@@ -75,144 +81,6 @@ pub enum Error {
 
 /// Crate-local `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Durable request state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestState {
-    /// A request has been accepted but not resolved to canonical media.
-    Pending,
-    /// A request has been resolved to canonical media.
-    Resolved,
-    /// Kino is choosing how to satisfy the request.
-    Planning,
-    /// A provider is producing candidate media for the request.
-    Fulfilling,
-    /// Candidate media is being ingested into the library.
-    Ingesting,
-    /// The requested media is available in the library.
-    Satisfied,
-    /// The request cannot be completed.
-    Failed,
-    /// The request was cancelled before completion.
-    Cancelled,
-}
-
-impl RequestState {
-    /// The persisted string representation.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Resolved => "resolved",
-            Self::Planning => "planning",
-            Self::Fulfilling => "fulfilling",
-            Self::Ingesting => "ingesting",
-            Self::Satisfied => "satisfied",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    /// Whether at least one transition command can move from this state to `next`.
-    pub const fn can_transition_to(self, next: Self) -> bool {
-        match self {
-            Self::Pending => matches!(next, Self::Resolved | Self::Failed | Self::Cancelled),
-            Self::Resolved => matches!(next, Self::Planning | Self::Failed | Self::Cancelled),
-            Self::Planning => {
-                matches!(
-                    next,
-                    Self::Resolved | Self::Fulfilling | Self::Failed | Self::Cancelled
-                )
-            }
-            Self::Fulfilling => {
-                matches!(
-                    next,
-                    Self::Resolved | Self::Ingesting | Self::Failed | Self::Cancelled
-                )
-            }
-            Self::Ingesting => {
-                matches!(
-                    next,
-                    Self::Resolved | Self::Satisfied | Self::Failed | Self::Cancelled
-                )
-            }
-            Self::Satisfied | Self::Failed | Self::Cancelled => false,
-        }
-    }
-
-    const fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Pending | Self::Resolved | Self::Planning | Self::Fulfilling | Self::Ingesting
-        )
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "resolved" => Ok(Self::Resolved),
-            "planning" => Ok(Self::Planning),
-            "fulfilling" => Ok(Self::Fulfilling),
-            "ingesting" => Ok(Self::Ingesting),
-            "satisfied" => Ok(Self::Satisfied),
-            "failed" => Ok(Self::Failed),
-            "cancelled" => Ok(Self::Cancelled),
-            _ => Err(Error::InvalidRequestState {
-                value: value.to_owned(),
-            }),
-        }
-    }
-}
-
-impl fmt::Display for RequestState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Typed reason for a failed request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestFailureReason {
-    /// No configured provider accepted the request.
-    NoProviderAccepted,
-    /// The selected provider could not acquire media.
-    AcquisitionFailed,
-    /// Candidate media could not be ingested.
-    IngestFailed,
-    /// The request was cancelled through a path represented as failure.
-    Cancelled,
-}
-
-impl RequestFailureReason {
-    /// The persisted string representation.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NoProviderAccepted => "no_provider_accepted",
-            Self::AcquisitionFailed => "acquisition_failed",
-            Self::IngestFailed => "ingest_failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "no_provider_accepted" => Ok(Self::NoProviderAccepted),
-            "acquisition_failed" => Ok(Self::AcquisitionFailed),
-            "ingest_failed" => Ok(Self::IngestFailed),
-            "cancelled" => Ok(Self::Cancelled),
-            _ => Err(Error::InvalidFailureReason {
-                value: value.to_owned(),
-            }),
-        }
-    }
-}
-
-impl fmt::Display for RequestFailureReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 /// A validated request transition command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,21 +188,6 @@ impl RequestEventActor {
     }
 }
 
-/// Current request projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Request {
-    /// Request id.
-    pub id: Id,
-    /// Current request state.
-    pub state: RequestState,
-    /// Creation timestamp.
-    pub created_at: Timestamp,
-    /// Last state-change timestamp.
-    pub updated_at: Timestamp,
-    /// Failure reason when `state` is `Failed`.
-    pub failure_reason: Option<RequestFailureReason>,
-}
-
 /// Durable status event for a request state change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestStatusEvent {
@@ -440,6 +293,61 @@ pub struct RequestListPage {
     pub next_offset: Option<u64>,
 }
 
+/// Data required to create a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewRequest<'a> {
+    /// Raw query text supplied by the requester.
+    pub target_raw_query: &'a str,
+    /// Principal that owns the request.
+    pub requester: RequestRequester,
+    /// Optional actor for the initial status event.
+    pub actor: Option<RequestEventActor>,
+    /// Optional human-readable context for the initial status event.
+    pub message: Option<&'a str>,
+}
+
+impl<'a> NewRequest<'a> {
+    /// Construct an anonymous request for `target_raw_query`.
+    pub const fn anonymous(target_raw_query: &'a str) -> Self {
+        Self {
+            target_raw_query,
+            requester: RequestRequester::Anonymous,
+            actor: None,
+            message: None,
+        }
+    }
+
+    /// Set the requester.
+    pub const fn with_requester(self, requester: RequestRequester) -> Self {
+        Self { requester, ..self }
+    }
+
+    /// Set the initial status-event actor.
+    pub const fn with_actor(self, actor: RequestEventActor) -> Self {
+        Self {
+            actor: Some(actor),
+            ..self
+        }
+    }
+
+    /// Set the initial status-event message.
+    pub const fn with_message(self, message: &'a str) -> Self {
+        Self {
+            message: Some(message),
+            ..self
+        }
+    }
+}
+
+/// Mutable request model links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestModelUpdate {
+    /// Resolved canonical identity id.
+    pub canonical_identity_id: Option<Id>,
+    /// Fulfillment plan id.
+    pub plan_id: Option<Id>,
+}
+
 /// Internal request API backed by `kino-db`.
 #[derive(Clone)]
 pub struct RequestService {
@@ -453,11 +361,7 @@ impl RequestService {
     }
 
     /// Create a new pending request.
-    pub async fn create(
-        &self,
-        actor: Option<RequestEventActor>,
-        message: Option<&str>,
-    ) -> Result<RequestDetail> {
+    pub async fn create(&self, request: NewRequest<'_>) -> Result<RequestDetail> {
         let id = Id::new();
         let event_id = Id::new();
         let now = Timestamp::now();
@@ -465,11 +369,25 @@ impl RequestService {
 
         sqlx::query(
             r#"
-            INSERT INTO requests (id, state, created_at, updated_at, failure_reason)
-            VALUES (?1, ?2, ?3, ?4, NULL)
+            INSERT INTO requests (
+                id,
+                requester_kind,
+                requester_id,
+                target_raw_query,
+                canonical_identity_id,
+                state,
+                created_at,
+                updated_at,
+                plan_id,
+                failure_reason
+            )
+            VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, NULL, NULL)
             "#,
         )
         .bind(id)
+        .bind(request.requester.kind())
+        .bind(request.requester.id())
+        .bind(request.target_raw_query)
         .bind(RequestState::Pending.as_str())
         .bind(now)
         .bind(now)
@@ -484,8 +402,8 @@ impl RequestService {
                 from_state: None,
                 to_state: RequestState::Pending,
                 occurred_at: now,
-                message,
-                actor,
+                message: request.message,
+                actor: request.actor,
             },
         )
         .await?;
@@ -498,7 +416,17 @@ impl RequestService {
     pub async fn get(&self, id: Id) -> Result<RequestDetail> {
         let request_row = sqlx::query(
             r#"
-            SELECT id, state, created_at, updated_at, failure_reason
+            SELECT
+                id,
+                requester_kind,
+                requester_id,
+                target_raw_query,
+                canonical_identity_id,
+                state,
+                created_at,
+                updated_at,
+                plan_id,
+                failure_reason
             FROM requests
             WHERE id = ?1
             "#,
@@ -540,7 +468,17 @@ impl RequestService {
 
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT id, state, created_at, updated_at, failure_reason
+            SELECT
+                id,
+                requester_kind,
+                requester_id,
+                target_raw_query,
+                canonical_identity_id,
+                state,
+                created_at,
+                updated_at,
+                plan_id,
+                failure_reason
             FROM requests
             "#,
         );
@@ -575,6 +513,36 @@ impl RequestService {
         })
     }
 
+    /// Update nullable links on the current request projection.
+    pub async fn update_model(
+        &self,
+        request_id: Id,
+        update: RequestModelUpdate,
+    ) -> Result<RequestDetail> {
+        let now = Timestamp::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE requests
+            SET canonical_identity_id = ?2,
+                plan_id = ?3,
+                updated_at = ?4
+            WHERE id = ?1
+            "#,
+        )
+        .bind(request_id)
+        .bind(update.canonical_identity_id)
+        .bind(update.plan_id)
+        .bind(now)
+        .execute(self.db.write_pool())
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::RequestNotFound { id: request_id });
+        }
+
+        self.get(request_id).await
+    }
+
     /// Apply a validated state transition and append its status event.
     pub async fn transition(
         &self,
@@ -586,7 +554,17 @@ impl RequestService {
         let mut tx = self.db.write_pool().begin().await?;
         let row = sqlx::query(
             r#"
-            SELECT id, state, created_at, updated_at, failure_reason
+            SELECT
+                id,
+                requester_kind,
+                requester_id,
+                target_raw_query,
+                canonical_identity_id,
+                state,
+                created_at,
+                updated_at,
+                plan_id,
+                failure_reason
             FROM requests
             WHERE id = ?1
             "#,
@@ -692,14 +670,25 @@ async fn insert_status_event(
 fn request_from_row(row: &SqliteRow) -> Result<Request> {
     let failure_reason = row
         .try_get::<Option<&str>, _>("failure_reason")?
-        .map(RequestFailureReason::parse)
+        .map(parse_failure_reason)
         .transpose()?;
+    let requester = RequestRequester::from_parts(
+        row.try_get("requester_kind")?,
+        row.try_get::<Option<Id>, _>("requester_id")?,
+    )
+    .ok_or(Error::InvalidRequester)?;
 
     Ok(Request {
         id: row.try_get("id")?,
-        state: RequestState::parse(row.try_get("state")?)?,
+        requester,
+        target: RequestTarget {
+            raw_query: row.try_get("target_raw_query")?,
+            canonical_identity_id: row.try_get("canonical_identity_id")?,
+        },
+        state: parse_request_state(row.try_get("state")?)?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        plan_id: row.try_get("plan_id")?,
         failure_reason,
     })
 }
@@ -716,17 +705,29 @@ fn status_event_from_row(row: &SqliteRow) -> Result<RequestStatusEvent> {
     };
     let from_state = row
         .try_get::<Option<&str>, _>("from_state")?
-        .map(RequestState::parse)
+        .map(parse_request_state)
         .transpose()?;
 
     Ok(RequestStatusEvent {
         id: row.try_get("id")?,
         request_id: row.try_get("request_id")?,
         from_state,
-        to_state: RequestState::parse(row.try_get("to_state")?)?,
+        to_state: parse_request_state(row.try_get("to_state")?)?,
         occurred_at: row.try_get("occurred_at")?,
         message: row.try_get("message")?,
         actor,
+    })
+}
+
+fn parse_request_state(value: &str) -> Result<RequestState> {
+    RequestState::parse(value).ok_or_else(|| Error::InvalidRequestState {
+        value: value.to_owned(),
+    })
+}
+
+fn parse_failure_reason(value: &str) -> Result<RequestFailureReason> {
+    RequestFailureReason::parse(value).ok_or_else(|| Error::InvalidFailureReason {
+        value: value.to_owned(),
     })
 }
 
@@ -743,11 +744,14 @@ mod tests {
 
         let detail = service
             .create(
-                Some(RequestEventActor::User(user_id)),
-                Some("requested by user"),
+                NewRequest::anonymous("Inception (2010)")
+                    .with_actor(RequestEventActor::User(user_id))
+                    .with_message("requested by user"),
             )
             .await?;
 
+        assert_eq!(detail.request.requester, RequestRequester::Anonymous);
+        assert_eq!(detail.request.target.raw_query, "Inception (2010)");
         assert_eq!(detail.request.state, RequestState::Pending);
         assert_eq!(detail.status_events.len(), 1);
         let event = &detail.status_events[0];
@@ -765,7 +769,11 @@ mod tests {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
         let created = service
-            .create(Some(RequestEventActor::System), Some("accepted"))
+            .create(
+                NewRequest::anonymous("Inception (2010)")
+                    .with_actor(RequestEventActor::System)
+                    .with_message("accepted"),
+            )
             .await?;
 
         let detail = service
@@ -797,8 +805,12 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let first = service.create(None, Some("first")).await?;
-        let second = service.create(None, Some("second")).await?;
+        let first = service
+            .create(NewRequest::anonymous("first").with_message("first"))
+            .await?;
+        let second = service
+            .create(NewRequest::anonymous("second").with_message("second"))
+            .await?;
 
         let page = service.list(RequestListQuery::new()).await?;
 
@@ -815,11 +827,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_model_fields_round_trip_through_crud()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let canonical_identity_id = Id::new();
+        let plan_id = Id::new();
+
+        let created = service
+            .create(
+                NewRequest::anonymous("Inception (2010)")
+                    .with_requester(RequestRequester::System)
+                    .with_actor(RequestEventActor::System)
+                    .with_message("accepted"),
+            )
+            .await?;
+
+        assert_eq!(created.request.requester, RequestRequester::System);
+        assert_eq!(created.request.target.raw_query, "Inception (2010)");
+        assert_eq!(created.request.target.canonical_identity_id, None);
+        assert_eq!(created.request.plan_id, None);
+
+        let updated = service
+            .update_model(
+                created.request.id,
+                RequestModelUpdate {
+                    canonical_identity_id: Some(canonical_identity_id),
+                    plan_id: Some(plan_id),
+                },
+            )
+            .await?;
+        let loaded = service.get(created.request.id).await?;
+        let listed = service.list(RequestListQuery::new()).await?;
+
+        assert_eq!(
+            updated.request.target.canonical_identity_id,
+            Some(canonical_identity_id)
+        );
+        assert_eq!(updated.request.plan_id, Some(plan_id));
+        assert_eq!(loaded.request, updated.request);
+        assert_eq!(listed.requests.len(), 1);
+        assert_eq!(listed.requests[0], updated.request);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_filters_by_state() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let pending = service.create(None, Some("pending")).await?;
-        let resolved = service.create(None, Some("resolved")).await?;
+        let pending = service
+            .create(NewRequest::anonymous("pending").with_message("pending"))
+            .await?;
+        let resolved = service
+            .create(NewRequest::anonymous("resolved").with_message("resolved"))
+            .await?;
         service
             .transition(resolved.request.id, RequestTransition::Resolve, None, None)
             .await?;
@@ -839,9 +901,15 @@ mod tests {
     async fn list_uses_offset_pagination() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let first = service.create(None, Some("first")).await?;
-        let second = service.create(None, Some("second")).await?;
-        let third = service.create(None, Some("third")).await?;
+        let first = service
+            .create(NewRequest::anonymous("first").with_message("first"))
+            .await?;
+        let second = service
+            .create(NewRequest::anonymous("second").with_message("second"))
+            .await?;
+        let third = service
+            .create(NewRequest::anonymous("third").with_message("third"))
+            .await?;
 
         let first_page = service
             .list(RequestListQuery::new().with_limit(2).with_offset(0))
@@ -898,7 +966,9 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let created = service.create(None, None).await?;
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
 
         let err = match service
             .transition(
@@ -934,7 +1004,9 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let created = service.create(None, None).await?;
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
         let cancelled = service
             .transition(created.request.id, RequestTransition::Cancel, None, None)
             .await?;
@@ -969,7 +1041,9 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let created = service.create(None, None).await?;
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
 
         let detail = service
             .transition(
@@ -1066,7 +1140,9 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let created = service.create(None, None).await?;
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
         service
             .transition(created.request.id, RequestTransition::Resolve, None, None)
             .await?;
@@ -1108,7 +1184,9 @@ mod tests {
     {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db.clone());
-        let created = service.create(None, None).await?;
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
         let event_id = created.status_events[0].id;
 
         let update_result =

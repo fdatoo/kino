@@ -6,9 +6,11 @@
 
 pub mod config;
 pub mod id;
+pub mod request;
 pub mod time;
 pub mod tracing;
 
 pub use config::Config;
 pub use id::Id;
+pub use request::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use time::Timestamp;

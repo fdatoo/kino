@@ -8,7 +8,7 @@ use axum::{
 use kino_core::{Id, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
-    RequestDetail, RequestListPage, RequestListQuery, RequestService, RequestState,
+    NewRequest, RequestDetail, RequestListPage, RequestListQuery, RequestService, RequestState,
     RequestTransition,
 };
 use serde::{Deserialize, Serialize};
@@ -18,9 +18,10 @@ struct AppState {
     requests: RequestService,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRequest {
+    target: String,
     message: Option<String>,
 }
 
@@ -48,12 +49,16 @@ pub(crate) fn router(db: Db) -> Router {
 
 async fn create_request(
     State(state): State<AppState>,
-    payload: Option<Json<CreateRequest>>,
+    Json(payload): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<RequestDetail>)> {
-    let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
     let detail = state
         .requests
-        .create(None, payload.message.as_deref())
+        .create(NewRequest {
+            target_raw_query: payload.target.as_str(),
+            requester: kino_fulfillment::RequestRequester::Anonymous,
+            actor: None,
+            message: payload.message.as_deref(),
+        })
         .await?;
     Ok((StatusCode::CREATED, Json(detail)))
 }
