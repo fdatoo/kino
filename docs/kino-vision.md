@@ -173,7 +173,6 @@ The doc deliberately doesn't resolve these. They're the things to think through 
 - **Subtitle policy.** OCR for image-based subs, forced-subtitle detection — how much of this is in scope.
 - **Metadata provider strategy.** TMDB is the obvious primary; how to handle gaps (anime, non-English content, home video) without becoming a metadata provider aggregator like Jellyfin did.
 - **Update and migration strategy.** Single-binary upgrades are easy; database migrations across breaking schema changes need a real plan before the first user-facing release.
-- **Request UX semantics.** How much visibility users have into fulfillment — whether a request shows its provider, its progress, and its source, or whether the system presents fulfillment as a black box.
 - **What "v1" means publicly.** This doc treats Kino as a personal project. If at some point it's worth releasing publicly, the bar for that — docs, support, breaking-change policy — is a separate decision.
 
 ## 9. Principles
