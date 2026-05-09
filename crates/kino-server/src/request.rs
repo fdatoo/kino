@@ -1,13 +1,16 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use kino_core::{Id, id::ParseIdError};
 use kino_db::Db;
-use kino_fulfillment::{Request, RequestDetail, RequestService, RequestTransition};
+use kino_fulfillment::{
+    RequestDetail, RequestListPage, RequestListQuery, RequestService, RequestState,
+    RequestTransition,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -21,11 +24,12 @@ struct CreateRequest {
     message: Option<String>,
 }
 
-/// JSON response for listing requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListRequestsResponse {
-    /// Default request projections.
-    pub requests: Vec<Request>,
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListRequestsQuery {
+    state: Option<RequestState>,
+    limit: Option<u32>,
+    offset: Option<u64>,
 }
 
 pub(crate) fn router(db: Db) -> Router {
@@ -54,9 +58,23 @@ async fn create_request(
     Ok((StatusCode::CREATED, Json(detail)))
 }
 
-async fn list_requests(State(state): State<AppState>) -> ApiResult<Json<ListRequestsResponse>> {
-    let requests = state.requests.list().await?;
-    Ok(Json(ListRequestsResponse { requests }))
+async fn list_requests(
+    State(state): State<AppState>,
+    Query(query): Query<ListRequestsQuery>,
+) -> ApiResult<Json<RequestListPage>> {
+    let mut request_query = RequestListQuery::new();
+    if let Some(filter_state) = query.state {
+        request_query = request_query.with_state(filter_state);
+    }
+    if let Some(limit) = query.limit {
+        request_query = request_query.with_limit(limit);
+    }
+    if let Some(offset) = query.offset {
+        request_query = request_query.with_offset(offset);
+    }
+
+    let page = state.requests.list(request_query).await?;
+    Ok(Json(page))
 }
 
 async fn get_request(
@@ -105,6 +123,12 @@ impl IntoResponse for ApiError {
             }
             Self::Fulfillment(kino_fulfillment::Error::InvalidTransition { .. }) => {
                 StatusCode::CONFLICT
+            }
+            Self::Fulfillment(kino_fulfillment::Error::InvalidListLimit { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Fulfillment(kino_fulfillment::Error::InvalidListOffset { .. }) => {
+                StatusCode::BAD_REQUEST
             }
             Self::Fulfillment(_) => {
                 tracing::error!(error = %self, "request api failed");

@@ -3,6 +3,7 @@
 mod request;
 
 pub use request::{
-    Error, Request, RequestDetail, RequestEventActor, RequestFailureReason, RequestService,
+    Error, REQUEST_LIST_DEFAULT_LIMIT, REQUEST_LIST_MAX_LIMIT, Request, RequestDetail,
+    RequestEventActor, RequestFailureReason, RequestListPage, RequestListQuery, RequestService,
     RequestState, RequestStatusEvent, RequestTransition, Result,
 };

@@ -8,8 +8,6 @@ use kino_db::Db;
 
 mod request;
 
-pub use request::ListRequestsResponse;
-
 /// Errors produced by `kino-server`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -5,8 +5,13 @@ use std::fmt;
 use kino_core::{Id, Timestamp};
 use kino_db::Db;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, sqlite::SqliteRow};
+use sqlx::{QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
 use thiserror::Error;
+
+/// Default request list page size.
+pub const REQUEST_LIST_DEFAULT_LIMIT: u32 = 50;
+/// Maximum request list page size accepted by the persistence API.
+pub const REQUEST_LIST_MAX_LIMIT: u32 = 250;
 
 /// Errors produced by `kino_fulfillment`.
 #[derive(Debug, Error)]
@@ -50,6 +55,22 @@ pub enum Error {
     /// A persisted event actor is malformed.
     #[error("request event actor is invalid")]
     InvalidEventActor,
+
+    /// A request list limit is outside the accepted range.
+    #[error("request list limit {limit} is invalid; expected 1..={max}")]
+    InvalidListLimit {
+        /// Requested page size.
+        limit: u32,
+        /// Maximum accepted page size.
+        max: u32,
+    },
+
+    /// A request list offset is too large to bind for SQLite.
+    #[error("request list offset {offset} is invalid")]
+    InvalidListOffset {
+        /// Requested row offset.
+        offset: u64,
+    },
 }
 
 /// Crate-local `Result` alias.
@@ -342,6 +363,83 @@ pub struct RequestDetail {
     pub status_events: Vec<RequestStatusEvent>,
 }
 
+/// Query parameters for listing requests.
+///
+/// Pagination uses offset semantics. Results are ordered by `(created_at, id)`;
+/// `offset` skips that many rows after applying the optional state filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestListQuery {
+    /// Optional state filter.
+    pub state: Option<RequestState>,
+    /// Maximum number of requests to return.
+    pub limit: u32,
+    /// Number of matching requests to skip.
+    pub offset: u64,
+}
+
+impl RequestListQuery {
+    /// Construct a list query with default pagination and no filters.
+    pub const fn new() -> Self {
+        Self {
+            state: None,
+            limit: REQUEST_LIST_DEFAULT_LIMIT,
+            offset: 0,
+        }
+    }
+
+    /// Return only requests in `state`.
+    pub const fn with_state(self, state: RequestState) -> Self {
+        Self {
+            state: Some(state),
+            ..self
+        }
+    }
+
+    /// Set the page size.
+    pub const fn with_limit(self, limit: u32) -> Self {
+        Self { limit, ..self }
+    }
+
+    /// Set the row offset.
+    pub const fn with_offset(self, offset: u64) -> Self {
+        Self { offset, ..self }
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.limit == 0 || self.limit > REQUEST_LIST_MAX_LIMIT {
+            return Err(Error::InvalidListLimit {
+                limit: self.limit,
+                max: REQUEST_LIST_MAX_LIMIT,
+            });
+        }
+
+        i64::try_from(self.offset)
+            .map(|_| ())
+            .map_err(|_| Error::InvalidListOffset {
+                offset: self.offset,
+            })
+    }
+}
+
+impl Default for RequestListQuery {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One page of request list results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestListPage {
+    /// Default request projections.
+    pub requests: Vec<Request>,
+    /// Applied page size.
+    pub limit: u32,
+    /// Applied row offset.
+    pub offset: u64,
+    /// Offset for the next page when another page may exist.
+    pub next_offset: Option<u64>,
+}
+
 /// Internal request API backed by `kino-db`.
 #[derive(Clone)]
 pub struct RequestService {
@@ -437,18 +535,44 @@ impl RequestService {
     }
 
     /// List requests using the default projection ordered by creation time.
-    pub async fn list(&self) -> Result<Vec<Request>> {
-        let rows = sqlx::query(
+    pub async fn list(&self, query: RequestListQuery) -> Result<RequestListPage> {
+        query.validate()?;
+
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
             SELECT id, state, created_at, updated_at, failure_reason
             FROM requests
-            ORDER BY created_at, id
             "#,
-        )
-        .fetch_all(self.db.read_pool())
-        .await?;
+        );
 
-        rows.iter().map(request_from_row).collect()
+        if let Some(state) = query.state {
+            builder.push(" WHERE state = ");
+            builder.push_bind(state.as_str());
+        }
+
+        builder.push(" ORDER BY created_at, id LIMIT ");
+        builder.push_bind(i64::from(query.limit) + 1);
+        builder.push(" OFFSET ");
+        builder.push_bind(
+            i64::try_from(query.offset).map_err(|_| Error::InvalidListOffset {
+                offset: query.offset,
+            })?,
+        );
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let has_more = rows.len() > query.limit as usize;
+        let requests = rows
+            .iter()
+            .take(query.limit as usize)
+            .map(request_from_row)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(RequestListPage {
+            requests,
+            limit: query.limit,
+            offset: query.offset,
+            next_offset: has_more.then_some(query.offset + u64::from(query.limit)),
+        })
     }
 
     /// Apply a validated state transition and append its status event.
@@ -676,13 +800,95 @@ mod tests {
         let first = service.create(None, Some("first")).await?;
         let second = service.create(None, Some("second")).await?;
 
-        let requests = service.list().await?;
+        let page = service.list(RequestListQuery::new()).await?;
 
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].id, first.request.id);
-        assert_eq!(requests[1].id, second.request.id);
-        assert_eq!(requests[0].state, RequestState::Pending);
-        assert_eq!(requests[1].state, RequestState::Pending);
+        assert_eq!(page.requests.len(), 2);
+        assert_eq!(page.limit, REQUEST_LIST_DEFAULT_LIMIT);
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.next_offset, None);
+        assert_eq!(page.requests[0].id, first.request.id);
+        assert_eq!(page.requests[1].id, second.request.id);
+        assert_eq!(page.requests[0].state, RequestState::Pending);
+        assert_eq!(page.requests[1].state, RequestState::Pending);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_state() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let pending = service.create(None, Some("pending")).await?;
+        let resolved = service.create(None, Some("resolved")).await?;
+        service
+            .transition(resolved.request.id, RequestTransition::Resolve, None, None)
+            .await?;
+
+        let page = service
+            .list(RequestListQuery::new().with_state(RequestState::Pending))
+            .await?;
+
+        assert_eq!(page.requests.len(), 1);
+        assert_eq!(page.requests[0].id, pending.request.id);
+        assert_eq!(page.requests[0].state, RequestState::Pending);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_uses_offset_pagination() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let first = service.create(None, Some("first")).await?;
+        let second = service.create(None, Some("second")).await?;
+        let third = service.create(None, Some("third")).await?;
+
+        let first_page = service
+            .list(RequestListQuery::new().with_limit(2).with_offset(0))
+            .await?;
+        let second_page = service
+            .list(RequestListQuery::new().with_limit(2).with_offset(2))
+            .await?;
+
+        assert_eq!(
+            first_page
+                .requests
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>(),
+            vec![first.request.id, second.request.id]
+        );
+        assert_eq!(first_page.next_offset, Some(2));
+        assert_eq!(
+            second_page
+                .requests
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>(),
+            vec![third.request.id]
+        );
+        assert_eq!(second_page.next_offset, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_rejects_invalid_limit() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+
+        let err = match service.list(RequestListQuery::new().with_limit(0)).await {
+            Ok(_) => panic!("invalid list limit was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            Error::InvalidListLimit {
+                limit: 0,
+                max: REQUEST_LIST_MAX_LIMIT
+            }
+        ));
 
         Ok(())
     }
