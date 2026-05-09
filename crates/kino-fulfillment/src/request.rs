@@ -23,10 +23,12 @@ pub enum Error {
     },
 
     /// A state transition is not allowed by the request state machine.
-    #[error("request transition from {from} to {to} is invalid")]
+    #[error("request transition {transition} from {from} to {to} is invalid")]
     InvalidTransition {
         /// Current request state.
         from: RequestState,
+        /// Requested transition command.
+        transition: RequestTransition,
         /// Requested next state.
         to: RequestState,
     },
@@ -90,16 +92,38 @@ impl RequestState {
         }
     }
 
-    /// Whether a transition to `next` is allowed.
+    /// Whether at least one transition command can move from this state to `next`.
     pub const fn can_transition_to(self, next: Self) -> bool {
         match self {
             Self::Pending => matches!(next, Self::Resolved | Self::Failed | Self::Cancelled),
             Self::Resolved => matches!(next, Self::Planning | Self::Failed | Self::Cancelled),
-            Self::Planning => matches!(next, Self::Fulfilling | Self::Failed | Self::Cancelled),
-            Self::Fulfilling => matches!(next, Self::Ingesting | Self::Failed | Self::Cancelled),
-            Self::Ingesting => matches!(next, Self::Satisfied | Self::Failed | Self::Cancelled),
+            Self::Planning => {
+                matches!(
+                    next,
+                    Self::Resolved | Self::Fulfilling | Self::Failed | Self::Cancelled
+                )
+            }
+            Self::Fulfilling => {
+                matches!(
+                    next,
+                    Self::Resolved | Self::Ingesting | Self::Failed | Self::Cancelled
+                )
+            }
+            Self::Ingesting => {
+                matches!(
+                    next,
+                    Self::Resolved | Self::Satisfied | Self::Failed | Self::Cancelled
+                )
+            }
             Self::Satisfied | Self::Failed | Self::Cancelled => false,
         }
+    }
+
+    const fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Resolved | Self::Planning | Self::Fulfilling | Self::Ingesting
+        )
     }
 
     fn parse(value: &str) -> Result<Self> {
@@ -174,6 +198,8 @@ impl fmt::Display for RequestFailureReason {
 pub enum RequestTransition {
     /// Move from pending to resolved.
     Resolve,
+    /// Move an active post-resolution request back to resolved.
+    ReResolve,
     /// Move from resolved to planning.
     StartPlanning,
     /// Move from planning to fulfilling.
@@ -192,6 +218,7 @@ impl RequestTransition {
     fn to_state(self) -> RequestState {
         match self {
             Self::Resolve => RequestState::Resolved,
+            Self::ReResolve => RequestState::Resolved,
             Self::StartPlanning => RequestState::Planning,
             Self::StartFulfilling => RequestState::Fulfilling,
             Self::StartIngesting => RequestState::Ingesting,
@@ -201,15 +228,47 @@ impl RequestTransition {
         }
     }
 
+    /// Whether this transition command can be applied from `from`.
+    pub const fn can_apply_from(self, from: RequestState) -> bool {
+        match self {
+            Self::Resolve => matches!(from, RequestState::Pending),
+            Self::ReResolve => matches!(
+                from,
+                RequestState::Planning | RequestState::Fulfilling | RequestState::Ingesting
+            ),
+            Self::StartPlanning => matches!(from, RequestState::Resolved),
+            Self::StartFulfilling => matches!(from, RequestState::Planning),
+            Self::StartIngesting => matches!(from, RequestState::Fulfilling),
+            Self::Satisfy => matches!(from, RequestState::Ingesting),
+            Self::Fail(_) | Self::Cancel => from.is_active(),
+        }
+    }
+
     fn failure_reason(self) -> Option<RequestFailureReason> {
         match self {
             Self::Fail(reason) => Some(reason),
             Self::Resolve
+            | Self::ReResolve
             | Self::StartPlanning
             | Self::StartFulfilling
             | Self::StartIngesting
             | Self::Satisfy
             | Self::Cancel => None,
+        }
+    }
+}
+
+impl fmt::Display for RequestTransition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resolve => f.write_str("resolve"),
+            Self::ReResolve => f.write_str("re-resolve"),
+            Self::StartPlanning => f.write_str("start planning"),
+            Self::StartFulfilling => f.write_str("start fulfilling"),
+            Self::StartIngesting => f.write_str("start ingesting"),
+            Self::Satisfy => f.write_str("satisfy"),
+            Self::Fail(reason) => write!(f, "fail ({reason})"),
+            Self::Cancel => f.write_str("cancel"),
         }
     }
 }
@@ -418,9 +477,10 @@ impl RequestService {
 
         let current = request_from_row(&row)?;
         let next = transition.to_state();
-        if !current.state.can_transition_to(next) {
+        if !transition.can_apply_from(current.state) {
             return Err(Error::InvalidTransition {
                 from: current.state,
+                transition,
                 to: next,
             });
         }
@@ -651,6 +711,7 @@ mod tests {
             err,
             Error::InvalidTransition {
                 from: RequestState::Pending,
+                transition: RequestTransition::Satisfy,
                 to: RequestState::Satisfied
             }
         ));
@@ -689,6 +750,7 @@ mod tests {
             err,
             Error::InvalidTransition {
                 from: RequestState::Cancelled,
+                transition: RequestTransition::Resolve,
                 to: RequestState::Resolved
             }
         ));
@@ -718,6 +780,119 @@ mod tests {
             Some(RequestFailureReason::NoProviderAccepted)
         );
         assert_eq!(detail.status_events.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn transition_matrix_enumerates_legal_and_illegal_transitions() {
+        let states = [
+            RequestState::Pending,
+            RequestState::Resolved,
+            RequestState::Planning,
+            RequestState::Fulfilling,
+            RequestState::Ingesting,
+            RequestState::Satisfied,
+            RequestState::Failed,
+            RequestState::Cancelled,
+        ];
+        let transitions = [
+            RequestTransition::Resolve,
+            RequestTransition::ReResolve,
+            RequestTransition::StartPlanning,
+            RequestTransition::StartFulfilling,
+            RequestTransition::StartIngesting,
+            RequestTransition::Satisfy,
+            RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
+            RequestTransition::Cancel,
+        ];
+        let legal = [
+            (RequestState::Pending, RequestTransition::Resolve),
+            (
+                RequestState::Pending,
+                RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
+            ),
+            (RequestState::Pending, RequestTransition::Cancel),
+            (RequestState::Resolved, RequestTransition::StartPlanning),
+            (
+                RequestState::Resolved,
+                RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
+            ),
+            (RequestState::Resolved, RequestTransition::Cancel),
+            (RequestState::Planning, RequestTransition::ReResolve),
+            (RequestState::Planning, RequestTransition::StartFulfilling),
+            (
+                RequestState::Planning,
+                RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
+            ),
+            (RequestState::Planning, RequestTransition::Cancel),
+            (RequestState::Fulfilling, RequestTransition::ReResolve),
+            (RequestState::Fulfilling, RequestTransition::StartIngesting),
+            (
+                RequestState::Fulfilling,
+                RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
+            ),
+            (RequestState::Fulfilling, RequestTransition::Cancel),
+            (RequestState::Ingesting, RequestTransition::ReResolve),
+            (RequestState::Ingesting, RequestTransition::Satisfy),
+            (
+                RequestState::Ingesting,
+                RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
+            ),
+            (RequestState::Ingesting, RequestTransition::Cancel),
+        ];
+
+        for state in states {
+            for transition in transitions {
+                let expected = legal.contains(&(state, transition));
+
+                assert_eq!(
+                    transition.can_apply_from(state),
+                    expected,
+                    "{transition:?} from {state:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn re_resolve_moves_active_request_back_to_resolved()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service.create(None, None).await?;
+        service
+            .transition(created.request.id, RequestTransition::Resolve, None, None)
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+
+        let detail = service
+            .transition(
+                created.request.id,
+                RequestTransition::ReResolve,
+                Some(RequestEventActor::System),
+                Some("resolved again"),
+            )
+            .await?;
+
+        assert_eq!(detail.request.state, RequestState::Resolved);
+        assert_eq!(detail.status_events.len(), 4);
+        assert_eq!(
+            detail.status_events[3].from_state,
+            Some(RequestState::Planning)
+        );
+        assert_eq!(detail.status_events[3].to_state, RequestState::Resolved);
+        assert_eq!(
+            detail.status_events[3].message.as_deref(),
+            Some("resolved again")
+        );
 
         Ok(())
     }
