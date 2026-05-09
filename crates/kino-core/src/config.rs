@@ -1,6 +1,8 @@
 //! Configuration: a TOML file plus environment-variable overrides.
 
 use std::{
+    fs::{self, OpenOptions},
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
@@ -94,6 +96,22 @@ pub enum ConfigError {
     /// The wrapped figment error carries source location.
     #[error("invalid config: {0}")]
     Invalid(#[from] Box<figment::Error>),
+
+    /// The configured library root is missing, inaccessible, or not a directory.
+    #[error("invalid library_root {path}: {source}", path = .path.display())]
+    InvalidLibraryRoot {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// The configured database path cannot be created in its parent directory.
+    #[error("invalid database_path {path}: {source}", path = .path.display())]
+    InvalidDatabasePath {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl Config {
@@ -131,6 +149,7 @@ impl Config {
         )
         .extract::<Config>()
         .map_err(|e| ConfigError::Invalid(Box::new(e)))
+        .and_then(Config::validate)
     }
 
     /// Load configuration from an explicit file path (skips `KINO_CONFIG`).
@@ -150,7 +169,65 @@ impl Config {
             )
             .extract::<Config>()
             .map_err(|e| ConfigError::Invalid(Box::new(e)))
+            .and_then(Config::validate)
     }
+
+    fn validate(self) -> Result<Self, ConfigError> {
+        validate_library_root(&self.library_root)?;
+        validate_database_path(&self.database_path)?;
+        Ok(self)
+    }
+}
+
+fn validate_library_root(path: &Path) -> Result<(), ConfigError> {
+    let metadata = fs::metadata(path).map_err(|source| ConfigError::InvalidLibraryRoot {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(ConfigError::InvalidLibraryRoot {
+            path: path.to_path_buf(),
+            source: io::Error::other("path is not a directory"),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_database_path(path: &Path) -> Result<(), ConfigError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let metadata = fs::metadata(parent).map_err(|source| ConfigError::InvalidDatabasePath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(ConfigError::InvalidDatabasePath {
+            path: path.to_path_buf(),
+            source: io::Error::other("parent path is not a directory"),
+        });
+    }
+
+    let probe = parent.join(format!(".kino-config-write-test-{}", crate::id::Id::new()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|source| ConfigError::InvalidDatabasePath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    drop(file);
+
+    fs::remove_file(&probe).map_err(|source| ConfigError::InvalidDatabasePath {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -159,28 +236,75 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+    use tempfile::TempDir;
 
-    const FULL_TOML: &str = r#"
-        database_path = "/var/lib/kino/kino.db"
-        library_root = "/srv/media"
-        log_level = "debug"
+    struct ConfigFixture {
+        dir: TempDir,
+        database_path: PathBuf,
+        database_dir: PathBuf,
+        library_root: PathBuf,
+    }
 
-        [server]
-        listen = "0.0.0.0:9000"
-    "#;
+    impl ConfigFixture {
+        fn new() -> Result<Self, figment::Error> {
+            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let database_dir = dir.path().join("db");
+            let library_root = dir.path().join("library");
 
-    const REQUIRED_ONLY_TOML: &str = r#"
-        database_path = "/db"
-        library_root = "/lib"
-    "#;
+            fs::create_dir(&database_dir).map_err(|e| e.to_string())?;
+            fs::create_dir(&library_root).map_err(|e| e.to_string())?;
+
+            Ok(Self {
+                database_path: database_dir.join("kino.db"),
+                database_dir,
+                library_root,
+                dir,
+            })
+        }
+
+        fn required_only_toml(&self) -> String {
+            required_only_toml(&self.database_path, &self.library_root)
+        }
+    }
+
+    fn required_only_toml(database_path: &Path, library_root: &Path) -> String {
+        format!(
+            r#"
+                database_path = "{}"
+                library_root = "{}"
+            "#,
+            database_path.display(),
+            library_root.display()
+        )
+    }
+
+    fn full_toml(database_path: &Path, library_root: &Path) -> String {
+        format!(
+            r#"
+                database_path = "{}"
+                library_root = "{}"
+                log_level = "debug"
+
+                [server]
+                listen = "0.0.0.0:9000"
+            "#,
+            database_path.display(),
+            library_root.display()
+        )
+    }
 
     #[test]
     fn happy_path_full_toml() {
         Jail::expect_with(|jail| {
-            jail.create_file("kino.toml", FULL_TOML)?;
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &full_toml(&fixture.database_path, &fixture.library_root),
+            )?;
             let cfg = Config::load().map_err(|e| e.to_string())?;
-            assert_eq!(cfg.database_path, PathBuf::from("/var/lib/kino/kino.db"));
-            assert_eq!(cfg.library_root, PathBuf::from("/srv/media"));
+            assert_eq!(cfg.database_path, fixture.database_path);
+            assert_eq!(cfg.library_root, fixture.library_root);
             assert_eq!(cfg.log_level, "debug");
             assert_eq!(cfg.log_format, LogFormat::Pretty);
             assert_eq!(
@@ -194,7 +318,9 @@ mod tests {
     #[test]
     fn defaults_apply_when_optional_fields_omitted() {
         Jail::expect_with(|jail| {
-            jail.create_file("kino.toml", REQUIRED_ONLY_TOML)?;
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.log_level, "info");
             assert_eq!(cfg.log_format, LogFormat::Pretty);
@@ -209,7 +335,12 @@ mod tests {
     #[test]
     fn missing_required_field_is_invalid_error() {
         Jail::expect_with(|jail| {
-            jail.create_file("kino.toml", r#"library_root = "/lib""#)?;
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(r#"library_root = "{}""#, fixture.library_root.display()),
+            )?;
             let err = Config::load().unwrap_err();
             assert!(matches!(err, ConfigError::Invalid(_)), "got: {err:?}");
             assert!(err.to_string().contains("database_path"), "got: {err}");
@@ -220,12 +351,18 @@ mod tests {
     #[test]
     fn deny_unknown_fields_rejects_typos() {
         Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
             jail.create_file(
                 "kino.toml",
-                r#"
-                    databse_path = "/typo"
-                    library_root = "/lib"
-                "#,
+                &format!(
+                    r#"
+                        databse_path = "{}"
+                        library_root = "{}"
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
             )?;
             let err = Config::load().unwrap_err();
             assert!(matches!(err, ConfigError::Invalid(_)), "got: {err:?}");
@@ -236,10 +373,15 @@ mod tests {
     #[test]
     fn env_override_supplies_required_field() {
         Jail::expect_with(|jail| {
-            jail.create_file("kino.toml", r#"library_root = "/lib""#)?;
-            jail.set_env("KINO_DATABASE_PATH", "/from-env");
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(r#"library_root = "{}""#, fixture.library_root.display()),
+            )?;
+            jail.set_env("KINO_DATABASE_PATH", fixture.database_path.display());
             let cfg = Config::load().map_err(|e| e.to_string())?;
-            assert_eq!(cfg.database_path, PathBuf::from("/from-env"));
+            assert_eq!(cfg.database_path, fixture.database_path);
             Ok(())
         });
     }
@@ -247,7 +389,9 @@ mod tests {
     #[test]
     fn nested_env_override_for_server_listen() {
         Jail::expect_with(|jail| {
-            jail.create_file("kino.toml", REQUIRED_ONLY_TOML)?;
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
             jail.set_env("KINO_SERVER__LISTEN", "0.0.0.0:8080");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(
@@ -261,7 +405,9 @@ mod tests {
     #[test]
     fn env_override_selects_log_format() {
         Jail::expect_with(|jail| {
-            jail.create_file("kino.toml", REQUIRED_ONLY_TOML)?;
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
             jail.set_env("KINO_LOG_FORMAT", "json");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.log_format, LogFormat::Json);
@@ -272,7 +418,9 @@ mod tests {
     #[test]
     fn kino_log_is_runtime_filter_not_config_field() {
         Jail::expect_with(|jail| {
-            jail.create_file("kino.toml", REQUIRED_ONLY_TOML)?;
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
             jail.set_env("KINO_LOG", "debug");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.log_level, "info");
@@ -283,10 +431,12 @@ mod tests {
     #[test]
     fn kino_config_selects_explicit_file() {
         Jail::expect_with(|jail| {
-            jail.create_file("elsewhere.toml", REQUIRED_ONLY_TOML)?;
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("elsewhere.toml", &fixture.required_only_toml())?;
             jail.set_env("KINO_CONFIG", "elsewhere.toml");
             let cfg = Config::load().map_err(|e| e.to_string())?;
-            assert_eq!(cfg.database_path, PathBuf::from("/db"));
+            assert_eq!(cfg.database_path, fixture.database_path);
             Ok(())
         });
     }
@@ -310,11 +460,127 @@ mod tests {
     #[test]
     fn load_works_with_no_file_when_env_supplies_required_fields() {
         Jail::expect_with(|jail| {
-            jail.set_env("KINO_DATABASE_PATH", "/d");
-            jail.set_env("KINO_LIBRARY_ROOT", "/l");
+            let fixture = ConfigFixture::new()?;
+
+            jail.set_env("KINO_DATABASE_PATH", fixture.database_path.display());
+            jail.set_env("KINO_LIBRARY_ROOT", fixture.library_root.display());
             let cfg = Config::load().map_err(|e| e.to_string())?;
-            assert_eq!(cfg.database_path, PathBuf::from("/d"));
-            assert_eq!(cfg.library_root, PathBuf::from("/l"));
+            assert_eq!(cfg.database_path, fixture.database_path);
+            assert_eq!(cfg.library_root, fixture.library_root);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_missing_library_root() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let missing_library_root = fixture.dir.path().join("missing-library");
+
+            jail.create_file(
+                "kino.toml",
+                &required_only_toml(&fixture.database_path, &missing_library_root),
+            )?;
+            let err = Config::load().unwrap_err();
+
+            assert!(
+                matches!(err, ConfigError::InvalidLibraryRoot { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("library_root"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_library_root_that_is_not_a_directory() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let library_file = fixture.dir.path().join("library-file");
+
+            fs::write(&library_file, b"not a directory").map_err(|e| e.to_string())?;
+            jail.create_file(
+                "kino.toml",
+                &required_only_toml(&fixture.database_path, &library_file),
+            )?;
+            let err = Config::load().unwrap_err();
+
+            assert!(
+                matches!(err, ConfigError::InvalidLibraryRoot { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("library_root"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_missing_database_parent() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let database_path = fixture.dir.path().join("missing-db-dir").join("kino.db");
+
+            jail.create_file(
+                "kino.toml",
+                &required_only_toml(&database_path, &fixture.library_root),
+            )?;
+            let err = Config::load().unwrap_err();
+
+            assert!(
+                matches!(err, ConfigError::InvalidDatabasePath { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("database_path"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_database_parent_that_is_not_a_directory() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let database_parent = fixture.dir.path().join("db-parent-file");
+            let database_path = database_parent.join("kino.db");
+
+            fs::write(&database_parent, b"not a directory").map_err(|e| e.to_string())?;
+            jail.create_file(
+                "kino.toml",
+                &required_only_toml(&database_path, &fixture.library_root),
+            )?;
+            let err = Config::load().unwrap_err();
+
+            assert!(
+                matches!(err, ConfigError::InvalidDatabasePath { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("database_path"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_database_parent_that_is_not_writable() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let original_permissions = fs::metadata(&fixture.database_dir)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            let mut readonly_permissions = original_permissions.clone();
+            readonly_permissions.set_readonly(true);
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            fs::set_permissions(&fixture.database_dir, readonly_permissions)
+                .map_err(|e| e.to_string())?;
+            let result = Config::load();
+            fs::set_permissions(&fixture.database_dir, original_permissions)
+                .map_err(|e| e.to_string())?;
+
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidDatabasePath { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("database_path"), "got: {err}");
             Ok(())
         });
     }
