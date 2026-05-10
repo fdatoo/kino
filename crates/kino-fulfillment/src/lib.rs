@@ -13,10 +13,13 @@ pub use planning::{
     FulfillmentProviderArgs, FulfillmentUserInputReason, compute_fulfillment_plan,
 };
 pub use provider::{
-    ConfiguredFulfillmentProvider, FulfillmentProviderCapability, FulfillmentProviderError,
-    PROVIDER_RETRY_INITIAL_BACKOFF, PROVIDER_RETRY_MAX_BACKOFF, PROVIDER_RETRY_MAX_FAILURES,
-    ProviderRetryPolicy, ProviderSelectionContext, ProviderSelectionPlan,
-    RankedFulfillmentProvider, select_fulfillment_provider,
+    ConfiguredFulfillmentProvider, FulfillmentProvider, FulfillmentProviderCancelResult,
+    FulfillmentProviderCapability, FulfillmentProviderCleanup, FulfillmentProviderError,
+    FulfillmentProviderFuture, FulfillmentProviderJobHandle, FulfillmentProviderJobStatus,
+    FulfillmentProviderProgress, FulfillmentProviderResult, PROVIDER_RETRY_INITIAL_BACKOFF,
+    PROVIDER_RETRY_MAX_BACKOFF, PROVIDER_RETRY_MAX_FAILURES, ProviderRetryPolicy,
+    ProviderSelectionContext, ProviderSelectionPlan, RankedFulfillmentProvider,
+    select_fulfillment_provider,
 };
 pub use request::{
     Error, FulfillmentPlan, FulfillmentPlanDecision, NewFulfillmentPlan, NewRequest,

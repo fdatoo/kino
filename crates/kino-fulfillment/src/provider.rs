@@ -1,11 +1,16 @@
 //! Fulfillment provider selection and error handling.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use kino_core::{CanonicalIdentityId, CanonicalIdentityKind};
 
-use crate::request::{Error, FulfillmentPlanDecision, Result};
+use crate::{
+    planning::FulfillmentProviderArgs,
+    request::{Error, FulfillmentPlanDecision, Result},
+};
 
 /// Default number of provider failures allowed before retry is exhausted.
 pub const PROVIDER_RETRY_MAX_FAILURES: u32 = 3;
@@ -50,9 +55,10 @@ pub enum FulfillmentProviderCapability {
 }
 
 /// Error returned by a fulfillment provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FulfillmentProviderError {
     /// Provider failure may clear on a later attempt.
+    #[error("transient provider error {code}: {message}")]
     Transient {
         /// Stable provider-specific error code.
         code: String,
@@ -60,6 +66,7 @@ pub enum FulfillmentProviderError {
         message: String,
     },
     /// Provider failure should fail the request without retrying.
+    #[error("permanent provider error {code}: {message}")]
     Permanent {
         /// Stable provider-specific error code.
         code: String,
@@ -118,6 +125,145 @@ impl FulfillmentProviderError {
             self.message()
         )
     }
+}
+
+/// Provider operation result.
+pub type FulfillmentProviderResult<T> = std::result::Result<T, FulfillmentProviderError>;
+
+/// Boxed provider future used by the lifecycle trait.
+pub type FulfillmentProviderFuture<'a, T> =
+    Pin<Box<dyn Future<Output = FulfillmentProviderResult<T>> + Send + 'a>>;
+
+/// Stable provider-owned job handle returned by `start`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FulfillmentProviderJobHandle {
+    /// Provider id that owns the job.
+    pub provider_id: String,
+    /// Provider-scoped job id.
+    pub job_id: String,
+}
+
+impl FulfillmentProviderJobHandle {
+    /// Construct a provider job handle.
+    pub fn new(provider_id: impl Into<String>, job_id: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            job_id: job_id.into(),
+        }
+    }
+}
+
+/// Bounded provider progress for a running job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FulfillmentProviderProgress {
+    completed_units: u64,
+    total_units: u64,
+}
+
+impl FulfillmentProviderProgress {
+    /// Construct progress when total is positive and completed does not exceed total.
+    pub const fn new(completed_units: u64, total_units: u64) -> Option<Self> {
+        if total_units == 0 || completed_units > total_units {
+            return None;
+        }
+
+        Some(Self {
+            completed_units,
+            total_units,
+        })
+    }
+
+    /// Completed work units.
+    pub const fn completed_units(self) -> u64 {
+        self.completed_units
+    }
+
+    /// Total work units.
+    pub const fn total_units(self) -> u64 {
+        self.total_units
+    }
+}
+
+/// Current provider job state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FulfillmentProviderJobStatus {
+    /// Provider accepted the job but has not started work.
+    Queued,
+    /// Provider is actively working.
+    Running {
+        /// Current progress.
+        progress: FulfillmentProviderProgress,
+    },
+    /// Provider completed fulfillment.
+    Completed,
+    /// Provider cancelled fulfillment and cleaned up partial state.
+    Cancelled {
+        /// Cleanup result for partial provider-owned state.
+        cleanup: FulfillmentProviderCleanup,
+    },
+    /// Provider job failed.
+    Failed {
+        /// Typed provider error.
+        error: FulfillmentProviderError,
+    },
+}
+
+/// Cleanup performed during cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FulfillmentProviderCleanup {
+    /// Provider removed partial files, temp dirs, and in-progress state.
+    CleanedUp,
+    /// Provider had no partial state to remove.
+    NothingToCleanUp,
+}
+
+/// Result returned after a provider cancellation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FulfillmentProviderCancelResult {
+    /// Cancelled job handle.
+    pub handle: FulfillmentProviderJobHandle,
+    /// Cleanup performed by the provider before returning.
+    pub cleanup: FulfillmentProviderCleanup,
+}
+
+impl FulfillmentProviderCancelResult {
+    /// Construct a cancellation result.
+    pub const fn new(
+        handle: FulfillmentProviderJobHandle,
+        cleanup: FulfillmentProviderCleanup,
+    ) -> Self {
+        Self { handle, cleanup }
+    }
+}
+
+/// Fulfillment provider lifecycle.
+///
+/// `cancel` must return only after provider-owned partial state has been
+/// removed or after the provider has confirmed there was no partial state.
+pub trait FulfillmentProvider: Send + Sync {
+    /// Stable provider id.
+    fn id(&self) -> &str;
+
+    /// Capabilities this provider can satisfy.
+    fn capabilities(&self) -> &[FulfillmentProviderCapability];
+
+    /// Start fulfillment and return a provider-owned job handle.
+    fn start<'a>(
+        &'a self,
+        args: FulfillmentProviderArgs,
+    ) -> FulfillmentProviderFuture<'a, FulfillmentProviderJobHandle>;
+
+    /// Poll provider job status.
+    fn status<'a>(
+        &'a self,
+        handle: &'a FulfillmentProviderJobHandle,
+    ) -> FulfillmentProviderFuture<'a, FulfillmentProviderJobStatus>;
+
+    /// Cancel provider work and clean up partial state.
+    fn cancel<'a>(
+        &'a self,
+        handle: &'a FulfillmentProviderJobHandle,
+    ) -> FulfillmentProviderFuture<'a, FulfillmentProviderCancelResult>;
 }
 
 /// Retry policy for transient provider failures.
@@ -373,7 +519,11 @@ fn rank_from_index(index: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kino_core::TmdbId;
+    use kino_core::{Id, TmdbId};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     const ANY: &[FulfillmentProviderCapability] = &[FulfillmentProviderCapability::AnyMedia];
@@ -509,10 +659,167 @@ mod tests {
         assert_eq!(policy.retry_after(4), None);
     }
 
+    #[tokio::test]
+    async fn provider_lifecycle_starts_reports_progress_and_cancels()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let partial_path =
+            std::env::temp_dir().join(format!("kino-provider-{}.partial", Id::new()));
+        let provider = FileBackedProvider::new(partial_path.clone());
+        let identity = movie_identity(550);
+
+        let handle = provider
+            .start(FulfillmentProviderArgs::new(identity))
+            .await?;
+        let status = provider.status(&handle).await?;
+
+        assert_eq!(provider.id(), "file-backed");
+        assert_eq!(provider.capabilities(), MOVIE);
+        assert_eq!(handle.provider_id, "file-backed");
+        assert_eq!(
+            status,
+            FulfillmentProviderJobStatus::Running {
+                progress: progress(1, 2),
+            }
+        );
+        assert!(partial_path.exists());
+
+        let cancelled = provider.cancel(&handle).await?;
+        let status = provider.status(&handle).await?;
+
+        assert_eq!(
+            cancelled,
+            FulfillmentProviderCancelResult::new(
+                handle.clone(),
+                FulfillmentProviderCleanup::CleanedUp
+            )
+        );
+        assert_eq!(
+            status,
+            FulfillmentProviderJobStatus::Cancelled {
+                cleanup: FulfillmentProviderCleanup::CleanedUp,
+            }
+        );
+        assert!(!partial_path.exists());
+
+        Ok(())
+    }
+
     fn movie_identity(tmdb_id: u32) -> CanonicalIdentityId {
         match TmdbId::new(tmdb_id) {
             Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
             None => panic!("test tmdb id must be positive"),
+        }
+    }
+
+    fn progress(completed_units: u64, total_units: u64) -> FulfillmentProviderProgress {
+        match FulfillmentProviderProgress::new(completed_units, total_units) {
+            Some(progress) => progress,
+            None => panic!("test progress must be valid"),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FileBackedJobState {
+        Running,
+        Cancelled(FulfillmentProviderCleanup),
+    }
+
+    struct FileBackedProvider {
+        partial_path: PathBuf,
+        jobs: Mutex<HashMap<String, FileBackedJobState>>,
+    }
+
+    impl FileBackedProvider {
+        fn new(partial_path: PathBuf) -> Self {
+            Self {
+                partial_path,
+                jobs: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl FulfillmentProvider for FileBackedProvider {
+        fn id(&self) -> &str {
+            "file-backed"
+        }
+
+        fn capabilities(&self) -> &[FulfillmentProviderCapability] {
+            MOVIE
+        }
+
+        fn start<'a>(
+            &'a self,
+            args: FulfillmentProviderArgs,
+        ) -> FulfillmentProviderFuture<'a, FulfillmentProviderJobHandle> {
+            Box::pin(async move {
+                fs::write(&self.partial_path, args.canonical_identity_id.to_string()).map_err(
+                    |err| FulfillmentProviderError::transient("write_failed", err.to_string()),
+                )?;
+                let handle = FulfillmentProviderJobHandle::new(self.id(), "job-1");
+                self.jobs
+                    .lock()
+                    .map_err(|err| {
+                        FulfillmentProviderError::transient("lock_failed", err.to_string())
+                    })?
+                    .insert(handle.job_id.clone(), FileBackedJobState::Running);
+
+                Ok(handle)
+            })
+        }
+
+        fn status<'a>(
+            &'a self,
+            handle: &'a FulfillmentProviderJobHandle,
+        ) -> FulfillmentProviderFuture<'a, FulfillmentProviderJobStatus> {
+            Box::pin(async move {
+                let jobs = self.jobs.lock().map_err(|err| {
+                    FulfillmentProviderError::transient("lock_failed", err.to_string())
+                })?;
+                match jobs.get(handle.job_id.as_str()).copied() {
+                    Some(FileBackedJobState::Running) => {
+                        Ok(FulfillmentProviderJobStatus::Running {
+                            progress: progress(1, 2),
+                        })
+                    }
+                    Some(FileBackedJobState::Cancelled(cleanup)) => {
+                        Ok(FulfillmentProviderJobStatus::Cancelled { cleanup })
+                    }
+                    None => Err(FulfillmentProviderError::permanent(
+                        "unknown_job",
+                        "job handle is not active",
+                    )),
+                }
+            })
+        }
+
+        fn cancel<'a>(
+            &'a self,
+            handle: &'a FulfillmentProviderJobHandle,
+        ) -> FulfillmentProviderFuture<'a, FulfillmentProviderCancelResult> {
+            Box::pin(async move {
+                let cleanup = if self.partial_path.exists() {
+                    fs::remove_file(&self.partial_path).map_err(|err| {
+                        FulfillmentProviderError::permanent("cleanup_failed", err.to_string())
+                    })?;
+                    FulfillmentProviderCleanup::CleanedUp
+                } else {
+                    FulfillmentProviderCleanup::NothingToCleanUp
+                };
+                self.jobs
+                    .lock()
+                    .map_err(|err| {
+                        FulfillmentProviderError::transient("lock_failed", err.to_string())
+                    })?
+                    .insert(
+                        handle.job_id.clone(),
+                        FileBackedJobState::Cancelled(cleanup),
+                    );
+
+                Ok(FulfillmentProviderCancelResult::new(
+                    handle.clone(),
+                    cleanup,
+                ))
+            })
         }
     }
 }
