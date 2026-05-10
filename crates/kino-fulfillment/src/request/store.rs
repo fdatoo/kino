@@ -8,8 +8,9 @@ use kino_db::Db;
 use sqlx::{QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
 
 use super::{
-    Error, NewRequest, RequestDetail, RequestEventActor, RequestIdentityProvenance,
-    RequestIdentityVersion, RequestListQuery, RequestMatchCandidate, RequestStatusEvent, Result,
+    Error, FulfillmentPlan, FulfillmentPlanDecision, NewRequest, RequestDetail, RequestEventActor,
+    RequestIdentityProvenance, RequestIdentityVersion, RequestListQuery, RequestMatchCandidate,
+    RequestStatusEvent, Result,
 };
 
 #[derive(Clone)]
@@ -32,6 +33,17 @@ pub(super) struct NewIdentityVersion {
     pub version: u32,
     pub canonical_identity_id: CanonicalIdentityId,
     pub provenance: RequestIdentityProvenance,
+    pub status_event_id: Option<Id>,
+    pub created_at: Timestamp,
+    pub actor: Option<RequestEventActor>,
+}
+
+pub(super) struct NewFulfillmentPlanRecord<'a> {
+    pub id: Id,
+    pub request_id: Id,
+    pub version: u32,
+    pub decision: FulfillmentPlanDecision,
+    pub summary: &'a str,
     pub status_event_id: Option<Id>,
     pub created_at: Timestamp,
     pub actor: Option<RequestEventActor>,
@@ -113,6 +125,33 @@ impl RequestStore {
         };
 
         let request = request_from_row(&request_row)?;
+        let plan_rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                request_id,
+                version,
+                decision,
+                summary,
+                status_event_id,
+                created_at,
+                actor_kind,
+                actor_id
+            FROM request_fulfillment_plans
+            WHERE request_id = ?1
+            ORDER BY version
+            "#,
+        )
+        .bind(id)
+        .fetch_all(self.db.read_pool())
+        .await?;
+        let plan_history = plan_rows
+            .iter()
+            .map(fulfillment_plan_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        let current_plan = request
+            .plan_id
+            .and_then(|plan_id| plan_history.iter().find(|plan| plan.id == plan_id).cloned());
         let event_rows = sqlx::query(
             r#"
             SELECT id, request_id, from_state, to_state, occurred_at, message, actor_kind, actor_id
@@ -169,6 +208,8 @@ impl RequestStore {
 
         Ok(RequestDetail {
             request,
+            current_plan,
+            plan_history,
             status_events,
             identity_versions,
             candidates,
@@ -232,6 +273,89 @@ impl RequestStore {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    pub(super) async fn next_plan_version(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        request_id: Id,
+    ) -> Result<u32> {
+        let version = sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+            SELECT MAX(version)
+            FROM request_fulfillment_plans
+            WHERE request_id = ?1
+            "#,
+        )
+        .bind(request_id)
+        .fetch_one(&mut **tx)
+        .await?
+        .unwrap_or(0)
+            + 1;
+
+        version
+            .try_into()
+            .map_err(|_| Error::InvalidFulfillmentPlanVersion { version })
+    }
+
+    pub(super) async fn insert_fulfillment_plan(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        plan: NewFulfillmentPlanRecord<'_>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO request_fulfillment_plans (
+                id,
+                request_id,
+                version,
+                decision,
+                summary,
+                status_event_id,
+                created_at,
+                actor_kind,
+                actor_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(plan.id)
+        .bind(plan.request_id)
+        .bind(i64::from(plan.version))
+        .bind(plan.decision.as_str())
+        .bind(plan.summary)
+        .bind(plan.status_event_id)
+        .bind(plan.created_at)
+        .bind(plan.actor.map(RequestEventActor::kind))
+        .bind(plan.actor.and_then(RequestEventActor::id))
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    pub(super) async fn update_current_plan(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        request_id: Id,
+        plan_id: Id,
+        updated_at: Timestamp,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE requests
+            SET plan_id = ?2,
+                updated_at = ?3
+            WHERE id = ?1
+            "#,
+        )
+        .bind(request_id)
+        .bind(plan_id)
+        .bind(updated_at)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
     }
 
     pub(super) async fn request_in_tx(
@@ -571,6 +695,32 @@ fn request_from_row(row: &SqliteRow) -> Result<Request> {
         updated_at: row.try_get("updated_at")?,
         plan_id: row.try_get("plan_id")?,
         failure_reason,
+    })
+}
+
+fn fulfillment_plan_from_row(row: &SqliteRow) -> Result<FulfillmentPlan> {
+    let persisted_version = row.try_get::<i64, _>("version")?;
+    let version =
+        persisted_version
+            .try_into()
+            .map_err(|_| Error::InvalidFulfillmentPlanVersion {
+                version: persisted_version,
+            })?;
+    let decision = FulfillmentPlanDecision::parse(row.try_get("decision")?).ok_or_else(|| {
+        Error::InvalidFulfillmentPlanDecision {
+            value: row.get::<String, _>("decision"),
+        }
+    })?;
+
+    Ok(FulfillmentPlan {
+        id: row.try_get("id")?,
+        request_id: row.try_get("request_id")?,
+        version,
+        decision,
+        summary: row.try_get("summary")?,
+        status_event_id: row.try_get("status_event_id")?,
+        created_at: row.try_get("created_at")?,
+        actor: actor_from_row(row)?,
     })
 }
 
