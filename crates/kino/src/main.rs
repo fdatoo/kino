@@ -68,6 +68,7 @@ mod tests {
             library_root: PathBuf::from("/srv/media"),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
         };
@@ -80,6 +81,7 @@ mod tests {
             library_root: PathBuf::from("/srv/media"),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
         })

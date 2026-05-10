@@ -37,6 +37,11 @@ pub struct Config {
     #[serde(default)]
     pub tmdb: TmdbConfig,
 
+    /// Fulfillment provider settings. Optional; no provider is configured by
+    /// default.
+    #[serde(default)]
+    pub providers: ProvidersConfig,
+
     /// Logging filter. Accepts any tracing-subscriber `EnvFilter` expression.
     /// Defaults to `"info"`.
     #[serde(default = "default_log_level")]
@@ -79,6 +84,27 @@ pub struct TmdbConfig {
     /// Maximum client-side request rate. Defaults to 20 requests per second.
     #[serde(default = "default_tmdb_max_requests_per_second")]
     pub max_requests_per_second: u32,
+}
+
+/// Fulfillment provider configuration sections.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvidersConfig {
+    /// Watch-folder provider settings.
+    #[serde(default)]
+    pub watch_folder: Option<WatchFolderProviderConfig>,
+}
+
+/// Configuration for the first-party watch-folder fulfillment provider.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchFolderProviderConfig {
+    /// Directory the provider watches for user-supplied media files.
+    pub path: PathBuf,
+
+    /// User preference used when ranking matching providers.
+    #[serde(default)]
+    pub preference: i32,
 }
 
 fn default_listen() -> SocketAddr {
@@ -150,6 +176,26 @@ pub enum ConfigError {
         /// Human-readable validation failure.
         reason: &'static str,
     },
+
+    /// A configured fulfillment provider has invalid scalar settings.
+    #[error("invalid provider config {provider}: {reason}")]
+    InvalidProviderConfig {
+        /// Stable provider config section.
+        provider: &'static str,
+        /// Human-readable validation failure.
+        reason: &'static str,
+    },
+
+    /// A configured fulfillment provider path is missing or not a directory.
+    #[error("invalid provider config {provider} path {path}: {source}", path = .path.display())]
+    InvalidProviderPath {
+        /// Stable provider config section.
+        provider: &'static str,
+        /// Invalid path.
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl Config {
@@ -214,6 +260,7 @@ impl Config {
         validate_library_root(&self.library_root)?;
         validate_database_path(&self.database_path)?;
         validate_tmdb_config(&self.tmdb)?;
+        validate_provider_configs(&self.providers)?;
         Ok(self)
     }
 }
@@ -238,6 +285,44 @@ fn validate_tmdb_config(config: &TmdbConfig) -> Result<(), ConfigError> {
     if config.max_requests_per_second > 50 {
         return Err(ConfigError::InvalidTmdbConfig {
             reason: "max_requests_per_second must be at most 50",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_provider_configs(config: &ProvidersConfig) -> Result<(), ConfigError> {
+    if let Some(watch_folder) = &config.watch_folder {
+        validate_watch_folder_provider_config(watch_folder)?;
+    }
+
+    Ok(())
+}
+
+fn validate_watch_folder_provider_config(
+    config: &WatchFolderProviderConfig,
+) -> Result<(), ConfigError> {
+    const PROVIDER: &str = "watch_folder";
+
+    if config.path.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidProviderConfig {
+            provider: PROVIDER,
+            reason: "path is empty",
+        });
+    }
+
+    let metadata =
+        fs::metadata(&config.path).map_err(|source| ConfigError::InvalidProviderPath {
+            provider: PROVIDER,
+            path: config.path.clone(),
+            source,
+        })?;
+
+    if !metadata.is_dir() {
+        return Err(ConfigError::InvalidProviderPath {
+            provider: PROVIDER,
+            path: config.path.clone(),
+            source: io::Error::other("path is not a directory"),
         });
     }
 
@@ -318,6 +403,7 @@ mod tests {
 
             fs::create_dir(&database_dir).map_err(|e| e.to_string())?;
             fs::create_dir(&library_root).map_err(|e| e.to_string())?;
+            fs::create_dir(library_root.join("incoming")).map_err(|e| e.to_string())?;
 
             Ok(Self {
                 database_path: database_dir.join("kino.db"),
@@ -344,6 +430,7 @@ mod tests {
     }
 
     fn full_toml(database_path: &Path, library_root: &Path) -> String {
+        let watch_folder = library_root.join("incoming");
         format!(
             r#"
                 database_path = "{}"
@@ -356,9 +443,14 @@ mod tests {
                 [tmdb]
                 api_key = "test-api-key"
                 max_requests_per_second = 10
+
+                [providers.watch_folder]
+                path = "{}"
+                preference = 25
             "#,
             database_path.display(),
-            library_root.display()
+            library_root.display(),
+            watch_folder.display()
         )
     }
 
@@ -378,6 +470,12 @@ mod tests {
             assert_eq!(cfg.log_format, LogFormat::Pretty);
             assert_eq!(cfg.tmdb.api_key.as_deref(), Some("test-api-key"));
             assert_eq!(cfg.tmdb.max_requests_per_second, 10);
+            let watch_folder = cfg
+                .providers
+                .watch_folder
+                .expect("watch folder should parse");
+            assert_eq!(watch_folder.path, fixture.library_root.join("incoming"));
+            assert_eq!(watch_folder.preference, 25);
             assert_eq!(
                 cfg.server.listen,
                 "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
@@ -401,6 +499,7 @@ mod tests {
             );
             assert_eq!(cfg.tmdb.api_key, None);
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
+            assert!(cfg.providers.watch_folder.is_none());
             Ok(())
         });
     }
@@ -497,6 +596,117 @@ mod tests {
             jail.set_env("KINO_TMDB__API_KEY", "env-api-key");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.tmdb.api_key.as_deref(), Some("env-api-key"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_watch_folder_provider() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let watch_folder = fixture.library_root.join("env-incoming");
+            fs::create_dir(&watch_folder).map_err(|e| e.to_string())?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_PROVIDERS__WATCH_FOLDER__PATH", watch_folder.display());
+            jail.set_env("KINO_PROVIDERS__WATCH_FOLDER__PREFERENCE", "9");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            let provider = cfg
+                .providers
+                .watch_folder
+                .expect("watch folder should be configured");
+            assert_eq!(provider.path, watch_folder);
+            assert_eq!(provider.preference, 9);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_watch_folder_provider_without_path() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [providers.watch_folder]
+                        preference = 9
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid(_)), "got: {err:?}");
+            assert!(err.to_string().contains("watch_folder"), "got: {err}");
+            assert!(err.to_string().contains("path"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_watch_folder_provider_path_that_is_not_directory() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let provider_file = fixture.library_root.join("provider-file");
+            fs::write(&provider_file, b"not a directory").map_err(|e| e.to_string())?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [providers.watch_folder]
+                        path = "{}"
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display(),
+                    provider_file.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidProviderPath { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("watch_folder"), "got: {err}");
+            assert!(err.to_string().contains("path"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_empty_watch_folder_provider_path() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [providers.watch_folder]
+                        path = ""
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidProviderConfig { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("watch_folder"), "got: {err}");
+            assert!(err.to_string().contains("path"), "got: {err}");
             Ok(())
         });
     }
