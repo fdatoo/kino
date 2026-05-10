@@ -67,16 +67,27 @@ impl RequestState {
         match self {
             Self::Pending => matches!(
                 next,
-                Self::NeedsDisambiguation | Self::Resolved | Self::Failed | Self::Cancelled
+                Self::NeedsDisambiguation
+                    | Self::Resolved
+                    | Self::Satisfied
+                    | Self::Failed
+                    | Self::Cancelled
             ),
             Self::NeedsDisambiguation => {
-                matches!(next, Self::Resolved | Self::Failed | Self::Cancelled)
+                matches!(
+                    next,
+                    Self::Resolved | Self::Satisfied | Self::Failed | Self::Cancelled
+                )
             }
             Self::Resolved => matches!(next, Self::Planning | Self::Failed | Self::Cancelled),
             Self::Planning => {
                 matches!(
                     next,
-                    Self::Resolved | Self::Fulfilling | Self::Failed | Self::Cancelled
+                    Self::Resolved
+                        | Self::Fulfilling
+                        | Self::Satisfied
+                        | Self::Failed
+                        | Self::Cancelled
                 )
             }
             Self::Fulfilling => {

@@ -298,6 +298,27 @@ impl RequestStore {
             .map_err(|_| Error::InvalidFulfillmentPlanVersion { version })
     }
 
+    pub(super) async fn media_item_exists_for_identity(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        canonical_identity_id: CanonicalIdentityId,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM media_items
+                WHERE canonical_identity_id = ?1
+            )
+            "#,
+        )
+        .bind(canonical_identity_id)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        Ok(exists)
+    }
+
     pub(super) async fn insert_fulfillment_plan(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
