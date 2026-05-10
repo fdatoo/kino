@@ -14,12 +14,12 @@ pub use planning::{
 };
 pub use provider::{
     ConfiguredFulfillmentProvider, FulfillmentProvider, FulfillmentProviderCancelResult,
-    FulfillmentProviderCapability, FulfillmentProviderCleanup, FulfillmentProviderError,
-    FulfillmentProviderFuture, FulfillmentProviderJobHandle, FulfillmentProviderJobStatus,
-    FulfillmentProviderProgress, FulfillmentProviderResult, PROVIDER_RETRY_INITIAL_BACKOFF,
-    PROVIDER_RETRY_MAX_BACKOFF, PROVIDER_RETRY_MAX_FAILURES, ProviderRetryPolicy,
-    ProviderSelectionContext, ProviderSelectionPlan, RankedFulfillmentProvider,
-    select_fulfillment_provider,
+    FulfillmentProviderCapabilities, FulfillmentProviderCapability, FulfillmentProviderCleanup,
+    FulfillmentProviderError, FulfillmentProviderFuture, FulfillmentProviderJobHandle,
+    FulfillmentProviderJobStatus, FulfillmentProviderProgress, FulfillmentProviderResult,
+    PROVIDER_RETRY_INITIAL_BACKOFF, PROVIDER_RETRY_MAX_BACKOFF, PROVIDER_RETRY_MAX_FAILURES,
+    ProviderRetryPolicy, ProviderSelectionContext, ProviderSelectionPlan,
+    RankedFulfillmentProvider, select_fulfillment_provider,
 };
 pub use request::{
     Error, FulfillmentPlan, FulfillmentPlanDecision, NewFulfillmentPlan, NewRequest,
