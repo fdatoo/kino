@@ -8,8 +8,8 @@ use axum::{
 use kino_core::{Id, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
-    NewRequest, RequestDetail, RequestListPage, RequestListQuery, RequestService, RequestState,
-    RequestTransition,
+    NewRequest, RequestDetail, RequestListPage, RequestListQuery, RequestMatchCandidateInput,
+    RequestService, RequestState, RequestTransition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,13 @@ struct ListRequestsQuery {
     offset: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScoreMatchesRequest {
+    candidates: Vec<RequestMatchCandidateInput>,
+    message: Option<String>,
+}
+
 pub(crate) fn router(db: Db) -> Router {
     let state = AppState {
         requests: RequestService::new(db),
@@ -44,6 +51,7 @@ pub(crate) fn router(db: Db) -> Router {
             "/api/requests/{id}",
             get(get_request).delete(cancel_request),
         )
+        .route("/api/requests/{id}/matches", post(score_matches))
         .with_state(state)
 }
 
@@ -103,6 +111,24 @@ async fn cancel_request(
     Ok(Json(detail))
 }
 
+async fn score_matches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ScoreMatchesRequest>,
+) -> ApiResult<Json<RequestDetail>> {
+    let id = parse_id(id)?;
+    let detail = state
+        .requests
+        .resolve_matches(
+            id,
+            payload.candidates,
+            Some(kino_fulfillment::RequestEventActor::System),
+            payload.message.as_deref(),
+        )
+        .await?;
+    Ok(Json(detail))
+}
+
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -129,10 +155,22 @@ impl IntoResponse for ApiError {
             Self::Fulfillment(kino_fulfillment::Error::InvalidTransition { .. }) => {
                 StatusCode::CONFLICT
             }
+            Self::Fulfillment(kino_fulfillment::Error::InvalidMatchResolutionState { .. }) => {
+                StatusCode::CONFLICT
+            }
             Self::Fulfillment(kino_fulfillment::Error::InvalidListLimit { .. }) => {
                 StatusCode::BAD_REQUEST
             }
             Self::Fulfillment(kino_fulfillment::Error::InvalidListOffset { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Fulfillment(kino_fulfillment::Error::NoMatchCandidates) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Fulfillment(kino_fulfillment::Error::DuplicateMatchCandidate { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Fulfillment(kino_fulfillment::Error::InvalidMatchCandidate { .. }) => {
                 StatusCode::BAD_REQUEST
             }
             Self::Fulfillment(_) => {

@@ -12,6 +12,8 @@ use crate::{Id, Timestamp};
 pub enum RequestState {
     /// A request has been accepted but not resolved to canonical media.
     Pending,
+    /// Resolver candidates need a user choice before fulfillment can continue.
+    NeedsDisambiguation,
     /// A request has been resolved to canonical media.
     Resolved,
     /// Kino is choosing how to satisfy the request.
@@ -33,6 +35,7 @@ impl RequestState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::NeedsDisambiguation => "needs_disambiguation",
             Self::Resolved => "resolved",
             Self::Planning => "planning",
             Self::Fulfilling => "fulfilling",
@@ -47,6 +50,7 @@ impl RequestState {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(Self::Pending),
+            "needs_disambiguation" => Some(Self::NeedsDisambiguation),
             "resolved" => Some(Self::Resolved),
             "planning" => Some(Self::Planning),
             "fulfilling" => Some(Self::Fulfilling),
@@ -61,7 +65,13 @@ impl RequestState {
     /// Whether at least one transition command can move from this state to `next`.
     pub const fn can_transition_to(self, next: Self) -> bool {
         match self {
-            Self::Pending => matches!(next, Self::Resolved | Self::Failed | Self::Cancelled),
+            Self::Pending => matches!(
+                next,
+                Self::NeedsDisambiguation | Self::Resolved | Self::Failed | Self::Cancelled
+            ),
+            Self::NeedsDisambiguation => {
+                matches!(next, Self::Resolved | Self::Failed | Self::Cancelled)
+            }
             Self::Resolved => matches!(next, Self::Planning | Self::Failed | Self::Cancelled),
             Self::Planning => {
                 matches!(
@@ -89,7 +99,12 @@ impl RequestState {
     pub const fn is_active(self) -> bool {
         matches!(
             self,
-            Self::Pending | Self::Resolved | Self::Planning | Self::Fulfilling | Self::Ingesting
+            Self::Pending
+                | Self::NeedsDisambiguation
+                | Self::Resolved
+                | Self::Planning
+                | Self::Fulfilling
+                | Self::Ingesting
         )
     }
 }
@@ -226,6 +241,10 @@ mod tests {
     #[test]
     fn request_state_parses_persisted_values() {
         assert_eq!(RequestState::parse("pending"), Some(RequestState::Pending));
+        assert_eq!(
+            RequestState::parse("needs_disambiguation"),
+            Some(RequestState::NeedsDisambiguation)
+        );
         assert_eq!(RequestState::parse("not-real"), None);
     }
 
