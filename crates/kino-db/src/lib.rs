@@ -594,6 +594,7 @@ mod tests {
             database_path,
             library_root: PathBuf::from("/srv/media"),
             server: Default::default(),
+            tmdb: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
         }

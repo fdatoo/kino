@@ -10,9 +10,12 @@ workspace = true
 [dependencies]
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
+reqwest = { workspace = true }
 serde = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 kino-db = { path = "../kino-db", features = ["test-helpers"] }

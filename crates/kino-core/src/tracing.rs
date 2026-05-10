@@ -106,7 +106,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::config::ServerConfig;
+    use crate::config::{ServerConfig, TmdbConfig};
 
     #[test]
     fn pretty_format_produces_parseable_utf8_output() {
@@ -191,6 +191,7 @@ mod tests {
             database_path: PathBuf::from("/db"),
             library_root: PathBuf::from("/lib"),
             server: ServerConfig::default(),
+            tmdb: TmdbConfig::default(),
             log_level: log_level.into(),
             log_format,
         }

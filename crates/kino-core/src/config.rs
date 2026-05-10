@@ -32,6 +32,11 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
 
+    /// TMDB API client settings. Optional; defaults documented on
+    /// [`TmdbConfig`].
+    #[serde(default)]
+    pub tmdb: TmdbConfig,
+
     /// Logging filter. Accepts any tracing-subscriber `EnvFilter` expression.
     /// Defaults to `"info"`.
     #[serde(default = "default_log_level")]
@@ -63,8 +68,25 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
 }
 
+/// TMDB API client settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TmdbConfig {
+    /// TMDB v3 API key used for application-level authentication.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// Maximum client-side request rate. Defaults to 20 requests per second.
+    #[serde(default = "default_tmdb_max_requests_per_second")]
+    pub max_requests_per_second: u32,
+}
+
 fn default_listen() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7777)
+}
+
+fn default_tmdb_max_requests_per_second() -> u32 {
+    20
 }
 
 fn default_log_level() -> String {
@@ -75,6 +97,15 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+        }
+    }
+}
+
+impl Default for TmdbConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            max_requests_per_second: default_tmdb_max_requests_per_second(),
         }
     }
 }
@@ -111,6 +142,13 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: io::Error,
+    },
+
+    /// The configured TMDB client settings are invalid.
+    #[error("invalid tmdb config: {reason}")]
+    InvalidTmdbConfig {
+        /// Human-readable validation failure.
+        reason: &'static str,
     },
 }
 
@@ -175,8 +213,35 @@ impl Config {
     fn validate(self) -> Result<Self, ConfigError> {
         validate_library_root(&self.library_root)?;
         validate_database_path(&self.database_path)?;
+        validate_tmdb_config(&self.tmdb)?;
         Ok(self)
     }
+}
+
+fn validate_tmdb_config(config: &TmdbConfig) -> Result<(), ConfigError> {
+    if config
+        .api_key
+        .as_ref()
+        .is_some_and(|api_key| api_key.trim().is_empty())
+    {
+        return Err(ConfigError::InvalidTmdbConfig {
+            reason: "api_key is empty",
+        });
+    }
+
+    if config.max_requests_per_second == 0 {
+        return Err(ConfigError::InvalidTmdbConfig {
+            reason: "max_requests_per_second must be positive",
+        });
+    }
+
+    if config.max_requests_per_second > 50 {
+        return Err(ConfigError::InvalidTmdbConfig {
+            reason: "max_requests_per_second must be at most 50",
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_library_root(path: &Path) -> Result<(), ConfigError> {
@@ -287,6 +352,10 @@ mod tests {
 
                 [server]
                 listen = "0.0.0.0:9000"
+
+                [tmdb]
+                api_key = "test-api-key"
+                max_requests_per_second = 10
             "#,
             database_path.display(),
             library_root.display()
@@ -307,6 +376,8 @@ mod tests {
             assert_eq!(cfg.library_root, fixture.library_root);
             assert_eq!(cfg.log_level, "debug");
             assert_eq!(cfg.log_format, LogFormat::Pretty);
+            assert_eq!(cfg.tmdb.api_key.as_deref(), Some("test-api-key"));
+            assert_eq!(cfg.tmdb.max_requests_per_second, 10);
             assert_eq!(
                 cfg.server.listen,
                 "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
@@ -328,6 +399,8 @@ mod tests {
                 cfg.server.listen,
                 "127.0.0.1:7777".parse::<SocketAddr>().unwrap()
             );
+            assert_eq!(cfg.tmdb.api_key, None);
+            assert_eq!(cfg.tmdb.max_requests_per_second, 20);
             Ok(())
         });
     }
@@ -411,6 +484,74 @@ mod tests {
             jail.set_env("KINO_LOG_FORMAT", "json");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.log_format, LogFormat::Json);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_tmdb_api_key() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_TMDB__API_KEY", "env-api-key");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.tmdb.api_key.as_deref(), Some("env-api-key"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_empty_tmdb_api_key() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [tmdb]
+                        api_key = " "
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidTmdbConfig { .. }));
+            assert!(err.to_string().contains("api_key"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_zero_tmdb_request_rate() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [tmdb]
+                        max_requests_per_second = 0
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidTmdbConfig { .. }));
+            assert!(
+                err.to_string().contains("max_requests_per_second"),
+                "got: {err}"
+            );
             Ok(())
         });
     }

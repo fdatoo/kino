@@ -16,3 +16,12 @@ log_format = "pretty"
 [server]
 # Address the server binds to. Optional. Defaults to 127.0.0.1:7777.
 listen = "127.0.0.1:7777"
+
+[tmdb]
+# TMDB v3 API key. Optional until request resolution is enabled.
+# Runtime override: KINO_TMDB__API_KEY.
+# api_key = "replace-me"
+
+# Polite client-side request cap. Optional. Defaults to 20, maximum 50.
+# Runtime override: KINO_TMDB__MAX_REQUESTS_PER_SECOND.
+max_requests_per_second = 20
