@@ -100,6 +100,7 @@ mod tests {
                 (6, String::from("request identity versions")),
                 (7, String::from("canonical identities")),
                 (8, String::from("request fulfillment plans")),
+                (9, String::from("minimal media items")),
             ]
         );
 

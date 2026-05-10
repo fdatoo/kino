@@ -206,7 +206,7 @@ pub enum RequestTransition {
     StartFulfilling,
     /// Move from fulfilling to ingesting.
     StartIngesting,
-    /// Move from ingesting to satisfied.
+    /// Move from planning or ingesting to satisfied.
     Satisfy,
     /// Move from any active state to failed with a typed reason.
     Fail(RequestFailureReason),
@@ -242,7 +242,7 @@ impl RequestTransition {
             Self::StartPlanning => matches!(from, RequestState::Resolved),
             Self::StartFulfilling => matches!(from, RequestState::Planning),
             Self::StartIngesting => matches!(from, RequestState::Fulfilling),
-            Self::Satisfy => matches!(from, RequestState::Ingesting),
+            Self::Satisfy => matches!(from, RequestState::Planning | RequestState::Ingesting),
             Self::Fail(_) | Self::Cancel => from.is_active(),
         }
     }
@@ -644,6 +644,15 @@ pub struct RequestModelUpdate {
     pub plan_id: Option<Id>,
 }
 
+struct CurrentPlanInput<'a> {
+    request_id: Id,
+    decision: FulfillmentPlanDecision,
+    summary: &'a str,
+    status_event_id: Option<Id>,
+    created_at: Timestamp,
+    actor: Option<RequestEventActor>,
+}
+
 /// Internal request API backed by `kino-db`.
 #[derive(Clone)]
 pub struct RequestService {
@@ -741,29 +750,50 @@ impl RequestService {
         }
 
         let now = Timestamp::now();
+        self.insert_current_plan(
+            &mut tx,
+            CurrentPlanInput {
+                request_id,
+                decision: plan.decision,
+                summary,
+                status_event_id: None,
+                created_at: now,
+                actor: plan.actor,
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.get(request_id).await
+    }
+
+    async fn insert_current_plan(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        plan: CurrentPlanInput<'_>,
+    ) -> Result<Id> {
         let plan_id = Id::new();
-        let version = self.store.next_plan_version(&mut tx, request_id).await?;
+        let version = self.store.next_plan_version(tx, plan.request_id).await?;
         self.store
             .insert_fulfillment_plan(
-                &mut tx,
+                tx,
                 NewFulfillmentPlanRecord {
                     id: plan_id,
-                    request_id,
+                    request_id: plan.request_id,
                     version,
                     decision: plan.decision,
-                    summary,
-                    status_event_id: None,
-                    created_at: now,
+                    summary: plan.summary,
+                    status_event_id: plan.status_event_id,
+                    created_at: plan.created_at,
                     actor: plan.actor,
                 },
             )
             .await?;
         self.store
-            .update_current_plan(&mut tx, request_id, plan_id, now)
+            .update_current_plan(tx, plan.request_id, plan_id, plan.created_at)
             .await?;
 
-        tx.commit().await?;
-        self.get(request_id).await
+        Ok(plan_id)
     }
 
     /// Select a provider for a planning request and persist the resulting plan.
@@ -786,6 +816,57 @@ impl RequestService {
             .target
             .canonical_identity_id
             .ok_or(Error::FulfillmentPlanningRequiresIdentity { request_id })?;
+        if self
+            .store
+            .media_item_exists_for_identity(&mut tx, canonical_identity_id)
+            .await?
+        {
+            let summary = format!("library already contains {canonical_identity_id}");
+            let summary = validate_plan_summary(summary.as_str())?;
+            let now = Timestamp::now();
+            let event_id = Id::new();
+            self.store
+                .update_state(&mut tx, request_id, RequestState::Satisfied, now, None)
+                .await?;
+            self.store
+                .insert_status_event(
+                    &mut tx,
+                    NewStatusEvent {
+                        id: event_id,
+                        request_id,
+                        from_state: Some(current.state),
+                        to_state: RequestState::Satisfied,
+                        occurred_at: now,
+                        message: Some(summary),
+                        actor,
+                    },
+                )
+                .await?;
+            self.insert_current_plan(
+                &mut tx,
+                CurrentPlanInput {
+                    request_id,
+                    decision: FulfillmentPlanDecision::AlreadySatisfied,
+                    summary,
+                    status_event_id: Some(event_id),
+                    created_at: now,
+                    actor,
+                },
+            )
+            .await?;
+
+            tx.commit().await?;
+            let detail = self.get(request_id).await?;
+            let selection = ProviderSelectionPlan {
+                decision: FulfillmentPlanDecision::AlreadySatisfied,
+                selected_provider_id: None,
+                ranked_providers: Vec::new(),
+                summary: summary.to_owned(),
+            };
+
+            return Ok(ProviderSelectionPlanningResult { selection, detail });
+        }
+
         let selection = select_fulfillment_provider(
             ProviderSelectionContext::new(canonical_identity_id)
                 .with_rejected_provider_ids(rejected_provider_ids),
@@ -793,26 +874,18 @@ impl RequestService {
         )?;
         let summary = validate_plan_summary(selection.summary.as_str())?;
         let now = Timestamp::now();
-        let plan_id = Id::new();
-        let version = self.store.next_plan_version(&mut tx, request_id).await?;
-        self.store
-            .insert_fulfillment_plan(
-                &mut tx,
-                NewFulfillmentPlanRecord {
-                    id: plan_id,
-                    request_id,
-                    version,
-                    decision: selection.decision,
-                    summary,
-                    status_event_id: None,
-                    created_at: now,
-                    actor,
-                },
-            )
-            .await?;
-        self.store
-            .update_current_plan(&mut tx, request_id, plan_id, now)
-            .await?;
+        self.insert_current_plan(
+            &mut tx,
+            CurrentPlanInput {
+                request_id,
+                decision: selection.decision,
+                summary,
+                status_event_id: None,
+                created_at: now,
+                actor,
+            },
+        )
+        .await?;
 
         tx.commit().await?;
         let detail = self.get(request_id).await?;
@@ -870,12 +943,12 @@ impl RequestService {
     ) -> Result<RequestDetail> {
         let mut tx = self.store.begin().await?;
         let current = self.store.request_in_tx(&mut tx, request_id).await?;
-        let next = transition.to_state();
+        let default_next = transition.to_state();
         if !transition.can_apply_from(current.state) {
             return Err(Error::InvalidTransition {
                 from: current.state,
                 transition,
-                to: next,
+                to: default_next,
             });
         }
 
@@ -893,6 +966,15 @@ impl RequestService {
                 now,
             )
             .await?;
+        let already_satisfied = self
+            .store
+            .media_item_exists_for_identity(&mut tx, canonical_identity_id)
+            .await?;
+        let next = if already_satisfied {
+            RequestState::Satisfied
+        } else {
+            default_next
+        };
         self.store
             .update_resolved(&mut tx, request_id, canonical_identity_id, next, now)
             .await?;
@@ -924,6 +1006,22 @@ impl RequestService {
                 },
             )
             .await?;
+        if already_satisfied {
+            let summary = format!("library already contains {canonical_identity_id}");
+            let summary = validate_plan_summary(summary.as_str())?;
+            self.insert_current_plan(
+                &mut tx,
+                CurrentPlanInput {
+                    request_id,
+                    decision: FulfillmentPlanDecision::AlreadySatisfied,
+                    summary,
+                    status_event_id: Some(event_id),
+                    created_at: now,
+                    actor,
+                },
+            )
+            .await?;
+        }
 
         tx.commit().await?;
         self.get(request_id).await
@@ -962,7 +1060,15 @@ impl RequestService {
             .await?;
 
         if auto_resolve {
-            let next = RequestState::Resolved;
+            let already_satisfied = self
+                .store
+                .media_item_exists_for_identity(&mut tx, top.canonical_identity_id)
+                .await?;
+            let next = if already_satisfied {
+                RequestState::Satisfied
+            } else {
+                RequestState::Resolved
+            };
             if !RequestTransition::Resolve.can_apply_from(current.state) {
                 return Err(Error::InvalidTransition {
                     from: current.state,
@@ -1015,6 +1121,22 @@ impl RequestService {
                     },
                 )
                 .await?;
+            if already_satisfied {
+                let summary = format!("library already contains {}", top.canonical_identity_id);
+                let summary = validate_plan_summary(summary.as_str())?;
+                self.insert_current_plan(
+                    &mut tx,
+                    CurrentPlanInput {
+                        request_id,
+                        decision: FulfillmentPlanDecision::AlreadySatisfied,
+                        summary,
+                        status_event_id: Some(event_id),
+                        created_at: now,
+                        actor,
+                    },
+                )
+                .await?;
+            }
         } else {
             for candidate in scored.iter().take(REQUEST_MATCH_CANDIDATE_LIMIT) {
                 self.store
@@ -1391,6 +1513,56 @@ mod tests {
             detail.identity_versions[0].status_event_id,
             Some(detail.status_events[1].id)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_short_circuits_existing_media_item()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db.clone());
+        let canonical_identity_id = identity(550);
+        insert_media_item(&db, canonical_identity_id).await?;
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+
+        let detail = service
+            .resolve_identity(
+                created.request.id,
+                canonical_identity_id,
+                RequestIdentityProvenance::Manual,
+                Some(RequestEventActor::System),
+                Some("matched canonical media"),
+            )
+            .await?;
+
+        assert_eq!(detail.request.state, RequestState::Satisfied);
+        assert_eq!(
+            detail.request.target.canonical_identity_id,
+            Some(canonical_identity_id)
+        );
+        assert_eq!(detail.status_events.len(), 2);
+        assert_eq!(
+            detail.status_events[1].from_state,
+            Some(RequestState::Pending)
+        );
+        assert_eq!(detail.status_events[1].to_state, RequestState::Satisfied);
+        assert_eq!(detail.plan_history.len(), 1);
+        assert_eq!(
+            detail.plan_history[0].decision,
+            FulfillmentPlanDecision::AlreadySatisfied
+        );
+        assert_eq!(
+            detail.plan_history[0].summary,
+            "library already contains tmdb:movie:550"
+        );
+        assert_eq!(
+            detail.plan_history[0].status_event_id,
+            Some(detail.status_events[1].id)
+        );
+        assert_eq!(detail.current_plan, Some(detail.plan_history[0].clone()));
 
         Ok(())
     }
@@ -1775,6 +1947,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_provider_selection_checks_library_before_provider_validation()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db.clone());
+        let canonical_identity_id = identity(550);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+        service
+            .resolve_identity(
+                created.request.id,
+                canonical_identity_id,
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+        insert_media_item(&db, canonical_identity_id).await?;
+        let providers = [
+            ConfiguredFulfillmentProvider::new("duplicate", 0, MOVIE_PROVIDER),
+            ConfiguredFulfillmentProvider::new(" duplicate ", 1, MOVIE_PROVIDER),
+        ];
+
+        let planned = service
+            .plan_provider_selection(
+                created.request.id,
+                &providers,
+                &[],
+                Some(RequestEventActor::System),
+            )
+            .await?;
+
+        assert_eq!(
+            planned.selection.decision,
+            FulfillmentPlanDecision::AlreadySatisfied
+        );
+        assert_eq!(planned.selection.selected_provider_id, None);
+        assert!(planned.selection.ranked_providers.is_empty());
+        assert_eq!(planned.detail.request.state, RequestState::Satisfied);
+        assert_eq!(
+            planned
+                .detail
+                .current_plan
+                .as_ref()
+                .map(|plan| plan.decision),
+            Some(FulfillmentPlanDecision::AlreadySatisfied)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn high_confidence_match_resolves_request()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
@@ -2130,6 +2362,7 @@ mod tests {
             (RequestState::Resolved, RequestTransition::Cancel),
             (RequestState::Planning, RequestTransition::ReResolve),
             (RequestState::Planning, RequestTransition::StartFulfilling),
+            (RequestState::Planning, RequestTransition::Satisfy),
             (
                 RequestState::Planning,
                 RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
@@ -2371,5 +2604,57 @@ mod tests {
             Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
             None => panic!("test tmdb id must be positive"),
         }
+    }
+
+    async fn insert_media_item(
+        db: &kino_db::Db,
+        canonical_identity_id: CanonicalIdentityId,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let now = Timestamp::now();
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO canonical_identities (
+                id,
+                provider,
+                media_kind,
+                tmdb_id,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(canonical_identity_id)
+        .bind(canonical_identity_id.provider().as_str())
+        .bind(canonical_identity_id.kind().as_str())
+        .bind(i64::from(canonical_identity_id.tmdb_id().get()))
+        .bind(CanonicalIdentitySource::Manual.as_str())
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(Id::new())
+        .bind(canonical_identity_id.kind().as_str())
+        .bind(canonical_identity_id)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(())
     }
 }
