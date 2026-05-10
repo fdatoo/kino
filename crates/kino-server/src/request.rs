@@ -1,3 +1,5 @@
+use std::{path::PathBuf, sync::Arc};
+
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -8,15 +10,17 @@ use axum::{
 use kino_core::{CanonicalIdentityId, Id, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
-    FulfillmentPlanDecision, NewFulfillmentPlan, NewRequest, RequestDetail, RequestEventActor,
-    RequestListPage, RequestListQuery, RequestMatchCandidateInput, RequestService, RequestState,
-    RequestTransition,
+    FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
+    FulfillmentProviderError, ManualImportProvider, NewFulfillmentPlan, NewRequest, RequestDetail,
+    RequestEventActor, RequestListPage, RequestListQuery, RequestMatchCandidateInput,
+    RequestService, RequestState, RequestTransition,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct AppState {
     requests: RequestService,
+    manual_imports: Arc<ManualImportProvider>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,9 +59,25 @@ struct RecordPlanRequest {
     summary: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualImportRequest {
+    path: PathBuf,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManualImportResponse {
+    request: RequestDetail,
+    provider_id: String,
+    job_id: String,
+    path: PathBuf,
+}
+
 pub(crate) fn router(db: Db) -> Router {
     let state = AppState {
         requests: RequestService::new(db),
+        manual_imports: Arc::new(ManualImportProvider::new()),
     };
 
     Router::new()
@@ -69,6 +89,10 @@ pub(crate) fn router(db: Db) -> Router {
         .route("/api/requests/{id}/matches", post(score_matches))
         .route("/api/requests/{id}/plans", post(record_plan))
         .route("/api/requests/{id}/re-resolution", post(re_resolve))
+        .route(
+            "/api/admin/requests/{id}/manual-import",
+            post(manual_import),
+        )
         .with_state(state)
 }
 
@@ -181,6 +205,53 @@ async fn re_resolve(
     Ok(Json(detail))
 }
 
+async fn manual_import(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ManualImportRequest>,
+) -> ApiResult<Json<ManualImportResponse>> {
+    let id = parse_id(id)?;
+    let current = state.requests.get(id).await?;
+    if !RequestTransition::StartIngesting.can_apply_from(current.request.state) {
+        return Err(ApiError::InvalidManualImportState {
+            from: current.request.state,
+        });
+    }
+
+    let canonical_identity_id =
+        current
+            .request
+            .target
+            .canonical_identity_id
+            .ok_or(ApiError::ManualImport(FulfillmentProviderError::permanent(
+                "request_unresolved",
+                format!("request {id} does not have a canonical identity"),
+            )))?;
+    let path = payload.path;
+    let handle = state
+        .manual_imports
+        .start(FulfillmentProviderArgs::new(canonical_identity_id).with_source_path(&path))
+        .await
+        .map_err(ApiError::ManualImport)?;
+    let message = manual_import_message(payload.message.as_deref(), &path, &handle.job_id);
+    let detail = state
+        .requests
+        .transition(
+            id,
+            RequestTransition::StartIngesting,
+            Some(RequestEventActor::System),
+            Some(message.as_str()),
+        )
+        .await?;
+
+    Ok(Json(ManualImportResponse {
+        request: detail,
+        provider_id: handle.provider_id,
+        job_id: handle.job_id,
+        path,
+    }))
+}
+
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +261,12 @@ enum ApiError {
 
     #[error(transparent)]
     Fulfillment(#[from] kino_fulfillment::Error),
+
+    #[error("manual import from {from} is invalid")]
+    InvalidManualImportState { from: RequestState },
+
+    #[error(transparent)]
+    ManualImport(FulfillmentProviderError),
 }
 
 #[derive(Serialize)]
@@ -234,6 +311,9 @@ impl IntoResponse for ApiError {
             Self::Fulfillment(kino_fulfillment::Error::EmptyFulfillmentPlanSummary) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::InvalidManualImportState { .. } => StatusCode::CONFLICT,
+            Self::ManualImport(error) if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ManualImport(_) => StatusCode::BAD_REQUEST,
             Self::Fulfillment(_) => {
                 tracing::error!(error = %self, "request api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -254,4 +334,12 @@ fn parse_id(value: String) -> ApiResult<Id> {
     value
         .parse()
         .map_err(|source| ApiError::InvalidId { value, source })
+}
+
+fn manual_import_message(message: Option<&str>, path: &std::path::Path, job_id: &str) -> String {
+    let import_message = format!("manual import {} accepted as {job_id}", path.display());
+    match message.map(str::trim).filter(|message| !message.is_empty()) {
+        Some(message) => format!("{message}; {import_message}"),
+        None => import_message,
+    }
 }

@@ -1,5 +1,6 @@
 //! Request tracking and fulfillment orchestration.
 
+pub mod manual_import;
 pub mod movie;
 mod planning;
 mod provider;
@@ -9,6 +10,7 @@ pub mod tv;
 pub mod watch_folder;
 
 pub use kino_core::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
+pub use manual_import::{MANUAL_IMPORT_PROVIDER_ID, ManualImportProvider};
 pub use planning::{
     ComputedFulfillmentPlan, FulfillmentLibraryState, FulfillmentPlanningInput,
     FulfillmentProviderArgs, FulfillmentUserInputReason, compute_fulfillment_plan,
