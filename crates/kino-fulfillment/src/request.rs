@@ -1,6 +1,6 @@
-//! Request persistence, status events, and state transitions.
+//! Request persistence, status events, matching, and state transitions.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use kino_core::{
     Id, Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget, Timestamp,
@@ -14,6 +14,12 @@ use thiserror::Error;
 pub const REQUEST_LIST_DEFAULT_LIMIT: u32 = 50;
 /// Maximum request list page size accepted by the persistence API.
 pub const REQUEST_LIST_MAX_LIMIT: u32 = 250;
+/// Maximum disambiguation candidates stored on a parked request.
+pub const REQUEST_MATCH_CANDIDATE_LIMIT: usize = 5;
+/// Minimum score for automatic request resolution.
+pub const REQUEST_AUTO_RESOLVE_MIN_SCORE: f64 = 0.86;
+/// Minimum lead over the next candidate for automatic request resolution.
+pub const REQUEST_AUTO_RESOLVE_MIN_MARGIN: f64 = 0.08;
 
 /// Errors produced by `kino_fulfillment`.
 #[derive(Debug, Error)]
@@ -38,6 +44,13 @@ pub enum Error {
         transition: RequestTransition,
         /// Requested next state.
         to: RequestState,
+    },
+
+    /// Match scoring cannot run from the current request state.
+    #[error("request match resolution from {from} is invalid")]
+    InvalidMatchResolutionState {
+        /// Current request state.
+        from: RequestState,
     },
 
     /// A persisted request state is outside the known enum.
@@ -76,6 +89,26 @@ pub enum Error {
     InvalidListOffset {
         /// Requested row offset.
         offset: u64,
+    },
+
+    /// Match resolution received no candidates to score.
+    #[error("request match resolution requires at least one candidate")]
+    NoMatchCandidates,
+
+    /// A candidate appears more than once in one scoring request.
+    #[error("request match candidate {canonical_identity_id} is duplicated")]
+    DuplicateMatchCandidate {
+        /// Duplicated canonical identity id.
+        canonical_identity_id: Id,
+    },
+
+    /// A candidate field is invalid.
+    #[error("request match candidate {canonical_identity_id} is invalid: {reason}")]
+    InvalidMatchCandidate {
+        /// Candidate identity id.
+        canonical_identity_id: Id,
+        /// Human-readable validation failure.
+        reason: &'static str,
     },
 }
 
@@ -120,7 +153,10 @@ impl RequestTransition {
     /// Whether this transition command can be applied from `from`.
     pub const fn can_apply_from(self, from: RequestState) -> bool {
         match self {
-            Self::Resolve => matches!(from, RequestState::Pending),
+            Self::Resolve => matches!(
+                from,
+                RequestState::Pending | RequestState::NeedsDisambiguation
+            ),
             Self::ReResolve => matches!(
                 from,
                 RequestState::Planning | RequestState::Fulfilling | RequestState::Ingesting
@@ -207,13 +243,45 @@ pub struct RequestStatusEvent {
     pub actor: Option<RequestEventActor>,
 }
 
+/// Candidate supplied by a resolver before request-level scoring.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestMatchCandidateInput {
+    /// Candidate canonical identity id.
+    pub canonical_identity_id: Id,
+    /// Candidate display title.
+    pub title: String,
+    /// Candidate release or first-air year when known.
+    pub year: Option<i32>,
+    /// Provider popularity value used only as a tiebreaker.
+    pub popularity: f64,
+}
+
+/// Ranked candidate stored when a request needs disambiguation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestMatchCandidate {
+    /// Request-local rank starting at one.
+    pub rank: u32,
+    /// Candidate canonical identity id.
+    pub canonical_identity_id: Id,
+    /// Candidate display title.
+    pub title: String,
+    /// Candidate release or first-air year when known.
+    pub year: Option<i32>,
+    /// Provider popularity value used only as a tiebreaker.
+    pub popularity: f64,
+    /// Confidence score in the inclusive range `0.0..=1.0`.
+    pub score: f64,
+}
+
 /// Internal detail projection for request reads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestDetail {
     /// Current request projection.
     pub request: Request,
     /// Status events ordered by occurrence.
     pub status_events: Vec<RequestStatusEvent>,
+    /// Ranked candidates when the request needs disambiguation.
+    pub candidates: Vec<RequestMatchCandidate>,
 }
 
 /// Query parameters for listing requests.
@@ -455,10 +523,26 @@ impl RequestService {
             .iter()
             .map(status_event_from_row)
             .collect::<Result<Vec<_>>>()?;
+        let candidate_rows = sqlx::query(
+            r#"
+            SELECT rank, canonical_identity_id, title, year, popularity, score
+            FROM request_match_candidates
+            WHERE request_id = ?1
+            ORDER BY rank
+            "#,
+        )
+        .bind(id)
+        .fetch_all(self.db.read_pool())
+        .await?;
+        let candidates = candidate_rows
+            .iter()
+            .map(match_candidate_from_row)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(RequestDetail {
             request,
             status_events,
+            candidates,
         })
     }
 
@@ -540,6 +624,162 @@ impl RequestService {
             return Err(Error::RequestNotFound { id: request_id });
         }
 
+        self.get(request_id).await
+    }
+
+    /// Score resolver candidates and either resolve or park the request.
+    pub async fn resolve_matches(
+        &self,
+        request_id: Id,
+        candidates: Vec<RequestMatchCandidateInput>,
+        actor: Option<RequestEventActor>,
+        message: Option<&str>,
+    ) -> Result<RequestDetail> {
+        validate_match_candidates(&candidates)?;
+
+        let mut tx = self.db.write_pool().begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                requester_kind,
+                requester_id,
+                target_raw_query,
+                canonical_identity_id,
+                state,
+                created_at,
+                updated_at,
+                plan_id,
+                failure_reason
+            FROM requests
+            WHERE id = ?1
+            "#,
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(Error::RequestNotFound { id: request_id });
+        };
+
+        let current = request_from_row(&row)?;
+        if !matches!(
+            current.state,
+            RequestState::Pending | RequestState::NeedsDisambiguation
+        ) {
+            return Err(Error::InvalidMatchResolutionState {
+                from: current.state,
+            });
+        }
+
+        let scored = score_match_candidates(&current.target.raw_query, candidates);
+        let top = scored.first().ok_or(Error::NoMatchCandidates)?;
+        let next_score = scored.get(1).map_or(0.0, |candidate| candidate.score);
+        let auto_resolve = top.score >= REQUEST_AUTO_RESOLVE_MIN_SCORE
+            && top.score - next_score >= REQUEST_AUTO_RESOLVE_MIN_MARGIN;
+        let now = Timestamp::now();
+
+        sqlx::query("DELETE FROM request_match_candidates WHERE request_id = ?1")
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if auto_resolve {
+            let next = RequestState::Resolved;
+            if !RequestTransition::Resolve.can_apply_from(current.state) {
+                return Err(Error::InvalidTransition {
+                    from: current.state,
+                    transition: RequestTransition::Resolve,
+                    to: next,
+                });
+            }
+
+            sqlx::query(
+                r#"
+                UPDATE requests
+                SET canonical_identity_id = ?2,
+                    state = ?3,
+                    updated_at = ?4,
+                    failure_reason = NULL
+                WHERE id = ?1
+                "#,
+            )
+            .bind(request_id)
+            .bind(top.canonical_identity_id)
+            .bind(next.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            insert_status_event(
+                &mut tx,
+                NewStatusEvent {
+                    id: Id::new(),
+                    request_id,
+                    from_state: Some(current.state),
+                    to_state: next,
+                    occurred_at: now,
+                    message,
+                    actor,
+                },
+            )
+            .await?;
+        } else {
+            for candidate in scored.iter().take(REQUEST_MATCH_CANDIDATE_LIMIT) {
+                insert_match_candidate(&mut tx, request_id, candidate, now).await?;
+            }
+
+            if current.state == RequestState::NeedsDisambiguation {
+                sqlx::query(
+                    r#"
+                    UPDATE requests
+                    SET canonical_identity_id = NULL,
+                        updated_at = ?2,
+                        failure_reason = NULL
+                    WHERE id = ?1
+                    "#,
+                )
+                .bind(request_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                let next = RequestState::NeedsDisambiguation;
+
+                sqlx::query(
+                    r#"
+                    UPDATE requests
+                    SET canonical_identity_id = NULL,
+                        state = ?2,
+                        updated_at = ?3,
+                        failure_reason = NULL
+                    WHERE id = ?1
+                    "#,
+                )
+                .bind(request_id)
+                .bind(next.as_str())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+
+                insert_status_event(
+                    &mut tx,
+                    NewStatusEvent {
+                        id: Id::new(),
+                        request_id,
+                        from_state: Some(current.state),
+                        to_state: next,
+                        occurred_at: now,
+                        message,
+                        actor,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
         self.get(request_id).await
     }
 
@@ -667,6 +907,41 @@ async fn insert_status_event(
     Ok(())
 }
 
+async fn insert_match_candidate(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    request_id: Id,
+    candidate: &RequestMatchCandidate,
+    created_at: Timestamp,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO request_match_candidates (
+            request_id,
+            rank,
+            canonical_identity_id,
+            title,
+            year,
+            popularity,
+            score,
+            created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(request_id)
+    .bind(i64::from(candidate.rank))
+    .bind(candidate.canonical_identity_id)
+    .bind(candidate.title.as_str())
+    .bind(candidate.year)
+    .bind(candidate.popularity)
+    .bind(candidate.score)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 fn request_from_row(row: &SqliteRow) -> Result<Request> {
     let failure_reason = row
         .try_get::<Option<&str>, _>("failure_reason")?
@@ -690,6 +965,26 @@ fn request_from_row(row: &SqliteRow) -> Result<Request> {
         updated_at: row.try_get("updated_at")?,
         plan_id: row.try_get("plan_id")?,
         failure_reason,
+    })
+}
+
+fn match_candidate_from_row(row: &SqliteRow) -> Result<RequestMatchCandidate> {
+    let canonical_identity_id = row.try_get("canonical_identity_id")?;
+    let rank =
+        row.try_get::<i64, _>("rank")?
+            .try_into()
+            .map_err(|_| Error::InvalidMatchCandidate {
+                canonical_identity_id,
+                reason: "rank is outside u32 range",
+            })?;
+
+    Ok(RequestMatchCandidate {
+        rank,
+        canonical_identity_id,
+        title: row.try_get("title")?,
+        year: row.try_get("year")?,
+        popularity: row.try_get("popularity")?,
+        score: row.try_get("score")?,
     })
 }
 
@@ -729,6 +1024,185 @@ fn parse_failure_reason(value: &str) -> Result<RequestFailureReason> {
     RequestFailureReason::parse(value).ok_or_else(|| Error::InvalidFailureReason {
         value: value.to_owned(),
     })
+}
+
+fn validate_match_candidates(candidates: &[RequestMatchCandidateInput]) -> Result<()> {
+    if candidates.is_empty() {
+        return Err(Error::NoMatchCandidates);
+    }
+
+    let mut seen = HashSet::with_capacity(candidates.len());
+    for candidate in candidates {
+        if candidate.title.trim().is_empty() {
+            return Err(Error::InvalidMatchCandidate {
+                canonical_identity_id: candidate.canonical_identity_id,
+                reason: "title is empty",
+            });
+        }
+        if candidate.year.is_some_and(|year| year <= 0) {
+            return Err(Error::InvalidMatchCandidate {
+                canonical_identity_id: candidate.canonical_identity_id,
+                reason: "year must be positive",
+            });
+        }
+        if !candidate.popularity.is_finite() || candidate.popularity < 0.0 {
+            return Err(Error::InvalidMatchCandidate {
+                canonical_identity_id: candidate.canonical_identity_id,
+                reason: "popularity must be finite and non-negative",
+            });
+        }
+        if !seen.insert(candidate.canonical_identity_id) {
+            return Err(Error::DuplicateMatchCandidate {
+                canonical_identity_id: candidate.canonical_identity_id,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn score_match_candidates(
+    raw_query: &str,
+    candidates: Vec<RequestMatchCandidateInput>,
+) -> Vec<RequestMatchCandidate> {
+    let query_title = title_without_year(raw_query);
+    let query_year = extract_year(raw_query);
+    let max_popularity = candidates
+        .iter()
+        .map(|candidate| candidate.popularity)
+        .fold(0.0, f64::max);
+
+    let mut scored = candidates
+        .into_iter()
+        .map(|candidate| {
+            let title_score = title_similarity(&query_title, &candidate.title);
+            let year_score = year_match_score(query_year, candidate.year);
+            let popularity_score = if max_popularity > 0.0 {
+                candidate.popularity / max_popularity
+            } else {
+                0.0
+            };
+            let score =
+                (title_score * 0.80 + year_score * 0.15 + popularity_score * 0.05).clamp(0.0, 1.0);
+
+            RequestMatchCandidate {
+                rank: 0,
+                canonical_identity_id: candidate.canonical_identity_id,
+                title: candidate.title,
+                year: candidate.year,
+                popularity: candidate.popularity,
+                score,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| right.popularity.total_cmp(&left.popularity))
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.canonical_identity_id.cmp(&right.canonical_identity_id))
+    });
+
+    for (index, candidate) in scored.iter_mut().enumerate() {
+        if index >= u32::MAX as usize {
+            candidate.rank = u32::MAX;
+        } else {
+            candidate.rank = index as u32 + 1;
+        };
+    }
+
+    scored
+}
+
+fn extract_year(value: &str) -> Option<i32> {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let end = index;
+        if end - start != 4 || !year_position_looks_intentional(value, start, end) {
+            continue;
+        }
+
+        if let Ok(year) = value[start..end].parse::<i32>()
+            && (1888..=2100).contains(&year)
+        {
+            return Some(year);
+        }
+    }
+
+    None
+}
+
+fn year_position_looks_intentional(value: &str, start: usize, end: usize) -> bool {
+    let previous = value[..start].chars().next_back();
+    let next = value[end..].chars().next();
+    let parenthesized = previous == Some('(') && next == Some(')');
+    let trailing = next.is_none()
+        && previous.is_some_and(|character| {
+            character.is_ascii_whitespace() || matches!(character, '-' | '/' | ':')
+        });
+
+    parenthesized || trailing
+}
+
+fn title_without_year(value: &str) -> String {
+    let mut title = value.to_owned();
+    if let Some(year) = extract_year(value) {
+        title = title.replace(&format!("({year})"), " ");
+        title = title.replace(&year.to_string(), " ");
+    }
+    title
+}
+
+fn year_match_score(query_year: Option<i32>, candidate_year: Option<i32>) -> f64 {
+    match (query_year, candidate_year) {
+        (Some(query), Some(candidate)) if query == candidate => 1.0,
+        (Some(query), Some(candidate)) if (query - candidate).abs() == 1 => 0.65,
+        (Some(_), Some(_)) => 0.0,
+        (Some(_), None) => 0.35,
+        (None, _) => 0.5,
+    }
+}
+
+fn title_similarity(left: &str, right: &str) -> f64 {
+    let left_tokens = normalized_tokens(left);
+    let right_tokens = normalized_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+    if left_tokens == right_tokens {
+        return 1.0;
+    }
+
+    let mut unmatched = right_tokens.clone();
+    let mut matches = 0usize;
+    for token in &left_tokens {
+        if let Some(index) = unmatched.iter().position(|candidate| candidate == token) {
+            unmatched.swap_remove(index);
+            matches += 1;
+        }
+    }
+
+    (2.0 * matches as f64) / (left_tokens.len() + right_tokens.len()) as f64
+}
+
+fn normalized_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 #[cfg(test)]
@@ -868,6 +1342,77 @@ mod tests {
         assert_eq!(loaded.request, updated.request);
         assert_eq!(listed.requests.len(), 1);
         assert_eq!(listed.requests[0], updated.request);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn high_confidence_match_resolves_request()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let winner_id = Id::new();
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+
+        let detail = service
+            .resolve_matches(
+                created.request.id,
+                vec![
+                    candidate(winner_id, "Inception", Some(2010), 80.0),
+                    candidate(Id::new(), "Interstellar", Some(2014), 70.0),
+                ],
+                Some(RequestEventActor::System),
+                Some("matched canonical media"),
+            )
+            .await?;
+
+        assert_eq!(detail.request.state, RequestState::Resolved);
+        assert_eq!(detail.request.target.canonical_identity_id, Some(winner_id));
+        assert!(detail.candidates.is_empty());
+        assert_eq!(detail.status_events.len(), 2);
+        assert_eq!(detail.status_events[1].to_state, RequestState::Resolved);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn low_confidence_match_parks_request_with_ranked_candidates()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let newer_id = Id::new();
+        let older_id = Id::new();
+        let created = service.create(NewRequest::anonymous("Dune")).await?;
+
+        let detail = service
+            .resolve_matches(
+                created.request.id,
+                vec![
+                    candidate(older_id, "Dune", Some(1984), 60.0),
+                    candidate(newer_id, "Dune", Some(2021), 90.0),
+                    candidate(Id::new(), "Dune World", Some(2021), 10.0),
+                ],
+                Some(RequestEventActor::System),
+                Some("needs user choice"),
+            )
+            .await?;
+        let loaded = service.get(created.request.id).await?;
+
+        assert_eq!(detail.request.state, RequestState::NeedsDisambiguation);
+        assert_eq!(detail.request.target.canonical_identity_id, None);
+        assert_eq!(detail.candidates.len(), 3);
+        assert_eq!(detail.candidates[0].rank, 1);
+        assert_eq!(detail.candidates[0].canonical_identity_id, newer_id);
+        assert_eq!(detail.candidates[1].rank, 2);
+        assert_eq!(detail.candidates[1].canonical_identity_id, older_id);
+        assert_eq!(loaded.candidates, detail.candidates);
+        assert_eq!(detail.status_events.len(), 2);
+        assert_eq!(
+            detail.status_events[1].to_state,
+            RequestState::NeedsDisambiguation
+        );
 
         Ok(())
     }
@@ -1068,6 +1613,7 @@ mod tests {
     fn transition_matrix_enumerates_legal_and_illegal_transitions() {
         let states = [
             RequestState::Pending,
+            RequestState::NeedsDisambiguation,
             RequestState::Resolved,
             RequestState::Planning,
             RequestState::Fulfilling,
@@ -1093,6 +1639,15 @@ mod tests {
                 RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
             ),
             (RequestState::Pending, RequestTransition::Cancel),
+            (
+                RequestState::NeedsDisambiguation,
+                RequestTransition::Resolve,
+            ),
+            (
+                RequestState::NeedsDisambiguation,
+                RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
+            ),
+            (RequestState::NeedsDisambiguation, RequestTransition::Cancel),
             (RequestState::Resolved, RequestTransition::StartPlanning),
             (
                 RequestState::Resolved,
@@ -1208,5 +1763,19 @@ mod tests {
         assert_eq!(detail.status_events[0].message, None);
 
         Ok(())
+    }
+
+    fn candidate(
+        canonical_identity_id: Id,
+        title: &str,
+        year: Option<i32>,
+        popularity: f64,
+    ) -> RequestMatchCandidateInput {
+        RequestMatchCandidateInput {
+            canonical_identity_id,
+            title: title.to_owned(),
+            year,
+            popularity,
+        }
     }
 }

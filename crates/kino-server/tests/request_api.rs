@@ -2,6 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request as HttpRequest, StatusCode, header},
 };
+use kino_core::Id;
 use kino_fulfillment::{RequestDetail, RequestListPage, RequestState};
 use serde::de::DeserializeOwned;
 use tower::util::ServiceExt;
@@ -125,6 +126,114 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
         )
         .await?;
     assert_eq!(bad_limit_response.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+    let created = create_request(&app, "Inception (2010)").await?;
+    let winner_id = Id::new();
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/requests/{}/matches", created.request.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{
+                        "message":"matched canonical media",
+                        "candidates":[
+                            {{
+                                "canonical_identity_id":"{winner_id}",
+                                "title":"Inception",
+                                "year":2010,
+                                "popularity":80.0
+                            }},
+                            {{
+                                "canonical_identity_id":"{}",
+                                "title":"Interstellar",
+                                "year":2014,
+                                "popularity":70.0
+                            }}
+                        ]
+                    }}"#,
+                    Id::new()
+                )))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let resolved: RequestDetail = response_json(response).await?;
+    assert_eq!(resolved.request.state, RequestState::Resolved);
+    assert_eq!(
+        resolved.request.target.canonical_identity_id,
+        Some(winner_id)
+    );
+    assert!(resolved.candidates.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_match_api_parks_low_confidence_match_with_candidates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+    let created = create_request(&app, "Dune").await?;
+    let newer_id = Id::new();
+    let older_id = Id::new();
+
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/requests/{}/matches", created.request.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{
+                        "message":"needs user choice",
+                        "candidates":[
+                            {{
+                                "canonical_identity_id":"{older_id}",
+                                "title":"Dune",
+                                "year":1984,
+                                "popularity":60.0
+                            }},
+                            {{
+                                "canonical_identity_id":"{newer_id}",
+                                "title":"Dune",
+                                "year":2021,
+                                "popularity":90.0
+                            }}
+                        ]
+                    }}"#
+                )))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parked: RequestDetail = response_json(response).await?;
+    assert_eq!(parked.request.state, RequestState::NeedsDisambiguation);
+    assert_eq!(parked.candidates.len(), 2);
+    assert_eq!(parked.candidates[0].canonical_identity_id, newer_id);
+
+    let get_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/requests/{}", created.request.id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let fetched: RequestDetail = response_json(get_response).await?;
+    assert_eq!(fetched.candidates, parked.candidates);
 
     Ok(())
 }
