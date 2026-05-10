@@ -27,7 +27,7 @@ pub struct ConfiguredFulfillmentProvider<'a> {
     /// User preference. Higher values rank ahead of lower values.
     pub preference: i32,
     /// Declared provider capabilities.
-    pub capabilities: &'a [FulfillmentProviderCapability],
+    pub capabilities: FulfillmentProviderCapabilities<'a>,
 }
 
 impl<'a> ConfiguredFulfillmentProvider<'a> {
@@ -35,13 +35,18 @@ impl<'a> ConfiguredFulfillmentProvider<'a> {
     pub const fn new(
         id: &'a str,
         preference: i32,
-        capabilities: &'a [FulfillmentProviderCapability],
+        capabilities: FulfillmentProviderCapabilities<'a>,
     ) -> Self {
         Self {
             id,
             preference,
             capabilities,
         }
+    }
+
+    /// Construct a descriptor from a provider implementation.
+    pub fn from_provider(provider: &'a dyn FulfillmentProvider, preference: i32) -> Self {
+        Self::new(provider.id(), preference, provider.capabilities())
     }
 }
 
@@ -52,6 +57,41 @@ pub enum FulfillmentProviderCapability {
     AnyMedia,
     /// Provider can attempt one canonical media kind.
     MediaKind(CanonicalIdentityKind),
+}
+
+/// Typed capability declaration returned by a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FulfillmentProviderCapabilities<'a> {
+    capabilities: &'a [FulfillmentProviderCapability],
+}
+
+impl<'a> FulfillmentProviderCapabilities<'a> {
+    /// Construct a provider capability declaration.
+    pub const fn new(capabilities: &'a [FulfillmentProviderCapability]) -> Self {
+        Self { capabilities }
+    }
+
+    /// Return all declared capabilities.
+    pub const fn as_slice(self) -> &'a [FulfillmentProviderCapability] {
+        self.capabilities
+    }
+
+    /// Whether no capabilities were declared.
+    pub const fn is_empty(self) -> bool {
+        self.capabilities.is_empty()
+    }
+
+    /// Return the best capability matching `media_kind`.
+    pub fn best_match(
+        self,
+        media_kind: CanonicalIdentityKind,
+    ) -> Option<FulfillmentProviderCapability> {
+        self.capabilities
+            .iter()
+            .copied()
+            .filter(|capability| capability.matches(media_kind))
+            .max_by_key(|capability| capability.rank())
+    }
 }
 
 /// Error returned by a fulfillment provider.
@@ -245,7 +285,7 @@ pub trait FulfillmentProvider: Send + Sync {
     fn id(&self) -> &str;
 
     /// Capabilities this provider can satisfy.
-    fn capabilities(&self) -> &[FulfillmentProviderCapability];
+    fn capabilities(&self) -> FulfillmentProviderCapabilities<'_>;
 
     /// Start fulfillment and return a provider-owned job handle.
     fn start<'a>(
@@ -399,14 +439,15 @@ pub fn select_fulfillment_provider(
                 return None;
             }
 
-            best_capability_match(provider.capabilities, media_kind).map(|matched_capability| {
-                RankedFulfillmentProvider {
+            provider
+                .capabilities
+                .best_match(media_kind)
+                .map(|matched_capability| RankedFulfillmentProvider {
                     rank: 0,
                     provider_id: provider_id.to_owned(),
                     preference: provider.preference,
                     matched_capability,
-                }
-            })
+                })
         })
         .collect::<Vec<_>>();
 
@@ -454,17 +495,6 @@ pub fn select_fulfillment_provider(
         ranked_providers: ranked,
         summary,
     })
-}
-
-fn best_capability_match(
-    capabilities: &[FulfillmentProviderCapability],
-    media_kind: CanonicalIdentityKind,
-) -> Option<FulfillmentProviderCapability> {
-    capabilities
-        .iter()
-        .copied()
-        .filter(|capability| capability.matches(media_kind))
-        .max_by_key(|capability| capability.rank())
 }
 
 fn validate_configured_providers(providers: &[ConfiguredFulfillmentProvider<'_>]) -> Result<()> {
@@ -533,13 +563,19 @@ mod tests {
     const TV: &[FulfillmentProviderCapability] = &[FulfillmentProviderCapability::MediaKind(
         CanonicalIdentityKind::TvSeries,
     )];
+    const ANY_CAPS: FulfillmentProviderCapabilities<'static> =
+        FulfillmentProviderCapabilities::new(ANY);
+    const MOVIE_CAPS: FulfillmentProviderCapabilities<'static> =
+        FulfillmentProviderCapabilities::new(MOVIE);
+    const TV_CAPS: FulfillmentProviderCapabilities<'static> =
+        FulfillmentProviderCapabilities::new(TV);
 
     #[test]
     fn single_matching_provider_is_selected() {
         let identity = movie_identity(550);
         let providers = [
-            ConfiguredFulfillmentProvider::new("tv-only", 100, TV),
-            ConfiguredFulfillmentProvider::new("movie-provider", 0, MOVIE),
+            ConfiguredFulfillmentProvider::new("tv-only", 100, TV_CAPS),
+            ConfiguredFulfillmentProvider::new("movie-provider", 0, MOVIE_CAPS),
         ];
 
         let plan = select_fulfillment_provider(ProviderSelectionContext::new(identity), &providers)
@@ -556,10 +592,10 @@ mod tests {
     fn multiple_matching_providers_use_documented_ranking() {
         let identity = movie_identity(550);
         let providers = [
-            ConfiguredFulfillmentProvider::new("z-generic-high", 100, ANY),
-            ConfiguredFulfillmentProvider::new("b-movie-low", 1, MOVIE),
-            ConfiguredFulfillmentProvider::new("a-movie-high", 10, MOVIE),
-            ConfiguredFulfillmentProvider::new("c-movie-high", 10, MOVIE),
+            ConfiguredFulfillmentProvider::new("z-generic-high", 100, ANY_CAPS),
+            ConfiguredFulfillmentProvider::new("b-movie-low", 1, MOVIE_CAPS),
+            ConfiguredFulfillmentProvider::new("a-movie-high", 10, MOVIE_CAPS),
+            ConfiguredFulfillmentProvider::new("c-movie-high", 10, MOVIE_CAPS),
         ];
 
         let plan = select_fulfillment_provider(ProviderSelectionContext::new(identity), &providers)
@@ -587,8 +623,8 @@ mod tests {
     fn rejected_provider_falls_back_to_next_match() {
         let identity = movie_identity(550);
         let providers = [
-            ConfiguredFulfillmentProvider::new("first", 10, MOVIE),
-            ConfiguredFulfillmentProvider::new("second", 5, MOVIE),
+            ConfiguredFulfillmentProvider::new("first", 10, MOVIE_CAPS),
+            ConfiguredFulfillmentProvider::new("second", 5, MOVIE_CAPS),
         ];
         let rejected = ["first"];
 
@@ -606,7 +642,7 @@ mod tests {
     #[test]
     fn no_matching_provider_needs_user_input() {
         let identity = movie_identity(550);
-        let providers = [ConfiguredFulfillmentProvider::new("tv-only", 100, TV)];
+        let providers = [ConfiguredFulfillmentProvider::new("tv-only", 100, TV_CAPS)];
 
         let plan = select_fulfillment_provider(ProviderSelectionContext::new(identity), &providers)
             .expect("provider selection should succeed");
@@ -620,8 +656,8 @@ mod tests {
     fn invalid_provider_configuration_is_rejected() {
         let identity = movie_identity(550);
         let providers = [
-            ConfiguredFulfillmentProvider::new("duplicate", 0, ANY),
-            ConfiguredFulfillmentProvider::new(" duplicate ", 1, ANY),
+            ConfiguredFulfillmentProvider::new("duplicate", 0, ANY_CAPS),
+            ConfiguredFulfillmentProvider::new(" duplicate ", 1, ANY_CAPS),
         ];
 
         let err = select_fulfillment_provider(ProviderSelectionContext::new(identity), &providers)
@@ -673,7 +709,7 @@ mod tests {
         let status = provider.status(&handle).await?;
 
         assert_eq!(provider.id(), "file-backed");
-        assert_eq!(provider.capabilities(), MOVIE);
+        assert_eq!(provider.capabilities().as_slice(), MOVIE);
         assert_eq!(handle.provider_id, "file-backed");
         assert_eq!(
             status,
@@ -743,8 +779,8 @@ mod tests {
             "file-backed"
         }
 
-        fn capabilities(&self) -> &[FulfillmentProviderCapability] {
-            MOVIE
+        fn capabilities(&self) -> FulfillmentProviderCapabilities<'_> {
+            MOVIE_CAPS
         }
 
         fn start<'a>(

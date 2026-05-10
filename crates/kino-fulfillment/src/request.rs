@@ -1483,7 +1483,8 @@ fn normalized_tokens(value: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::provider::{
-        FulfillmentProviderCapability, FulfillmentProviderError, ProviderRetryPolicy,
+        FulfillmentProviderCapabilities, FulfillmentProviderCapability, FulfillmentProviderError,
+        ProviderRetryPolicy,
     };
     use kino_core::{CanonicalIdentityKind, TmdbId};
     use std::time::Duration;
@@ -1496,6 +1497,10 @@ mod tests {
         &[FulfillmentProviderCapability::MediaKind(
             CanonicalIdentityKind::TvSeries,
         )];
+    const MOVIE_CAPS: FulfillmentProviderCapabilities<'static> =
+        FulfillmentProviderCapabilities::new(MOVIE_PROVIDER);
+    const TV_CAPS: FulfillmentProviderCapabilities<'static> =
+        FulfillmentProviderCapabilities::new(TV_PROVIDER);
 
     #[tokio::test]
     async fn create_writes_initial_status_event()
@@ -1896,8 +1901,8 @@ mod tests {
             )
             .await?;
         let providers = [
-            ConfiguredFulfillmentProvider::new("tv-provider", 100, TV_PROVIDER),
-            ConfiguredFulfillmentProvider::new("movie-provider", 0, MOVIE_PROVIDER),
+            ConfiguredFulfillmentProvider::new("tv-provider", 100, TV_CAPS),
+            ConfiguredFulfillmentProvider::new("movie-provider", 0, MOVIE_CAPS),
         ];
 
         let planned = service
@@ -1974,7 +1979,7 @@ mod tests {
         let providers = [ConfiguredFulfillmentProvider::new(
             "tv-provider",
             100,
-            TV_PROVIDER,
+            TV_CAPS,
         )];
 
         let planned = service
@@ -2035,8 +2040,8 @@ mod tests {
             .await?;
         insert_media_item(&db, canonical_identity_id).await?;
         let providers = [
-            ConfiguredFulfillmentProvider::new("duplicate", 0, MOVIE_PROVIDER),
-            ConfiguredFulfillmentProvider::new(" duplicate ", 1, MOVIE_PROVIDER),
+            ConfiguredFulfillmentProvider::new("duplicate", 0, MOVIE_CAPS),
+            ConfiguredFulfillmentProvider::new(" duplicate ", 1, MOVIE_CAPS),
         ];
 
         let planned = service
