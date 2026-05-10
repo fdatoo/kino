@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use kino_core::{Id, id::ParseIdError};
+use kino_core::{CanonicalIdentityId, Id, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
     NewRequest, RequestDetail, RequestEventActor, RequestListPage, RequestListQuery,
@@ -43,7 +43,7 @@ struct ScoreMatchesRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReResolveRequest {
-    canonical_identity_id: Id,
+    canonical_identity_id: CanonicalIdentityId,
     message: Option<String>,
 }
 

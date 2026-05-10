@@ -1,7 +1,8 @@
 //! Request persistence owned by fulfillment.
 
 use kino_core::{
-    Id, Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget, Timestamp,
+    CanonicalIdentity, CanonicalIdentityId, CanonicalIdentitySource, Id, Request,
+    RequestFailureReason, RequestRequester, RequestState, RequestTarget, Timestamp,
 };
 use kino_db::Db;
 use sqlx::{QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
@@ -29,7 +30,7 @@ pub(super) struct NewStatusEvent<'a> {
 pub(super) struct NewIdentityVersion {
     pub request_id: Id,
     pub version: u32,
-    pub canonical_identity_id: Id,
+    pub canonical_identity_id: CanonicalIdentityId,
     pub provenance: RequestIdentityProvenance,
     pub status_event_id: Option<Id>,
     pub created_at: Timestamp,
@@ -269,7 +270,7 @@ impl RequestStore {
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         request_id: Id,
-        canonical_identity_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
         state: RequestState,
         updated_at: Timestamp,
     ) -> Result<()> {
@@ -467,6 +468,43 @@ impl RequestStore {
         .bind(version.created_at)
         .bind(version.actor.map(RequestEventActor::kind))
         .bind(version.actor.and_then(RequestEventActor::id))
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    pub(super) async fn ensure_canonical_identity(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        id: CanonicalIdentityId,
+        source: CanonicalIdentitySource,
+        now: Timestamp,
+    ) -> Result<()> {
+        let identity = CanonicalIdentity::new(id, source, now, now);
+
+        sqlx::query(
+            r#"
+            INSERT INTO canonical_identities (
+                id,
+                provider,
+                media_kind,
+                tmdb_id,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO NOTHING
+            "#,
+        )
+        .bind(identity.id)
+        .bind(identity.provider.as_str())
+        .bind(identity.kind.as_str())
+        .bind(i64::from(identity.tmdb_id.get()))
+        .bind(identity.source.as_str())
+        .bind(identity.created_at)
+        .bind(identity.updated_at)
         .execute(&mut **tx)
         .await?;
 
