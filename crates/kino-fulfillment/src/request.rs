@@ -1,6 +1,6 @@
 //! Request status, matching, and state transitions.
 
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, time::Duration};
 
 use kino_core::{
     CanonicalIdentityId, CanonicalIdentitySource, Id, Request, RequestFailureReason,
@@ -15,7 +15,10 @@ use crate::{
         ComputedFulfillmentPlan, FulfillmentLibraryState, FulfillmentPlanningInput,
         compute_fulfillment_plan,
     },
-    provider::{ConfiguredFulfillmentProvider, ProviderSelectionPlan},
+    provider::{
+        ConfiguredFulfillmentProvider, FulfillmentProviderError, ProviderRetryPolicy,
+        ProviderSelectionPlan,
+    },
 };
 
 mod store;
@@ -515,6 +518,27 @@ pub struct ProviderSelectionPlanningResult {
     pub detail: RequestDetail,
 }
 
+/// Result of recording a provider error against a request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderErrorHandlingResult {
+    /// The provider error was transient and another attempt should be scheduled.
+    Retry {
+        /// Provider that returned the transient error.
+        provider_id: String,
+        /// Number of consecutive failures including the one just recorded.
+        failure_count: u32,
+        /// Delay to wait before the next attempt.
+        retry_after: Duration,
+        /// Human-readable status context.
+        message: String,
+    },
+    /// The request was transitioned to failed.
+    Failed {
+        /// Request detail after failure transition.
+        detail: Box<RequestDetail>,
+    },
+}
+
 /// Query parameters for listing requests.
 ///
 /// Pagination uses offset semantics. Results are ordered by `(created_at, id)`;
@@ -876,6 +900,43 @@ impl RequestService {
         let detail = self.get(request_id).await?;
 
         Ok(ProviderSelectionPlanningResult { selection, detail })
+    }
+
+    /// Apply provider error semantics to a request.
+    pub async fn handle_provider_error(
+        &self,
+        request_id: Id,
+        provider_id: &str,
+        error: FulfillmentProviderError,
+        failure_count: u32,
+        retry_policy: ProviderRetryPolicy,
+        actor: Option<RequestEventActor>,
+    ) -> Result<ProviderErrorHandlingResult> {
+        let provider_id = validate_provider_error_provider_id(provider_id)?;
+        let message = error.status_message(provider_id);
+        if error.is_transient()
+            && let Some(retry_after) = retry_policy.retry_after(failure_count)
+        {
+            return Ok(ProviderErrorHandlingResult::Retry {
+                provider_id: provider_id.to_owned(),
+                failure_count,
+                retry_after,
+                message,
+            });
+        }
+
+        let detail = self
+            .transition(
+                request_id,
+                RequestTransition::Fail(RequestFailureReason::AcquisitionFailed),
+                actor,
+                Some(message.as_str()),
+            )
+            .await?;
+
+        Ok(ProviderErrorHandlingResult::Failed {
+            detail: Box::new(detail),
+        })
     }
 
     /// Resolve a pending or disambiguated request to a canonical identity.
@@ -1263,6 +1324,18 @@ fn validate_plan_summary(summary: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+fn validate_provider_error_provider_id(provider_id: &str) -> Result<&str> {
+    let trimmed = provider_id.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidFulfillmentProvider {
+            provider_id: provider_id.to_owned(),
+            reason: "id is empty",
+        });
+    }
+
+    Ok(trimmed)
+}
+
 fn score_match_candidates(
     raw_query: &str,
     candidates: Vec<RequestMatchCandidateInput>,
@@ -1409,8 +1482,11 @@ fn normalized_tokens(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::FulfillmentProviderCapability;
+    use crate::provider::{
+        FulfillmentProviderCapability, FulfillmentProviderError, ProviderRetryPolicy,
+    };
     use kino_core::{CanonicalIdentityKind, TmdbId};
+    use std::time::Duration;
 
     const MOVIE_PROVIDER: &[FulfillmentProviderCapability] =
         &[FulfillmentProviderCapability::MediaKind(
@@ -1986,6 +2062,130 @@ mod tests {
                 .as_ref()
                 .map(|plan| plan.decision),
             Some(FulfillmentPlanDecision::AlreadySatisfied)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_provider_error_returns_retry_without_state_transition()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let request_id = fulfilling_request(&service).await?;
+        let policy = ProviderRetryPolicy::new(3, Duration::from_secs(5), Duration::from_secs(30));
+
+        let result = service
+            .handle_provider_error(
+                request_id,
+                "movie-provider",
+                FulfillmentProviderError::transient("timeout", "provider timed out"),
+                1,
+                policy,
+                Some(RequestEventActor::System),
+            )
+            .await?;
+
+        assert_eq!(
+            result,
+            ProviderErrorHandlingResult::Retry {
+                provider_id: String::from("movie-provider"),
+                failure_count: 1,
+                retry_after: Duration::from_secs(5),
+                message: String::from(
+                    "provider movie-provider returned transient error timeout: provider timed out"
+                ),
+            }
+        );
+
+        let detail = service.get(request_id).await?;
+        assert_eq!(detail.request.state, RequestState::Fulfilling);
+        assert_eq!(detail.request.failure_reason, None);
+        assert_eq!(
+            detail.status_events.last().map(|event| event.to_state),
+            Some(RequestState::Fulfilling)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permanent_provider_error_fails_request_with_error_message()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let request_id = fulfilling_request(&service).await?;
+
+        let result = service
+            .handle_provider_error(
+                request_id,
+                "movie-provider",
+                FulfillmentProviderError::permanent("not_found", "provider rejected id"),
+                1,
+                ProviderRetryPolicy::default(),
+                Some(RequestEventActor::System),
+            )
+            .await?;
+
+        let ProviderErrorHandlingResult::Failed { detail } = result else {
+            panic!("permanent errors should fail the request");
+        };
+        let event = detail
+            .status_events
+            .last()
+            .ok_or("failed request should have a status event")?;
+
+        assert_eq!(detail.request.state, RequestState::Failed);
+        assert_eq!(
+            detail.request.failure_reason,
+            Some(RequestFailureReason::AcquisitionFailed)
+        );
+        assert_eq!(event.to_state, RequestState::Failed);
+        assert_eq!(
+            event.message.as_deref(),
+            Some(
+                "provider movie-provider returned permanent error not_found: provider rejected id"
+            )
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_transient_provider_error_fails_request()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let request_id = fulfilling_request(&service).await?;
+
+        let result = service
+            .handle_provider_error(
+                request_id,
+                "movie-provider",
+                FulfillmentProviderError::transient("rate_limited", "provider is rate limited"),
+                3,
+                ProviderRetryPolicy::default(),
+                Some(RequestEventActor::System),
+            )
+            .await?;
+
+        let ProviderErrorHandlingResult::Failed { detail } = result else {
+            panic!("exhausted transient errors should fail the request");
+        };
+
+        assert_eq!(detail.request.state, RequestState::Failed);
+        assert_eq!(
+            detail.request.failure_reason,
+            Some(RequestFailureReason::AcquisitionFailed)
+        );
+        assert_eq!(
+            detail
+                .status_events
+                .last()
+                .and_then(|event| event.message.as_deref()),
+            Some(
+                "provider movie-provider returned transient error rate_limited: provider is rate limited"
+            )
         );
 
         Ok(())
@@ -2589,6 +2789,41 @@ mod tests {
             Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
             None => panic!("test tmdb id must be positive"),
         }
+    }
+
+    async fn fulfilling_request(
+        service: &RequestService,
+    ) -> std::result::Result<Id, Box<dyn std::error::Error>> {
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+        service
+            .resolve_identity(
+                created.request.id,
+                identity(550),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartFulfilling,
+                None,
+                None,
+            )
+            .await?;
+
+        Ok(created.request.id)
     }
 
     async fn insert_media_item(
