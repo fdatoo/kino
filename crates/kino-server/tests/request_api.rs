@@ -3,7 +3,10 @@ use axum::{
     http::{Request as HttpRequest, StatusCode, header},
 };
 use kino_core::Id;
-use kino_fulfillment::{RequestDetail, RequestListPage, RequestState};
+use kino_fulfillment::{
+    NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage, RequestService,
+    RequestState, RequestTransition,
+};
 use serde::de::DeserializeOwned;
 use tower::util::ServiceExt;
 
@@ -234,6 +237,82 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
     assert_eq!(get_response.status(), StatusCode::OK);
     let fetched: RequestDetail = response_json(get_response).await?;
     assert_eq!(fetched.candidates, parked.candidates);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn re_resolution_api_records_versioned_identity_history()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let service = RequestService::new(db.clone());
+    let app = kino_server::router(db);
+    let first_identity = Id::new();
+    let second_identity = Id::new();
+    let created = service
+        .create(NewRequest::anonymous("Inception (2010)"))
+        .await?;
+    service
+        .resolve_identity(
+            created.request.id,
+            first_identity,
+            RequestIdentityProvenance::Manual,
+            None,
+            Some("initial choice"),
+        )
+        .await?;
+    service
+        .transition(
+            created.request.id,
+            RequestTransition::StartPlanning,
+            None,
+            None,
+        )
+        .await?;
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/requests/{}/re-resolution",
+                    created.request.id
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{
+                        "canonical_identity_id":"{second_identity}",
+                        "message":"admin selected a better match"
+                    }}"#
+                )))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail: RequestDetail = response_json(response).await?;
+    assert_eq!(detail.request.state, RequestState::Resolved);
+    assert_eq!(
+        detail.request.target.canonical_identity_id,
+        Some(second_identity)
+    );
+    assert_eq!(detail.identity_versions.len(), 2);
+    assert_eq!(detail.identity_versions[0].version, 1);
+    assert_eq!(
+        detail.identity_versions[0].canonical_identity_id,
+        first_identity
+    );
+    assert_eq!(detail.identity_versions[1].version, 2);
+    assert_eq!(
+        detail.identity_versions[1].canonical_identity_id,
+        second_identity
+    );
+    assert_eq!(
+        detail
+            .status_events
+            .last()
+            .and_then(|event| event.message.as_deref()),
+        Some("admin selected a better match")
+    );
 
     Ok(())
 }

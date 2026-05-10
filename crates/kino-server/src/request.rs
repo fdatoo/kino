@@ -8,8 +8,8 @@ use axum::{
 use kino_core::{Id, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
-    NewRequest, RequestDetail, RequestListPage, RequestListQuery, RequestMatchCandidateInput,
-    RequestService, RequestState, RequestTransition,
+    NewRequest, RequestDetail, RequestEventActor, RequestListPage, RequestListQuery,
+    RequestMatchCandidateInput, RequestService, RequestState, RequestTransition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,13 @@ struct ScoreMatchesRequest {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReResolveRequest {
+    canonical_identity_id: Id,
+    message: Option<String>,
+}
+
 pub(crate) fn router(db: Db) -> Router {
     let state = AppState {
         requests: RequestService::new(db),
@@ -52,6 +59,7 @@ pub(crate) fn router(db: Db) -> Router {
             get(get_request).delete(cancel_request),
         )
         .route("/api/requests/{id}/matches", post(score_matches))
+        .route("/api/requests/{id}/re-resolution", post(re_resolve))
         .with_state(state)
 }
 
@@ -122,7 +130,25 @@ async fn score_matches(
         .resolve_matches(
             id,
             payload.candidates,
-            Some(kino_fulfillment::RequestEventActor::System),
+            Some(RequestEventActor::System),
+            payload.message.as_deref(),
+        )
+        .await?;
+    Ok(Json(detail))
+}
+
+async fn re_resolve(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ReResolveRequest>,
+) -> ApiResult<Json<RequestDetail>> {
+    let id = parse_id(id)?;
+    let detail = state
+        .requests
+        .re_resolve_identity(
+            id,
+            payload.canonical_identity_id,
+            Some(RequestEventActor::System),
             payload.message.as_deref(),
         )
         .await?;
@@ -156,6 +182,9 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT
             }
             Self::Fulfillment(kino_fulfillment::Error::InvalidMatchResolutionState { .. }) => {
+                StatusCode::CONFLICT
+            }
+            Self::Fulfillment(kino_fulfillment::Error::ResolutionRequiresIdentity { .. }) => {
                 StatusCode::CONFLICT
             }
             Self::Fulfillment(kino_fulfillment::Error::InvalidListLimit { .. }) => {

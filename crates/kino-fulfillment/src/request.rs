@@ -95,6 +95,27 @@ pub enum Error {
     #[error("request match resolution requires at least one candidate")]
     NoMatchCandidates,
 
+    /// Resolution transitions require an explicit canonical identity action.
+    #[error("request transition {transition} requires canonical identity resolution")]
+    ResolutionRequiresIdentity {
+        /// Requested resolution transition.
+        transition: RequestTransition,
+    },
+
+    /// A persisted identity provenance is outside the known enum.
+    #[error("request identity provenance {value} is invalid")]
+    InvalidIdentityProvenance {
+        /// Persisted provenance value.
+        value: String,
+    },
+
+    /// A persisted identity version is outside the accepted range.
+    #[error("request identity version {version} is invalid")]
+    InvalidIdentityVersion {
+        /// Persisted version value.
+        version: i64,
+    },
+
     /// A candidate appears more than once in one scoring request.
     #[error("request match candidate {canonical_identity_id} is duplicated")]
     DuplicateMatchCandidate {
@@ -243,6 +264,52 @@ pub struct RequestStatusEvent {
     pub actor: Option<RequestEventActor>,
 }
 
+/// Provenance for a request canonical identity version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestIdentityProvenance {
+    /// Resolver match scoring selected the identity.
+    MatchScoring,
+    /// A user or admin deliberately selected the identity.
+    Manual,
+}
+
+impl RequestIdentityProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MatchScoring => "match_scoring",
+            Self::Manual => "manual",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "match_scoring" => Some(Self::MatchScoring),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+/// Versioned canonical identity selected for a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestIdentityVersion {
+    /// Request id.
+    pub request_id: Id,
+    /// Monotonic per-request identity version.
+    pub version: u32,
+    /// Selected canonical identity id.
+    pub canonical_identity_id: Id,
+    /// Reason the identity was selected.
+    pub provenance: RequestIdentityProvenance,
+    /// Status event written by the same resolution transition.
+    pub status_event_id: Option<Id>,
+    /// Version creation timestamp.
+    pub created_at: Timestamp,
+    /// Optional actor responsible for the identity choice.
+    pub actor: Option<RequestEventActor>,
+}
+
 /// Candidate supplied by a resolver before request-level scoring.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestMatchCandidateInput {
@@ -280,6 +347,8 @@ pub struct RequestDetail {
     pub request: Request,
     /// Status events ordered by occurrence.
     pub status_events: Vec<RequestStatusEvent>,
+    /// Canonical identity history ordered by version.
+    pub identity_versions: Vec<RequestIdentityVersion>,
     /// Ranked candidates when the request needs disambiguation.
     pub candidates: Vec<RequestMatchCandidate>,
 }
@@ -407,10 +476,10 @@ impl<'a> NewRequest<'a> {
     }
 }
 
-/// Mutable request model links.
+/// Mutable non-identity request model links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RequestModelUpdate {
-    /// Resolved canonical identity id.
+    /// Canonical identity writes are rejected; use resolution APIs instead.
     pub canonical_identity_id: Option<Id>,
     /// Fulfillment plan id.
     pub plan_id: Option<Id>,
@@ -523,6 +592,29 @@ impl RequestService {
             .iter()
             .map(status_event_from_row)
             .collect::<Result<Vec<_>>>()?;
+        let identity_rows = sqlx::query(
+            r#"
+            SELECT
+                request_id,
+                version,
+                canonical_identity_id,
+                provenance,
+                status_event_id,
+                created_at,
+                actor_kind,
+                actor_id
+            FROM request_identity_versions
+            WHERE request_id = ?1
+            ORDER BY version
+            "#,
+        )
+        .bind(id)
+        .fetch_all(self.db.read_pool())
+        .await?;
+        let identity_versions = identity_rows
+            .iter()
+            .map(identity_version_from_row)
+            .collect::<Result<Vec<_>>>()?;
         let candidate_rows = sqlx::query(
             r#"
             SELECT rank, canonical_identity_id, title, year, popularity, score
@@ -542,6 +634,7 @@ impl RequestService {
         Ok(RequestDetail {
             request,
             status_events,
+            identity_versions,
             candidates,
         })
     }
@@ -603,18 +696,22 @@ impl RequestService {
         request_id: Id,
         update: RequestModelUpdate,
     ) -> Result<RequestDetail> {
+        if update.canonical_identity_id.is_some() {
+            return Err(Error::ResolutionRequiresIdentity {
+                transition: RequestTransition::Resolve,
+            });
+        }
+
         let now = Timestamp::now();
         let result = sqlx::query(
             r#"
             UPDATE requests
-            SET canonical_identity_id = ?2,
-                plan_id = ?3,
-                updated_at = ?4
+            SET plan_id = ?2,
+                updated_at = ?3
             WHERE id = ?1
             "#,
         )
         .bind(request_id)
-        .bind(update.canonical_identity_id)
         .bind(update.plan_id)
         .bind(now)
         .execute(self.db.write_pool())
@@ -624,6 +721,141 @@ impl RequestService {
             return Err(Error::RequestNotFound { id: request_id });
         }
 
+        self.get(request_id).await
+    }
+
+    /// Resolve a pending or disambiguated request to a canonical identity.
+    pub async fn resolve_identity(
+        &self,
+        request_id: Id,
+        canonical_identity_id: Id,
+        provenance: RequestIdentityProvenance,
+        actor: Option<RequestEventActor>,
+        message: Option<&str>,
+    ) -> Result<RequestDetail> {
+        self.resolve_identity_with_transition(
+            request_id,
+            canonical_identity_id,
+            provenance,
+            RequestTransition::Resolve,
+            actor,
+            message,
+        )
+        .await
+    }
+
+    /// Deliberately replace a post-resolution canonical identity.
+    pub async fn re_resolve_identity(
+        &self,
+        request_id: Id,
+        canonical_identity_id: Id,
+        actor: Option<RequestEventActor>,
+        message: Option<&str>,
+    ) -> Result<RequestDetail> {
+        self.resolve_identity_with_transition(
+            request_id,
+            canonical_identity_id,
+            RequestIdentityProvenance::Manual,
+            RequestTransition::ReResolve,
+            actor,
+            message,
+        )
+        .await
+    }
+
+    async fn resolve_identity_with_transition(
+        &self,
+        request_id: Id,
+        canonical_identity_id: Id,
+        provenance: RequestIdentityProvenance,
+        transition: RequestTransition,
+        actor: Option<RequestEventActor>,
+        message: Option<&str>,
+    ) -> Result<RequestDetail> {
+        let mut tx = self.db.write_pool().begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                requester_kind,
+                requester_id,
+                target_raw_query,
+                canonical_identity_id,
+                state,
+                created_at,
+                updated_at,
+                plan_id,
+                failure_reason
+            FROM requests
+            WHERE id = ?1
+            "#,
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(Error::RequestNotFound { id: request_id });
+        };
+
+        let current = request_from_row(&row)?;
+        let next = transition.to_state();
+        if !transition.can_apply_from(current.state) {
+            return Err(Error::InvalidTransition {
+                from: current.state,
+                transition,
+                to: next,
+            });
+        }
+
+        let now = Timestamp::now();
+        let event_id = Id::new();
+        let version = next_identity_version(&mut tx, request_id).await?;
+        sqlx::query(
+            r#"
+            UPDATE requests
+            SET canonical_identity_id = ?2,
+                state = ?3,
+                updated_at = ?4,
+                failure_reason = NULL
+            WHERE id = ?1
+            "#,
+        )
+        .bind(request_id)
+        .bind(canonical_identity_id)
+        .bind(next.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        insert_status_event(
+            &mut tx,
+            NewStatusEvent {
+                id: event_id,
+                request_id,
+                from_state: Some(current.state),
+                to_state: next,
+                occurred_at: now,
+                message,
+                actor,
+            },
+        )
+        .await?;
+        insert_identity_version(
+            &mut tx,
+            NewIdentityVersion {
+                request_id,
+                version,
+                canonical_identity_id,
+                provenance,
+                status_event_id: Some(event_id),
+                created_at: now,
+                actor,
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
         self.get(request_id).await
     }
 
@@ -695,6 +927,8 @@ impl RequestService {
                 });
             }
 
+            let event_id = Id::new();
+            let version = next_identity_version(&mut tx, request_id).await?;
             sqlx::query(
                 r#"
                 UPDATE requests
@@ -715,12 +949,25 @@ impl RequestService {
             insert_status_event(
                 &mut tx,
                 NewStatusEvent {
-                    id: Id::new(),
+                    id: event_id,
                     request_id,
                     from_state: Some(current.state),
                     to_state: next,
                     occurred_at: now,
                     message,
+                    actor,
+                },
+            )
+            .await?;
+            insert_identity_version(
+                &mut tx,
+                NewIdentityVersion {
+                    request_id,
+                    version,
+                    canonical_identity_id: top.canonical_identity_id,
+                    provenance: RequestIdentityProvenance::MatchScoring,
+                    status_event_id: Some(event_id),
+                    created_at: now,
                     actor,
                 },
             )
@@ -791,6 +1038,13 @@ impl RequestService {
         actor: Option<RequestEventActor>,
         message: Option<&str>,
     ) -> Result<RequestDetail> {
+        if matches!(
+            transition,
+            RequestTransition::Resolve | RequestTransition::ReResolve
+        ) {
+            return Err(Error::ResolutionRequiresIdentity { transition });
+        }
+
         let mut tx = self.db.write_pool().begin().await?;
         let row = sqlx::query(
             r#"
@@ -874,6 +1128,16 @@ struct NewStatusEvent<'a> {
     actor: Option<RequestEventActor>,
 }
 
+struct NewIdentityVersion {
+    request_id: Id,
+    version: u32,
+    canonical_identity_id: Id,
+    provenance: RequestIdentityProvenance,
+    status_event_id: Option<Id>,
+    created_at: Timestamp,
+    actor: Option<RequestEventActor>,
+}
+
 async fn insert_status_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     event: NewStatusEvent<'_>,
@@ -901,6 +1165,61 @@ async fn insert_status_event(
     .bind(event.message)
     .bind(event.actor.map(RequestEventActor::kind))
     .bind(event.actor.and_then(RequestEventActor::id))
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn next_identity_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    request_id: Id,
+) -> Result<u32> {
+    let version = sqlx::query_scalar::<_, Option<i64>>(
+        r#"
+        SELECT MAX(version)
+        FROM request_identity_versions
+        WHERE request_id = ?1
+        "#,
+    )
+    .bind(request_id)
+    .fetch_one(&mut **tx)
+    .await?
+    .unwrap_or(0)
+        + 1;
+
+    version
+        .try_into()
+        .map_err(|_| Error::InvalidIdentityVersion { version })
+}
+
+async fn insert_identity_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    version: NewIdentityVersion,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO request_identity_versions (
+            request_id,
+            version,
+            canonical_identity_id,
+            provenance,
+            status_event_id,
+            created_at,
+            actor_kind,
+            actor_id
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(version.request_id)
+    .bind(i64::from(version.version))
+    .bind(version.canonical_identity_id)
+    .bind(version.provenance.as_str())
+    .bind(version.status_event_id)
+    .bind(version.created_at)
+    .bind(version.actor.map(RequestEventActor::kind))
+    .bind(version.actor.and_then(RequestEventActor::id))
     .execute(&mut **tx)
     .await?;
 
@@ -1010,6 +1329,40 @@ fn status_event_from_row(row: &SqliteRow) -> Result<RequestStatusEvent> {
         to_state: parse_request_state(row.try_get("to_state")?)?,
         occurred_at: row.try_get("occurred_at")?,
         message: row.try_get("message")?,
+        actor,
+    })
+}
+
+fn identity_version_from_row(row: &SqliteRow) -> Result<RequestIdentityVersion> {
+    let actor = match (
+        row.try_get::<Option<&str>, _>("actor_kind")?,
+        row.try_get::<Option<Id>, _>("actor_id")?,
+    ) {
+        (None, None) => None,
+        (Some("system"), None) => Some(RequestEventActor::System),
+        (Some("user"), Some(id)) => Some(RequestEventActor::User(id)),
+        _ => return Err(Error::InvalidEventActor),
+    };
+    let persisted_version = row.try_get::<i64, _>("version")?;
+    let version = persisted_version
+        .try_into()
+        .map_err(|_| Error::InvalidIdentityVersion {
+            version: persisted_version,
+        })?;
+    let provenance =
+        RequestIdentityProvenance::parse(row.try_get("provenance")?).ok_or_else(|| {
+            Error::InvalidIdentityProvenance {
+                value: row.get::<String, _>("provenance"),
+            }
+        })?;
+
+    Ok(RequestIdentityVersion {
+        request_id: row.try_get("request_id")?,
+        version,
+        canonical_identity_id: row.try_get("canonical_identity_id")?,
+        provenance,
+        status_event_id: row.try_get("status_event_id")?,
+        created_at: row.try_get("created_at")?,
         actor,
     })
 }
@@ -1238,10 +1591,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transition_updates_state_and_appends_event()
+    async fn resolve_identity_updates_state_and_appends_event()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
+        let canonical_identity_id = Id::new();
         let created = service
             .create(
                 NewRequest::anonymous("Inception (2010)")
@@ -1251,9 +1605,10 @@ mod tests {
             .await?;
 
         let detail = service
-            .transition(
+            .resolve_identity(
                 created.request.id,
-                RequestTransition::Resolve,
+                canonical_identity_id,
+                RequestIdentityProvenance::Manual,
                 Some(RequestEventActor::System),
                 Some("matched canonical media"),
             )
@@ -1269,6 +1624,20 @@ mod tests {
         assert_eq!(
             detail.status_events[1].message.as_deref(),
             Some("matched canonical media")
+        );
+        assert_eq!(detail.identity_versions.len(), 1);
+        assert_eq!(detail.identity_versions[0].version, 1);
+        assert_eq!(
+            detail.identity_versions[0].canonical_identity_id,
+            canonical_identity_id
+        );
+        assert_eq!(
+            detail.identity_versions[0].provenance,
+            RequestIdentityProvenance::Manual
+        );
+        assert_eq!(
+            detail.identity_versions[0].status_event_id,
+            Some(detail.status_events[1].id)
         );
 
         Ok(())
@@ -1305,7 +1674,6 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let canonical_identity_id = Id::new();
         let plan_id = Id::new();
 
         let created = service
@@ -1326,7 +1694,7 @@ mod tests {
             .update_model(
                 created.request.id,
                 RequestModelUpdate {
-                    canonical_identity_id: Some(canonical_identity_id),
+                    canonical_identity_id: None,
                     plan_id: Some(plan_id),
                 },
             )
@@ -1334,14 +1702,48 @@ mod tests {
         let loaded = service.get(created.request.id).await?;
         let listed = service.list(RequestListQuery::new()).await?;
 
-        assert_eq!(
-            updated.request.target.canonical_identity_id,
-            Some(canonical_identity_id)
-        );
+        assert_eq!(updated.request.target.canonical_identity_id, None);
         assert_eq!(updated.request.plan_id, Some(plan_id));
         assert_eq!(loaded.request, updated.request);
         assert_eq!(listed.requests.len(), 1);
         assert_eq!(listed.requests[0], updated.request);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_model_update_rejects_identity_overwrite()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+
+        let err = match service
+            .update_model(
+                created.request.id,
+                RequestModelUpdate {
+                    canonical_identity_id: Some(Id::new()),
+                    plan_id: None,
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("unversioned identity update was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            Error::ResolutionRequiresIdentity {
+                transition: RequestTransition::Resolve
+            }
+        ));
+
+        let detail = service.get(created.request.id).await?;
+        assert_eq!(detail.request.target.canonical_identity_id, None);
+        assert!(detail.identity_versions.is_empty());
 
         Ok(())
     }
@@ -1373,6 +1775,13 @@ mod tests {
         assert!(detail.candidates.is_empty());
         assert_eq!(detail.status_events.len(), 2);
         assert_eq!(detail.status_events[1].to_state, RequestState::Resolved);
+        assert_eq!(detail.identity_versions.len(), 1);
+        assert_eq!(detail.identity_versions[0].version, 1);
+        assert_eq!(detail.identity_versions[0].canonical_identity_id, winner_id);
+        assert_eq!(
+            detail.identity_versions[0].provenance,
+            RequestIdentityProvenance::MatchScoring
+        );
 
         Ok(())
     }
@@ -1428,7 +1837,13 @@ mod tests {
             .create(NewRequest::anonymous("resolved").with_message("resolved"))
             .await?;
         service
-            .transition(resolved.request.id, RequestTransition::Resolve, None, None)
+            .resolve_identity(
+                resolved.request.id,
+                Id::new(),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
             .await?;
 
         let page = service
@@ -1545,6 +1960,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_resolution_transition_requires_identity_action()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+
+        let err = match service
+            .transition(created.request.id, RequestTransition::Resolve, None, None)
+            .await
+        {
+            Ok(_) => panic!("unversioned resolution transition was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            Error::ResolutionRequiresIdentity {
+                transition: RequestTransition::Resolve
+            }
+        ));
+
+        let detail = service.get(created.request.id).await?;
+        assert_eq!(detail.request.state, RequestState::Pending);
+        assert_eq!(detail.status_events.len(), 1);
+        assert!(detail.identity_versions.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn terminal_states_reject_later_transitions()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
@@ -1557,9 +2004,10 @@ mod tests {
             .await?;
 
         let err = match service
-            .transition(
+            .resolve_identity(
                 cancelled.request.id,
-                RequestTransition::Resolve,
+                Id::new(),
+                RequestIdentityProvenance::Manual,
                 Some(RequestEventActor::System),
                 None,
             )
@@ -1699,7 +2147,13 @@ mod tests {
             .create(NewRequest::anonymous("Inception (2010)"))
             .await?;
         service
-            .transition(created.request.id, RequestTransition::Resolve, None, None)
+            .resolve_identity(
+                created.request.id,
+                Id::new(),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
             .await?;
         service
             .transition(
@@ -1711,9 +2165,9 @@ mod tests {
             .await?;
 
         let detail = service
-            .transition(
+            .re_resolve_identity(
                 created.request.id,
-                RequestTransition::ReResolve,
+                Id::new(),
                 Some(RequestEventActor::System),
                 Some("resolved again"),
             )
@@ -1729,6 +2183,16 @@ mod tests {
         assert_eq!(
             detail.status_events[3].message.as_deref(),
             Some("resolved again")
+        );
+        assert_eq!(detail.identity_versions.len(), 2);
+        assert_eq!(detail.identity_versions[1].version, 2);
+        assert_eq!(
+            detail.identity_versions[1].provenance,
+            RequestIdentityProvenance::Manual
+        );
+        assert_eq!(
+            detail.identity_versions[1].status_event_id,
+            Some(detail.status_events[3].id)
         );
 
         Ok(())
@@ -1761,6 +2225,48 @@ mod tests {
         let detail = service.get(created.request.id).await?;
         assert_eq!(detail.status_events.len(), 1);
         assert_eq!(detail.status_events[0].message, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_versions_are_append_only()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db.clone());
+        let detail = service
+            .resolve_identity(
+                service
+                    .create(NewRequest::anonymous("Inception (2010)"))
+                    .await?
+                    .request
+                    .id,
+                Id::new(),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+
+        let update_result = sqlx::query(
+            "UPDATE request_identity_versions SET provenance = ?3 WHERE request_id = ?1 AND version = ?2",
+        )
+        .bind(detail.request.id)
+        .bind(i64::from(detail.identity_versions[0].version))
+        .bind(RequestIdentityProvenance::MatchScoring.as_str())
+        .execute(db.write_pool())
+        .await;
+        let delete_result =
+            sqlx::query("DELETE FROM request_identity_versions WHERE request_id = ?1")
+                .bind(detail.request.id)
+                .execute(db.write_pool())
+                .await;
+
+        assert!(update_result.is_err());
+        assert!(delete_result.is_err());
+
+        let loaded = service.get(detail.request.id).await?;
+        assert_eq!(loaded.identity_versions, detail.identity_versions);
 
         Ok(())
     }

@@ -95,6 +95,7 @@ mod tests {
                 (3, String::from("request list index")),
                 (4, String::from("request model fields")),
                 (5, String::from("request match candidates")),
+                (6, String::from("request identity versions")),
             ]
         );
 
