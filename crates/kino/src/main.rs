@@ -93,6 +93,7 @@ mod tests {
                 (1, String::from("initial")),
                 (2, String::from("request status events")),
                 (3, String::from("request list index")),
+                (4, String::from("request model fields")),
             ]
         );
 

@@ -18,11 +18,14 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
                 .method("POST")
                 .uri("/api/requests")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"message":"requested from curl"}"#))?,
+                .body(Body::from(
+                    r#"{"target":"Inception (2010)","message":"requested from curl"}"#,
+                ))?,
         )
         .await?;
     assert_eq!(create_response.status(), StatusCode::CREATED);
     let created: RequestDetail = response_json(create_response).await?;
+    assert_eq!(created.request.target.raw_query, "Inception (2010)");
     assert_eq!(created.request.state, RequestState::Pending);
     assert_eq!(created.status_events.len(), 1);
     assert_eq!(
@@ -137,7 +140,9 @@ async fn create_request(
                 .method("POST")
                 .uri("/api/requests")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(r#"{{"message":"{message}"}}"#)))?,
+                .body(Body::from(format!(
+                    r#"{{"target":"{message}","message":"{message}"}}"#
+                )))?,
         )
         .await?;
 
@@ -146,7 +151,7 @@ async fn create_request(
 }
 
 #[tokio::test]
-async fn create_request_accepts_empty_body() -> Result<(), Box<dyn std::error::Error>> {
+async fn create_request_requires_target() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let app = kino_server::router(db);
 
@@ -159,11 +164,7 @@ async fn create_request_accepts_empty_body() -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let created: RequestDetail = response_json(response).await?;
-    assert_eq!(created.request.state, RequestState::Pending);
-    assert_eq!(created.status_events.len(), 1);
-    assert_eq!(created.status_events[0].message, None);
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
     Ok(())
 }
