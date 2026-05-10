@@ -67,6 +67,7 @@ mod tests {
             database_path: database_path.clone(),
             library_root: PathBuf::from("/srv/media"),
             server: ServerConfig::default(),
+            tmdb: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
         };
@@ -78,6 +79,7 @@ mod tests {
             database_path,
             library_root: PathBuf::from("/srv/media"),
             server: ServerConfig::default(),
+            tmdb: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
         })

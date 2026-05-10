@@ -2,6 +2,7 @@
 
 pub mod movie;
 mod request;
+pub mod tmdb;
 pub mod tv;
 
 pub use kino_core::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
