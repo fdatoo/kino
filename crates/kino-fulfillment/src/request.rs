@@ -1,14 +1,15 @@
-//! Request persistence, status events, matching, and state transitions.
+//! Request status, matching, and state transitions.
 
 use std::{collections::HashSet, fmt};
 
-use kino_core::{
-    Id, Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget, Timestamp,
-};
+use kino_core::{Id, Request, RequestFailureReason, RequestRequester, RequestState, Timestamp};
 use kino_db::Db;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
 use thiserror::Error;
+
+mod store;
+
+use store::{NewIdentityVersion, NewStatusEvent, RequestStore};
 
 /// Default request list page size.
 pub const REQUEST_LIST_DEFAULT_LIMIT: u32 = 50;
@@ -488,13 +489,15 @@ pub struct RequestModelUpdate {
 /// Internal request API backed by `kino-db`.
 #[derive(Clone)]
 pub struct RequestService {
-    db: Db,
+    store: RequestStore,
 }
 
 impl RequestService {
     /// Construct a request service from an open database handle.
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self {
+            store: RequestStore::new(db),
+        }
     }
 
     /// Create a new pending request.
@@ -502,185 +505,36 @@ impl RequestService {
         let id = Id::new();
         let event_id = Id::new();
         let now = Timestamp::now();
-        let mut tx = self.db.write_pool().begin().await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO requests (
+        self.store
+            .create_pending(
                 id,
-                requester_kind,
-                requester_id,
-                target_raw_query,
-                canonical_identity_id,
-                state,
-                created_at,
-                updated_at,
-                plan_id,
-                failure_reason
+                request,
+                NewStatusEvent {
+                    id: event_id,
+                    request_id: id,
+                    from_state: None,
+                    to_state: RequestState::Pending,
+                    occurred_at: now,
+                    message: request.message,
+                    actor: request.actor,
+                },
             )
-            VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, NULL, NULL)
-            "#,
-        )
-        .bind(id)
-        .bind(request.requester.kind())
-        .bind(request.requester.id())
-        .bind(request.target_raw_query)
-        .bind(RequestState::Pending.as_str())
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        insert_status_event(
-            &mut tx,
-            NewStatusEvent {
-                id: event_id,
-                request_id: id,
-                from_state: None,
-                to_state: RequestState::Pending,
-                occurred_at: now,
-                message: request.message,
-                actor: request.actor,
-            },
-        )
-        .await?;
-
-        tx.commit().await?;
+            .await?;
         self.get(id).await
     }
 
     /// Read a request with its full status-event log.
     pub async fn get(&self, id: Id) -> Result<RequestDetail> {
-        let request_row = sqlx::query(
-            r#"
-            SELECT
-                id,
-                requester_kind,
-                requester_id,
-                target_raw_query,
-                canonical_identity_id,
-                state,
-                created_at,
-                updated_at,
-                plan_id,
-                failure_reason
-            FROM requests
-            WHERE id = ?1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(self.db.read_pool())
-        .await?;
-
-        let Some(request_row) = request_row else {
-            return Err(Error::RequestNotFound { id });
-        };
-
-        let request = request_from_row(&request_row)?;
-        let event_rows = sqlx::query(
-            r#"
-            SELECT id, request_id, from_state, to_state, occurred_at, message, actor_kind, actor_id
-            FROM request_status_events
-            WHERE request_id = ?1
-            ORDER BY occurred_at, id
-            "#,
-        )
-        .bind(id)
-        .fetch_all(self.db.read_pool())
-        .await?;
-        let status_events = event_rows
-            .iter()
-            .map(status_event_from_row)
-            .collect::<Result<Vec<_>>>()?;
-        let identity_rows = sqlx::query(
-            r#"
-            SELECT
-                request_id,
-                version,
-                canonical_identity_id,
-                provenance,
-                status_event_id,
-                created_at,
-                actor_kind,
-                actor_id
-            FROM request_identity_versions
-            WHERE request_id = ?1
-            ORDER BY version
-            "#,
-        )
-        .bind(id)
-        .fetch_all(self.db.read_pool())
-        .await?;
-        let identity_versions = identity_rows
-            .iter()
-            .map(identity_version_from_row)
-            .collect::<Result<Vec<_>>>()?;
-        let candidate_rows = sqlx::query(
-            r#"
-            SELECT rank, canonical_identity_id, title, year, popularity, score
-            FROM request_match_candidates
-            WHERE request_id = ?1
-            ORDER BY rank
-            "#,
-        )
-        .bind(id)
-        .fetch_all(self.db.read_pool())
-        .await?;
-        let candidates = candidate_rows
-            .iter()
-            .map(match_candidate_from_row)
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(RequestDetail {
-            request,
-            status_events,
-            identity_versions,
-            candidates,
-        })
+        self.store.get(id).await
     }
 
     /// List requests using the default projection ordered by creation time.
     pub async fn list(&self, query: RequestListQuery) -> Result<RequestListPage> {
         query.validate()?;
 
-        let mut builder = QueryBuilder::<Sqlite>::new(
-            r#"
-            SELECT
-                id,
-                requester_kind,
-                requester_id,
-                target_raw_query,
-                canonical_identity_id,
-                state,
-                created_at,
-                updated_at,
-                plan_id,
-                failure_reason
-            FROM requests
-            "#,
-        );
-
-        if let Some(state) = query.state {
-            builder.push(" WHERE state = ");
-            builder.push_bind(state.as_str());
-        }
-
-        builder.push(" ORDER BY created_at, id LIMIT ");
-        builder.push_bind(i64::from(query.limit) + 1);
-        builder.push(" OFFSET ");
-        builder.push_bind(
-            i64::try_from(query.offset).map_err(|_| Error::InvalidListOffset {
-                offset: query.offset,
-            })?,
-        );
-
-        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let rows = self.store.list(query).await?;
         let has_more = rows.len() > query.limit as usize;
-        let requests = rows
-            .iter()
-            .take(query.limit as usize)
-            .map(request_from_row)
-            .collect::<Result<Vec<_>>>()?;
+        let requests = rows.into_iter().take(query.limit as usize).collect();
 
         Ok(RequestListPage {
             requests,
@@ -702,22 +556,11 @@ impl RequestService {
             });
         }
 
-        let now = Timestamp::now();
-        let result = sqlx::query(
-            r#"
-            UPDATE requests
-            SET plan_id = ?2,
-                updated_at = ?3
-            WHERE id = ?1
-            "#,
-        )
-        .bind(request_id)
-        .bind(update.plan_id)
-        .bind(now)
-        .execute(self.db.write_pool())
-        .await?;
-
-        if result.rows_affected() == 0 {
+        let rows_affected = self
+            .store
+            .update_model_links(request_id, update.plan_id, Timestamp::now())
+            .await?;
+        if rows_affected == 0 {
             return Err(Error::RequestNotFound { id: request_id });
         }
 
@@ -772,33 +615,8 @@ impl RequestService {
         actor: Option<RequestEventActor>,
         message: Option<&str>,
     ) -> Result<RequestDetail> {
-        let mut tx = self.db.write_pool().begin().await?;
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id,
-                requester_kind,
-                requester_id,
-                target_raw_query,
-                canonical_identity_id,
-                state,
-                created_at,
-                updated_at,
-                plan_id,
-                failure_reason
-            FROM requests
-            WHERE id = ?1
-            "#,
-        )
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(row) = row else {
-            return Err(Error::RequestNotFound { id: request_id });
-        };
-
-        let current = request_from_row(&row)?;
+        let mut tx = self.store.begin().await?;
+        let current = self.store.request_in_tx(&mut tx, request_id).await?;
         let next = transition.to_state();
         if !transition.can_apply_from(current.state) {
             return Err(Error::InvalidTransition {
@@ -810,50 +628,41 @@ impl RequestService {
 
         let now = Timestamp::now();
         let event_id = Id::new();
-        let version = next_identity_version(&mut tx, request_id).await?;
-        sqlx::query(
-            r#"
-            UPDATE requests
-            SET canonical_identity_id = ?2,
-                state = ?3,
-                updated_at = ?4,
-                failure_reason = NULL
-            WHERE id = ?1
-            "#,
-        )
-        .bind(request_id)
-        .bind(canonical_identity_id)
-        .bind(next.as_str())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        insert_status_event(
-            &mut tx,
-            NewStatusEvent {
-                id: event_id,
-                request_id,
-                from_state: Some(current.state),
-                to_state: next,
-                occurred_at: now,
-                message,
-                actor,
-            },
-        )
-        .await?;
-        insert_identity_version(
-            &mut tx,
-            NewIdentityVersion {
-                request_id,
-                version,
-                canonical_identity_id,
-                provenance,
-                status_event_id: Some(event_id),
-                created_at: now,
-                actor,
-            },
-        )
-        .await?;
+        let version = self
+            .store
+            .next_identity_version(&mut tx, request_id)
+            .await?;
+        self.store
+            .update_resolved(&mut tx, request_id, canonical_identity_id, next, now)
+            .await?;
+        self.store
+            .insert_status_event(
+                &mut tx,
+                NewStatusEvent {
+                    id: event_id,
+                    request_id,
+                    from_state: Some(current.state),
+                    to_state: next,
+                    occurred_at: now,
+                    message,
+                    actor,
+                },
+            )
+            .await?;
+        self.store
+            .insert_identity_version(
+                &mut tx,
+                NewIdentityVersion {
+                    request_id,
+                    version,
+                    canonical_identity_id,
+                    provenance,
+                    status_event_id: Some(event_id),
+                    created_at: now,
+                    actor,
+                },
+            )
+            .await?;
 
         tx.commit().await?;
         self.get(request_id).await
@@ -869,33 +678,8 @@ impl RequestService {
     ) -> Result<RequestDetail> {
         validate_match_candidates(&candidates)?;
 
-        let mut tx = self.db.write_pool().begin().await?;
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id,
-                requester_kind,
-                requester_id,
-                target_raw_query,
-                canonical_identity_id,
-                state,
-                created_at,
-                updated_at,
-                plan_id,
-                failure_reason
-            FROM requests
-            WHERE id = ?1
-            "#,
-        )
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(row) = row else {
-            return Err(Error::RequestNotFound { id: request_id });
-        };
-
-        let current = request_from_row(&row)?;
+        let mut tx = self.store.begin().await?;
+        let current = self.store.request_in_tx(&mut tx, request_id).await?;
         if !matches!(
             current.state,
             RequestState::Pending | RequestState::NeedsDisambiguation
@@ -912,9 +696,8 @@ impl RequestService {
             && top.score - next_score >= REQUEST_AUTO_RESOLVE_MIN_MARGIN;
         let now = Timestamp::now();
 
-        sqlx::query("DELETE FROM request_match_candidates WHERE request_id = ?1")
-            .bind(request_id)
-            .execute(&mut *tx)
+        self.store
+            .delete_match_candidates(&mut tx, request_id)
             .await?;
 
         if auto_resolve {
@@ -928,92 +711,18 @@ impl RequestService {
             }
 
             let event_id = Id::new();
-            let version = next_identity_version(&mut tx, request_id).await?;
-            sqlx::query(
-                r#"
-                UPDATE requests
-                SET canonical_identity_id = ?2,
-                    state = ?3,
-                    updated_at = ?4,
-                    failure_reason = NULL
-                WHERE id = ?1
-                "#,
-            )
-            .bind(request_id)
-            .bind(top.canonical_identity_id)
-            .bind(next.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            insert_status_event(
-                &mut tx,
-                NewStatusEvent {
-                    id: event_id,
-                    request_id,
-                    from_state: Some(current.state),
-                    to_state: next,
-                    occurred_at: now,
-                    message,
-                    actor,
-                },
-            )
-            .await?;
-            insert_identity_version(
-                &mut tx,
-                NewIdentityVersion {
-                    request_id,
-                    version,
-                    canonical_identity_id: top.canonical_identity_id,
-                    provenance: RequestIdentityProvenance::MatchScoring,
-                    status_event_id: Some(event_id),
-                    created_at: now,
-                    actor,
-                },
-            )
-            .await?;
-        } else {
-            for candidate in scored.iter().take(REQUEST_MATCH_CANDIDATE_LIMIT) {
-                insert_match_candidate(&mut tx, request_id, candidate, now).await?;
-            }
-
-            if current.state == RequestState::NeedsDisambiguation {
-                sqlx::query(
-                    r#"
-                    UPDATE requests
-                    SET canonical_identity_id = NULL,
-                        updated_at = ?2,
-                        failure_reason = NULL
-                    WHERE id = ?1
-                    "#,
-                )
-                .bind(request_id)
-                .bind(now)
-                .execute(&mut *tx)
+            let version = self
+                .store
+                .next_identity_version(&mut tx, request_id)
                 .await?;
-            } else {
-                let next = RequestState::NeedsDisambiguation;
-
-                sqlx::query(
-                    r#"
-                    UPDATE requests
-                    SET canonical_identity_id = NULL,
-                        state = ?2,
-                        updated_at = ?3,
-                        failure_reason = NULL
-                    WHERE id = ?1
-                    "#,
-                )
-                .bind(request_id)
-                .bind(next.as_str())
-                .bind(now)
-                .execute(&mut *tx)
+            self.store
+                .update_resolved(&mut tx, request_id, top.canonical_identity_id, next, now)
                 .await?;
-
-                insert_status_event(
+            self.store
+                .insert_status_event(
                     &mut tx,
                     NewStatusEvent {
-                        id: Id::new(),
+                        id: event_id,
                         request_id,
                         from_state: Some(current.state),
                         to_state: next,
@@ -1023,6 +732,51 @@ impl RequestService {
                     },
                 )
                 .await?;
+            self.store
+                .insert_identity_version(
+                    &mut tx,
+                    NewIdentityVersion {
+                        request_id,
+                        version,
+                        canonical_identity_id: top.canonical_identity_id,
+                        provenance: RequestIdentityProvenance::MatchScoring,
+                        status_event_id: Some(event_id),
+                        created_at: now,
+                        actor,
+                    },
+                )
+                .await?;
+        } else {
+            for candidate in scored.iter().take(REQUEST_MATCH_CANDIDATE_LIMIT) {
+                self.store
+                    .insert_match_candidate(&mut tx, request_id, candidate, now)
+                    .await?;
+            }
+
+            if current.state == RequestState::NeedsDisambiguation {
+                self.store
+                    .refresh_disambiguation(&mut tx, request_id, now)
+                    .await?;
+            } else {
+                let next = RequestState::NeedsDisambiguation;
+
+                self.store
+                    .move_to_disambiguation(&mut tx, request_id, next, now)
+                    .await?;
+                self.store
+                    .insert_status_event(
+                        &mut tx,
+                        NewStatusEvent {
+                            id: Id::new(),
+                            request_id,
+                            from_state: Some(current.state),
+                            to_state: next,
+                            occurred_at: now,
+                            message,
+                            actor,
+                        },
+                    )
+                    .await?;
             }
         }
 
@@ -1045,33 +799,8 @@ impl RequestService {
             return Err(Error::ResolutionRequiresIdentity { transition });
         }
 
-        let mut tx = self.db.write_pool().begin().await?;
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id,
-                requester_kind,
-                requester_id,
-                target_raw_query,
-                canonical_identity_id,
-                state,
-                created_at,
-                updated_at,
-                plan_id,
-                failure_reason
-            FROM requests
-            WHERE id = ?1
-            "#,
-        )
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(row) = row else {
-            return Err(Error::RequestNotFound { id: request_id });
-        };
-
-        let current = request_from_row(&row)?;
+        let mut tx = self.store.begin().await?;
+        let current = self.store.request_in_tx(&mut tx, request_id).await?;
         let next = transition.to_state();
         if !transition.can_apply_from(current.state) {
             return Err(Error::InvalidTransition {
@@ -1082,301 +811,28 @@ impl RequestService {
         }
 
         let now = Timestamp::now();
-        let failure_reason = transition.failure_reason();
-        sqlx::query(
-            r#"
-            UPDATE requests
-            SET state = ?2,
-                updated_at = ?3,
-                failure_reason = ?4
-            WHERE id = ?1
-            "#,
-        )
-        .bind(request_id)
-        .bind(next.as_str())
-        .bind(now)
-        .bind(failure_reason.map(RequestFailureReason::as_str))
-        .execute(&mut *tx)
-        .await?;
+        self.store
+            .update_state(&mut tx, request_id, next, now, transition.failure_reason())
+            .await?;
 
-        insert_status_event(
-            &mut tx,
-            NewStatusEvent {
-                id: Id::new(),
-                request_id,
-                from_state: Some(current.state),
-                to_state: next,
-                occurred_at: now,
-                message,
-                actor,
-            },
-        )
-        .await?;
+        self.store
+            .insert_status_event(
+                &mut tx,
+                NewStatusEvent {
+                    id: Id::new(),
+                    request_id,
+                    from_state: Some(current.state),
+                    to_state: next,
+                    occurred_at: now,
+                    message,
+                    actor,
+                },
+            )
+            .await?;
 
         tx.commit().await?;
         self.get(request_id).await
     }
-}
-
-struct NewStatusEvent<'a> {
-    id: Id,
-    request_id: Id,
-    from_state: Option<RequestState>,
-    to_state: RequestState,
-    occurred_at: Timestamp,
-    message: Option<&'a str>,
-    actor: Option<RequestEventActor>,
-}
-
-struct NewIdentityVersion {
-    request_id: Id,
-    version: u32,
-    canonical_identity_id: Id,
-    provenance: RequestIdentityProvenance,
-    status_event_id: Option<Id>,
-    created_at: Timestamp,
-    actor: Option<RequestEventActor>,
-}
-
-async fn insert_status_event(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    event: NewStatusEvent<'_>,
-) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO request_status_events (
-            id,
-            request_id,
-            from_state,
-            to_state,
-            occurred_at,
-            message,
-            actor_kind,
-            actor_id
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        "#,
-    )
-    .bind(event.id)
-    .bind(event.request_id)
-    .bind(event.from_state.map(RequestState::as_str))
-    .bind(event.to_state.as_str())
-    .bind(event.occurred_at)
-    .bind(event.message)
-    .bind(event.actor.map(RequestEventActor::kind))
-    .bind(event.actor.and_then(RequestEventActor::id))
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
-}
-
-async fn next_identity_version(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    request_id: Id,
-) -> Result<u32> {
-    let version = sqlx::query_scalar::<_, Option<i64>>(
-        r#"
-        SELECT MAX(version)
-        FROM request_identity_versions
-        WHERE request_id = ?1
-        "#,
-    )
-    .bind(request_id)
-    .fetch_one(&mut **tx)
-    .await?
-    .unwrap_or(0)
-        + 1;
-
-    version
-        .try_into()
-        .map_err(|_| Error::InvalidIdentityVersion { version })
-}
-
-async fn insert_identity_version(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    version: NewIdentityVersion,
-) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO request_identity_versions (
-            request_id,
-            version,
-            canonical_identity_id,
-            provenance,
-            status_event_id,
-            created_at,
-            actor_kind,
-            actor_id
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        "#,
-    )
-    .bind(version.request_id)
-    .bind(i64::from(version.version))
-    .bind(version.canonical_identity_id)
-    .bind(version.provenance.as_str())
-    .bind(version.status_event_id)
-    .bind(version.created_at)
-    .bind(version.actor.map(RequestEventActor::kind))
-    .bind(version.actor.and_then(RequestEventActor::id))
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
-}
-
-async fn insert_match_candidate(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    request_id: Id,
-    candidate: &RequestMatchCandidate,
-    created_at: Timestamp,
-) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO request_match_candidates (
-            request_id,
-            rank,
-            canonical_identity_id,
-            title,
-            year,
-            popularity,
-            score,
-            created_at
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        "#,
-    )
-    .bind(request_id)
-    .bind(i64::from(candidate.rank))
-    .bind(candidate.canonical_identity_id)
-    .bind(candidate.title.as_str())
-    .bind(candidate.year)
-    .bind(candidate.popularity)
-    .bind(candidate.score)
-    .bind(created_at)
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
-}
-
-fn request_from_row(row: &SqliteRow) -> Result<Request> {
-    let failure_reason = row
-        .try_get::<Option<&str>, _>("failure_reason")?
-        .map(parse_failure_reason)
-        .transpose()?;
-    let requester = RequestRequester::from_parts(
-        row.try_get("requester_kind")?,
-        row.try_get::<Option<Id>, _>("requester_id")?,
-    )
-    .ok_or(Error::InvalidRequester)?;
-
-    Ok(Request {
-        id: row.try_get("id")?,
-        requester,
-        target: RequestTarget {
-            raw_query: row.try_get("target_raw_query")?,
-            canonical_identity_id: row.try_get("canonical_identity_id")?,
-        },
-        state: parse_request_state(row.try_get("state")?)?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-        plan_id: row.try_get("plan_id")?,
-        failure_reason,
-    })
-}
-
-fn match_candidate_from_row(row: &SqliteRow) -> Result<RequestMatchCandidate> {
-    let canonical_identity_id = row.try_get("canonical_identity_id")?;
-    let rank =
-        row.try_get::<i64, _>("rank")?
-            .try_into()
-            .map_err(|_| Error::InvalidMatchCandidate {
-                canonical_identity_id,
-                reason: "rank is outside u32 range",
-            })?;
-
-    Ok(RequestMatchCandidate {
-        rank,
-        canonical_identity_id,
-        title: row.try_get("title")?,
-        year: row.try_get("year")?,
-        popularity: row.try_get("popularity")?,
-        score: row.try_get("score")?,
-    })
-}
-
-fn status_event_from_row(row: &SqliteRow) -> Result<RequestStatusEvent> {
-    let actor = match (
-        row.try_get::<Option<&str>, _>("actor_kind")?,
-        row.try_get::<Option<Id>, _>("actor_id")?,
-    ) {
-        (None, None) => None,
-        (Some("system"), None) => Some(RequestEventActor::System),
-        (Some("user"), Some(id)) => Some(RequestEventActor::User(id)),
-        _ => return Err(Error::InvalidEventActor),
-    };
-    let from_state = row
-        .try_get::<Option<&str>, _>("from_state")?
-        .map(parse_request_state)
-        .transpose()?;
-
-    Ok(RequestStatusEvent {
-        id: row.try_get("id")?,
-        request_id: row.try_get("request_id")?,
-        from_state,
-        to_state: parse_request_state(row.try_get("to_state")?)?,
-        occurred_at: row.try_get("occurred_at")?,
-        message: row.try_get("message")?,
-        actor,
-    })
-}
-
-fn identity_version_from_row(row: &SqliteRow) -> Result<RequestIdentityVersion> {
-    let actor = match (
-        row.try_get::<Option<&str>, _>("actor_kind")?,
-        row.try_get::<Option<Id>, _>("actor_id")?,
-    ) {
-        (None, None) => None,
-        (Some("system"), None) => Some(RequestEventActor::System),
-        (Some("user"), Some(id)) => Some(RequestEventActor::User(id)),
-        _ => return Err(Error::InvalidEventActor),
-    };
-    let persisted_version = row.try_get::<i64, _>("version")?;
-    let version = persisted_version
-        .try_into()
-        .map_err(|_| Error::InvalidIdentityVersion {
-            version: persisted_version,
-        })?;
-    let provenance =
-        RequestIdentityProvenance::parse(row.try_get("provenance")?).ok_or_else(|| {
-            Error::InvalidIdentityProvenance {
-                value: row.get::<String, _>("provenance"),
-            }
-        })?;
-
-    Ok(RequestIdentityVersion {
-        request_id: row.try_get("request_id")?,
-        version,
-        canonical_identity_id: row.try_get("canonical_identity_id")?,
-        provenance,
-        status_event_id: row.try_get("status_event_id")?,
-        created_at: row.try_get("created_at")?,
-        actor,
-    })
-}
-
-fn parse_request_state(value: &str) -> Result<RequestState> {
-    RequestState::parse(value).ok_or_else(|| Error::InvalidRequestState {
-        value: value.to_owned(),
-    })
-}
-
-fn parse_failure_reason(value: &str) -> Result<RequestFailureReason> {
-    RequestFailureReason::parse(value).ok_or_else(|| Error::InvalidFailureReason {
-        value: value.to_owned(),
-    })
 }
 
 fn validate_match_candidates(candidates: &[RequestMatchCandidateInput]) -> Result<()> {
@@ -1557,7 +1013,6 @@ fn normalized_tokens(value: &str) -> Vec<String> {
         .map(str::to_ascii_lowercase)
         .collect()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
