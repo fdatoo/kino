@@ -6,6 +6,7 @@ mod provider;
 mod request;
 pub mod tmdb;
 pub mod tv;
+pub mod watch_folder;
 
 pub use kino_core::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use planning::{
@@ -30,3 +31,4 @@ pub use request::{
     RequestMatchCandidateInput, RequestModelUpdate, RequestService, RequestStatusEvent,
     RequestTransition, Result,
 };
+pub use watch_folder::{WATCH_FOLDER_PROVIDER_ID, WatchFolderProvider};
