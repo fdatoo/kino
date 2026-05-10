@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request as HttpRequest, StatusCode, header},
 };
-use kino_core::Id;
+use kino_core::{CanonicalIdentityId, TmdbId};
 use kino_fulfillment::{
     NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage, RequestService,
     RequestState, RequestTransition,
@@ -139,7 +139,7 @@ async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dy
     let db = kino_db::test_db().await?;
     let app = kino_server::router(db);
     let created = create_request(&app, "Inception (2010)").await?;
-    let winner_id = Id::new();
+    let winner_id = identity(550);
 
     let response = app
         .oneshot(
@@ -165,7 +165,7 @@ async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dy
                             }}
                         ]
                     }}"#,
-                    Id::new()
+                    identity(157_336)
                 )))?,
         )
         .await?;
@@ -188,8 +188,8 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
     let db = kino_db::test_db().await?;
     let app = kino_server::router(db);
     let created = create_request(&app, "Dune").await?;
-    let newer_id = Id::new();
-    let older_id = Id::new();
+    let newer_id = identity(438_631);
+    let older_id = identity(841);
 
     let response = app
         .clone()
@@ -247,8 +247,8 @@ async fn re_resolution_api_records_versioned_identity_history()
     let db = kino_db::test_db().await?;
     let service = RequestService::new(db.clone());
     let app = kino_server::router(db);
-    let first_identity = Id::new();
-    let second_identity = Id::new();
+    let first_identity = identity(550);
+    let second_identity = identity(551);
     let created = service
         .create(NewRequest::anonymous("Inception (2010)"))
         .await?;
@@ -336,6 +336,13 @@ async fn create_request(
 
     assert_eq!(response.status(), StatusCode::CREATED);
     response_json(response).await
+}
+
+fn identity(tmdb_id: u32) -> CanonicalIdentityId {
+    match TmdbId::new(tmdb_id) {
+        Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
+        None => panic!("test tmdb id must be positive"),
+    }
 }
 
 #[tokio::test]

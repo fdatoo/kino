@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, Timestamp};
+use crate::{CanonicalIdentityId, Id, Timestamp};
 
 /// Durable request state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,8 +209,8 @@ impl RequestRequester {
 pub struct RequestTarget {
     /// Raw query text supplied by the requester.
     pub raw_query: String,
-    /// Resolved canonical identity id once media identity persistence exists.
-    pub canonical_identity_id: Option<Id>,
+    /// Resolved canonical identity id.
+    pub canonical_identity_id: Option<CanonicalIdentityId>,
 }
 
 /// Current request projection.

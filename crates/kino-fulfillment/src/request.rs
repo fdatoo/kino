@@ -2,7 +2,10 @@
 
 use std::{collections::HashSet, fmt};
 
-use kino_core::{Id, Request, RequestFailureReason, RequestRequester, RequestState, Timestamp};
+use kino_core::{
+    CanonicalIdentityId, CanonicalIdentitySource, Id, Request, RequestFailureReason,
+    RequestRequester, RequestState, Timestamp,
+};
 use kino_db::Db;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -121,14 +124,14 @@ pub enum Error {
     #[error("request match candidate {canonical_identity_id} is duplicated")]
     DuplicateMatchCandidate {
         /// Duplicated canonical identity id.
-        canonical_identity_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
     },
 
     /// A candidate field is invalid.
     #[error("request match candidate {canonical_identity_id} is invalid: {reason}")]
     InvalidMatchCandidate {
         /// Candidate identity id.
-        canonical_identity_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
         /// Human-readable validation failure.
         reason: &'static str,
     },
@@ -290,6 +293,13 @@ impl RequestIdentityProvenance {
             _ => None,
         }
     }
+
+    fn identity_source(self) -> CanonicalIdentitySource {
+        match self {
+            Self::MatchScoring => CanonicalIdentitySource::MatchScoring,
+            Self::Manual => CanonicalIdentitySource::Manual,
+        }
+    }
 }
 
 /// Versioned canonical identity selected for a request.
@@ -300,7 +310,7 @@ pub struct RequestIdentityVersion {
     /// Monotonic per-request identity version.
     pub version: u32,
     /// Selected canonical identity id.
-    pub canonical_identity_id: Id,
+    pub canonical_identity_id: CanonicalIdentityId,
     /// Reason the identity was selected.
     pub provenance: RequestIdentityProvenance,
     /// Status event written by the same resolution transition.
@@ -315,7 +325,7 @@ pub struct RequestIdentityVersion {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestMatchCandidateInput {
     /// Candidate canonical identity id.
-    pub canonical_identity_id: Id,
+    pub canonical_identity_id: CanonicalIdentityId,
     /// Candidate display title.
     pub title: String,
     /// Candidate release or first-air year when known.
@@ -330,7 +340,7 @@ pub struct RequestMatchCandidate {
     /// Request-local rank starting at one.
     pub rank: u32,
     /// Candidate canonical identity id.
-    pub canonical_identity_id: Id,
+    pub canonical_identity_id: CanonicalIdentityId,
     /// Candidate display title.
     pub title: String,
     /// Candidate release or first-air year when known.
@@ -481,7 +491,7 @@ impl<'a> NewRequest<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RequestModelUpdate {
     /// Canonical identity writes are rejected; use resolution APIs instead.
-    pub canonical_identity_id: Option<Id>,
+    pub canonical_identity_id: Option<CanonicalIdentityId>,
     /// Fulfillment plan id.
     pub plan_id: Option<Id>,
 }
@@ -571,7 +581,7 @@ impl RequestService {
     pub async fn resolve_identity(
         &self,
         request_id: Id,
-        canonical_identity_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
         provenance: RequestIdentityProvenance,
         actor: Option<RequestEventActor>,
         message: Option<&str>,
@@ -591,7 +601,7 @@ impl RequestService {
     pub async fn re_resolve_identity(
         &self,
         request_id: Id,
-        canonical_identity_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
         actor: Option<RequestEventActor>,
         message: Option<&str>,
     ) -> Result<RequestDetail> {
@@ -609,7 +619,7 @@ impl RequestService {
     async fn resolve_identity_with_transition(
         &self,
         request_id: Id,
-        canonical_identity_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
         provenance: RequestIdentityProvenance,
         transition: RequestTransition,
         actor: Option<RequestEventActor>,
@@ -631,6 +641,14 @@ impl RequestService {
         let version = self
             .store
             .next_identity_version(&mut tx, request_id)
+            .await?;
+        self.store
+            .ensure_canonical_identity(
+                &mut tx,
+                canonical_identity_id,
+                provenance.identity_source(),
+                now,
+            )
             .await?;
         self.store
             .update_resolved(&mut tx, request_id, canonical_identity_id, next, now)
@@ -716,6 +734,14 @@ impl RequestService {
                 .next_identity_version(&mut tx, request_id)
                 .await?;
             self.store
+                .ensure_canonical_identity(
+                    &mut tx,
+                    top.canonical_identity_id,
+                    CanonicalIdentitySource::MatchScoring,
+                    now,
+                )
+                .await?;
+            self.store
                 .update_resolved(&mut tx, request_id, top.canonical_identity_id, next, now)
                 .await?;
             self.store
@@ -748,6 +774,14 @@ impl RequestService {
                 .await?;
         } else {
             for candidate in scored.iter().take(REQUEST_MATCH_CANDIDATE_LIMIT) {
+                self.store
+                    .ensure_canonical_identity(
+                        &mut tx,
+                        candidate.canonical_identity_id,
+                        CanonicalIdentitySource::MatchScoring,
+                        now,
+                    )
+                    .await?;
                 self.store
                     .insert_match_candidate(&mut tx, request_id, candidate, now)
                     .await?;
@@ -1016,6 +1050,7 @@ fn normalized_tokens(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kino_core::TmdbId;
 
     #[tokio::test]
     async fn create_writes_initial_status_event()
@@ -1050,7 +1085,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let canonical_identity_id = Id::new();
+        let canonical_identity_id = identity(550);
         let created = service
             .create(
                 NewRequest::anonymous("Inception (2010)")
@@ -1179,7 +1214,7 @@ mod tests {
             .update_model(
                 created.request.id,
                 RequestModelUpdate {
-                    canonical_identity_id: Some(Id::new()),
+                    canonical_identity_id: Some(identity(550)),
                     plan_id: None,
                 },
             )
@@ -1208,7 +1243,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let winner_id = Id::new();
+        let winner_id = identity(550);
         let created = service
             .create(NewRequest::anonymous("Inception (2010)"))
             .await?;
@@ -1218,7 +1253,7 @@ mod tests {
                 created.request.id,
                 vec![
                     candidate(winner_id, "Inception", Some(2010), 80.0),
-                    candidate(Id::new(), "Interstellar", Some(2014), 70.0),
+                    candidate(identity(157_336), "Interstellar", Some(2014), 70.0),
                 ],
                 Some(RequestEventActor::System),
                 Some("matched canonical media"),
@@ -1246,8 +1281,8 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let service = RequestService::new(db);
-        let newer_id = Id::new();
-        let older_id = Id::new();
+        let newer_id = identity(438_631);
+        let older_id = identity(841);
         let created = service.create(NewRequest::anonymous("Dune")).await?;
 
         let detail = service
@@ -1256,7 +1291,7 @@ mod tests {
                 vec![
                     candidate(older_id, "Dune", Some(1984), 60.0),
                     candidate(newer_id, "Dune", Some(2021), 90.0),
-                    candidate(Id::new(), "Dune World", Some(2021), 10.0),
+                    candidate(identity(999_999), "Dune World", Some(2021), 10.0),
                 ],
                 Some(RequestEventActor::System),
                 Some("needs user choice"),
@@ -1294,7 +1329,7 @@ mod tests {
         service
             .resolve_identity(
                 resolved.request.id,
-                Id::new(),
+                identity(550),
                 RequestIdentityProvenance::Manual,
                 None,
                 None,
@@ -1461,7 +1496,7 @@ mod tests {
         let err = match service
             .resolve_identity(
                 cancelled.request.id,
-                Id::new(),
+                identity(550),
                 RequestIdentityProvenance::Manual,
                 Some(RequestEventActor::System),
                 None,
@@ -1604,7 +1639,7 @@ mod tests {
         service
             .resolve_identity(
                 created.request.id,
-                Id::new(),
+                identity(550),
                 RequestIdentityProvenance::Manual,
                 None,
                 None,
@@ -1622,7 +1657,7 @@ mod tests {
         let detail = service
             .re_resolve_identity(
                 created.request.id,
-                Id::new(),
+                identity(551),
                 Some(RequestEventActor::System),
                 Some("resolved again"),
             )
@@ -1696,7 +1731,7 @@ mod tests {
                     .await?
                     .request
                     .id,
-                Id::new(),
+                identity(550),
                 RequestIdentityProvenance::Manual,
                 None,
                 None,
@@ -1727,7 +1762,7 @@ mod tests {
     }
 
     fn candidate(
-        canonical_identity_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
         title: &str,
         year: Option<i32>,
         popularity: f64,
@@ -1737,6 +1772,13 @@ mod tests {
             title: title.to_owned(),
             year,
             popularity,
+        }
+    }
+
+    fn identity(tmdb_id: u32) -> CanonicalIdentityId {
+        match TmdbId::new(tmdb_id) {
+            Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
+            None => panic!("test tmdb id must be positive"),
         }
     }
 }
