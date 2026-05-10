@@ -8,6 +8,7 @@ use kino_fulfillment::{
     RequestService, RequestState, RequestTransition,
 };
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tower::util::ServiceExt;
 
 #[tokio::test]
@@ -408,6 +409,131 @@ async fn request_plan_api_records_current_plan_and_history()
     Ok(())
 }
 
+#[tokio::test]
+async fn manual_import_api_accepts_readable_file_and_starts_ingesting()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let service = RequestService::new(db.clone());
+    let app = kino_server::router(db);
+    let request = fulfilling_request(&service).await?;
+    let path = std::env::temp_dir().join(format!("kino-manual-import-api-{}.mkv", request));
+    tokio::fs::write(&path, b"movie").await?;
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/admin/requests/{request}/manual-import"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{
+                        "path":"{}",
+                        "message":"operator selected source"
+                    }}"#,
+                    path.display()
+                )))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["provider_id"], "manual-import");
+    assert_eq!(body["path"], path.display().to_string());
+
+    let job_id = body["job_id"]
+        .as_str()
+        .ok_or("manual import job id missing")?;
+    let expected_message = format!(
+        "operator selected source; manual import {} accepted as {job_id}",
+        path.display()
+    );
+    let detail: RequestDetail = serde_json::from_value(body["request"].clone())?;
+    assert_eq!(detail.request.state, RequestState::Ingesting);
+    assert_eq!(
+        detail
+            .status_events
+            .last()
+            .and_then(|event| event.message.as_deref()),
+        Some(expected_message.as_str())
+    );
+
+    tokio::fs::remove_file(path).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let service = RequestService::new(db.clone());
+    let app = kino_server::router(db);
+    let request = fulfilling_request(&service).await?;
+    let path = std::env::temp_dir().join(format!("kino-manual-import-missing-{request}.mkv"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/admin/requests/{request}/manual-import"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response_json(response).await?;
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("path_not_found")),
+        "got: {body}"
+    );
+
+    let get_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/requests/{request}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let detail: RequestDetail = response_json(get_response).await?;
+    assert_eq!(detail.request.state, RequestState::Fulfilling);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_import_api_rejects_invalid_request_state() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+    let created = create_request(&app, "Inception (2010)").await?;
+    let path = std::env::temp_dir().join(format!(
+        "kino-manual-import-invalid-state-{}.mkv",
+        created.request.id
+    ));
+    tokio::fs::write(&path, b"movie").await?;
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/admin/requests/{}/manual-import",
+                    created.request.id
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    tokio::fs::remove_file(path).await?;
+    Ok(())
+}
+
 async fn create_request(
     app: &axum::Router,
     message: &str,
@@ -427,6 +553,50 @@ async fn create_request(
 
     assert_eq!(response.status(), StatusCode::CREATED);
     response_json(response).await
+}
+
+async fn fulfilling_request(
+    service: &RequestService,
+) -> Result<kino_core::Id, Box<dyn std::error::Error>> {
+    let created = service
+        .create(NewRequest::anonymous("Inception (2010)"))
+        .await?;
+    service
+        .resolve_identity(
+            created.request.id,
+            identity(550),
+            RequestIdentityProvenance::Manual,
+            None,
+            None,
+        )
+        .await?;
+    service
+        .transition(
+            created.request.id,
+            RequestTransition::StartPlanning,
+            None,
+            None,
+        )
+        .await?;
+    service
+        .record_plan(
+            created.request.id,
+            kino_fulfillment::NewFulfillmentPlan::new(
+                FulfillmentPlanDecision::NeedsProvider,
+                "manual import will provide a source file",
+            ),
+        )
+        .await?;
+    service
+        .transition(
+            created.request.id,
+            RequestTransition::StartFulfilling,
+            None,
+            None,
+        )
+        .await?;
+
+    Ok(created.request.id)
 }
 
 fn identity(tmdb_id: u32) -> CanonicalIdentityId {

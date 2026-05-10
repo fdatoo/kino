@@ -1,5 +1,7 @@
 //! Pure fulfillment planning.
 
+use std::path::{Path, PathBuf};
+
 use kino_core::{CanonicalIdentityId, Request};
 
 use crate::{
@@ -64,18 +66,34 @@ impl<'a> FulfillmentPlanningInput<'a> {
 }
 
 /// Arguments passed to a provider for a fulfillment attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FulfillmentProviderArgs {
     /// Canonical identity the provider should satisfy.
     pub canonical_identity_id: CanonicalIdentityId,
+    /// Provider-specific source file path, used by manual import.
+    pub source_path: Option<PathBuf>,
 }
 
 impl FulfillmentProviderArgs {
     /// Construct provider arguments for a resolved canonical identity.
-    pub const fn new(canonical_identity_id: CanonicalIdentityId) -> Self {
+    pub fn new(canonical_identity_id: CanonicalIdentityId) -> Self {
         Self {
             canonical_identity_id,
+            source_path: None,
         }
+    }
+
+    /// Attach a concrete source file path for providers that require one.
+    pub fn with_source_path(self, source_path: impl Into<PathBuf>) -> Self {
+        Self {
+            source_path: Some(source_path.into()),
+            ..self
+        }
+    }
+
+    /// Source file path supplied for this provider attempt.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
     }
 }
 
