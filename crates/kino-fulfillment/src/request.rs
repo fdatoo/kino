@@ -10,9 +10,12 @@ use kino_db::Db;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::provider::{
-    ConfiguredFulfillmentProvider, ProviderSelectionContext, ProviderSelectionPlan,
-    select_fulfillment_provider,
+use crate::{
+    planning::{
+        ComputedFulfillmentPlan, FulfillmentLibraryState, FulfillmentPlanningInput,
+        compute_fulfillment_plan,
+    },
+    provider::{ConfiguredFulfillmentProvider, ProviderSelectionPlan},
 };
 
 mod store;
@@ -816,71 +819,53 @@ impl RequestService {
             .target
             .canonical_identity_id
             .ok_or(Error::FulfillmentPlanningRequiresIdentity { request_id })?;
-        if self
+        let contains_resolved_identity = self
             .store
             .media_item_exists_for_identity(&mut tx, canonical_identity_id)
-            .await?
-        {
-            let summary = format!("library already contains {canonical_identity_id}");
-            let summary = validate_plan_summary(summary.as_str())?;
-            let now = Timestamp::now();
-            let event_id = Id::new();
-            self.store
-                .update_state(&mut tx, request_id, RequestState::Satisfied, now, None)
-                .await?;
-            self.store
-                .insert_status_event(
-                    &mut tx,
-                    NewStatusEvent {
-                        id: event_id,
-                        request_id,
-                        from_state: Some(current.state),
-                        to_state: RequestState::Satisfied,
-                        occurred_at: now,
-                        message: Some(summary),
-                        actor,
-                    },
-                )
-                .await?;
-            self.insert_current_plan(
-                &mut tx,
-                CurrentPlanInput {
-                    request_id,
-                    decision: FulfillmentPlanDecision::AlreadySatisfied,
-                    summary,
-                    status_event_id: Some(event_id),
-                    created_at: now,
-                    actor,
-                },
-            )
             .await?;
-
-            tx.commit().await?;
-            let detail = self.get(request_id).await?;
-            let selection = ProviderSelectionPlan {
-                decision: FulfillmentPlanDecision::AlreadySatisfied,
-                selected_provider_id: None,
-                ranked_providers: Vec::new(),
-                summary: summary.to_owned(),
+        let computed = compute_fulfillment_plan(
+            FulfillmentPlanningInput::new(
+                &current,
+                FulfillmentLibraryState::new(contains_resolved_identity),
+                providers,
+            )
+            .with_rejected_provider_ids(rejected_provider_ids),
+        )?;
+        let selection = computed.provider_selection_plan();
+        let summary = validate_plan_summary(computed.summary())?;
+        let now = Timestamp::now();
+        let status_event_id =
+            if matches!(computed, ComputedFulfillmentPlan::AlreadySatisfied { .. }) {
+                let event_id = Id::new();
+                self.store
+                    .update_state(&mut tx, request_id, RequestState::Satisfied, now, None)
+                    .await?;
+                self.store
+                    .insert_status_event(
+                        &mut tx,
+                        NewStatusEvent {
+                            id: event_id,
+                            request_id,
+                            from_state: Some(current.state),
+                            to_state: RequestState::Satisfied,
+                            occurred_at: now,
+                            message: Some(summary),
+                            actor,
+                        },
+                    )
+                    .await?;
+                Some(event_id)
+            } else {
+                None
             };
 
-            return Ok(ProviderSelectionPlanningResult { selection, detail });
-        }
-
-        let selection = select_fulfillment_provider(
-            ProviderSelectionContext::new(canonical_identity_id)
-                .with_rejected_provider_ids(rejected_provider_ids),
-            providers,
-        )?;
-        let summary = validate_plan_summary(selection.summary.as_str())?;
-        let now = Timestamp::now();
         self.insert_current_plan(
             &mut tx,
             CurrentPlanInput {
                 request_id,
-                decision: selection.decision,
+                decision: computed.decision(),
                 summary,
-                status_event_id: None,
+                status_event_id,
                 created_at: now,
                 actor,
             },

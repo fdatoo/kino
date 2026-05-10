@@ -1,12 +1,17 @@
 //! Request tracking and fulfillment orchestration.
 
 pub mod movie;
+mod planning;
 mod provider;
 mod request;
 pub mod tmdb;
 pub mod tv;
 
 pub use kino_core::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
+pub use planning::{
+    ComputedFulfillmentPlan, FulfillmentLibraryState, FulfillmentPlanningInput,
+    FulfillmentProviderArgs, FulfillmentUserInputReason, compute_fulfillment_plan,
+};
 pub use provider::{
     ConfiguredFulfillmentProvider, FulfillmentProviderCapability, ProviderSelectionContext,
     ProviderSelectionPlan, RankedFulfillmentProvider, select_fulfillment_provider,
