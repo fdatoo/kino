@@ -192,6 +192,7 @@ mod tests {
             library_root: PathBuf::from("/lib"),
             server: ServerConfig::default(),
             tmdb: TmdbConfig::default(),
+            providers: Default::default(),
             log_level: log_level.into(),
             log_format,
         }

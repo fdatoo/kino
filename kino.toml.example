@@ -25,3 +25,13 @@ listen = "127.0.0.1:7777"
 # Polite client-side request cap. Optional. Defaults to 20, maximum 50.
 # Runtime override: KINO_TMDB__MAX_REQUESTS_PER_SECOND.
 max_requests_per_second = 20
+
+[providers.watch_folder]
+# Directory watched for user-supplied media files. Required when this provider
+# section is present, and validated at startup.
+# Runtime override: KINO_PROVIDERS__WATCH_FOLDER__PATH.
+path = "/srv/kino/incoming"
+
+# Provider ranking preference. Optional. Defaults to 0.
+# Runtime override: KINO_PROVIDERS__WATCH_FOLDER__PREFERENCE.
+preference = 0
