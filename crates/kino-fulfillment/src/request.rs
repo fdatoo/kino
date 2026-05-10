@@ -10,6 +10,11 @@ use kino_db::Db;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::provider::{
+    ConfiguredFulfillmentProvider, ProviderSelectionContext, ProviderSelectionPlan,
+    select_fulfillment_provider,
+};
+
 mod store;
 
 use store::{NewFulfillmentPlanRecord, NewIdentityVersion, NewStatusEvent, RequestStore};
@@ -144,6 +149,29 @@ pub enum Error {
     /// A fulfillment plan summary is empty after trimming whitespace.
     #[error("request fulfillment plan summary is empty")]
     EmptyFulfillmentPlanSummary,
+
+    /// Fulfillment planning requires a resolved canonical identity.
+    #[error("request {request_id} fulfillment planning requires a canonical identity")]
+    FulfillmentPlanningRequiresIdentity {
+        /// Request missing a canonical identity.
+        request_id: Id,
+    },
+
+    /// A configured fulfillment provider is invalid.
+    #[error("configured fulfillment provider {provider_id:?} is invalid: {reason}")]
+    InvalidFulfillmentProvider {
+        /// Stable configured provider id, when present.
+        provider_id: String,
+        /// Human-readable validation failure.
+        reason: &'static str,
+    },
+
+    /// A configured fulfillment provider id appears more than once.
+    #[error("configured fulfillment provider {provider_id} is duplicated")]
+    DuplicateFulfillmentProvider {
+        /// Duplicated configured provider id.
+        provider_id: String,
+    },
 
     /// A candidate appears more than once in one scoring request.
     #[error("request match candidate {canonical_identity_id} is duplicated")]
@@ -475,6 +503,15 @@ pub struct RequestDetail {
     pub candidates: Vec<RequestMatchCandidate>,
 }
 
+/// Result of planning provider selection for a request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderSelectionPlanningResult {
+    /// Provider selection decision and ranked candidates.
+    pub selection: ProviderSelectionPlan,
+    /// Request detail after persisting the fulfillment plan.
+    pub detail: RequestDetail,
+}
+
 /// Query parameters for listing requests.
 ///
 /// Pagination uses offset semantics. Results are ordered by `(created_at, id)`;
@@ -727,6 +764,60 @@ impl RequestService {
 
         tx.commit().await?;
         self.get(request_id).await
+    }
+
+    /// Select a provider for a planning request and persist the resulting plan.
+    pub async fn plan_provider_selection(
+        &self,
+        request_id: Id,
+        providers: &[ConfiguredFulfillmentProvider<'_>],
+        rejected_provider_ids: &[&str],
+        actor: Option<RequestEventActor>,
+    ) -> Result<ProviderSelectionPlanningResult> {
+        let mut tx = self.store.begin().await?;
+        let current = self.store.request_in_tx(&mut tx, request_id).await?;
+        if current.state != RequestState::Planning {
+            return Err(Error::InvalidFulfillmentPlanState {
+                from: current.state,
+            });
+        }
+
+        let canonical_identity_id = current
+            .target
+            .canonical_identity_id
+            .ok_or(Error::FulfillmentPlanningRequiresIdentity { request_id })?;
+        let selection = select_fulfillment_provider(
+            ProviderSelectionContext::new(canonical_identity_id)
+                .with_rejected_provider_ids(rejected_provider_ids),
+            providers,
+        )?;
+        let summary = validate_plan_summary(selection.summary.as_str())?;
+        let now = Timestamp::now();
+        let plan_id = Id::new();
+        let version = self.store.next_plan_version(&mut tx, request_id).await?;
+        self.store
+            .insert_fulfillment_plan(
+                &mut tx,
+                NewFulfillmentPlanRecord {
+                    id: plan_id,
+                    request_id,
+                    version,
+                    decision: selection.decision,
+                    summary,
+                    status_event_id: None,
+                    created_at: now,
+                    actor,
+                },
+            )
+            .await?;
+        self.store
+            .update_current_plan(&mut tx, request_id, plan_id, now)
+            .await?;
+
+        tx.commit().await?;
+        let detail = self.get(request_id).await?;
+
+        Ok(ProviderSelectionPlanningResult { selection, detail })
     }
 
     /// Resolve a pending or disambiguated request to a canonical identity.
@@ -1211,7 +1302,17 @@ fn normalized_tokens(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kino_core::TmdbId;
+    use crate::provider::FulfillmentProviderCapability;
+    use kino_core::{CanonicalIdentityKind, TmdbId};
+
+    const MOVIE_PROVIDER: &[FulfillmentProviderCapability] =
+        &[FulfillmentProviderCapability::MediaKind(
+            CanonicalIdentityKind::Movie,
+        )];
+    const TV_PROVIDER: &[FulfillmentProviderCapability] =
+        &[FulfillmentProviderCapability::MediaKind(
+            CanonicalIdentityKind::TvSeries,
+        )];
 
     #[tokio::test]
     async fn create_writes_initial_status_event()
@@ -1532,6 +1633,143 @@ mod tests {
         let loaded = service.get(created.request.id).await?;
         assert!(loaded.current_plan.is_none());
         assert!(loaded.plan_history.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_provider_selection_records_selected_provider()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+        service
+            .resolve_identity(
+                created.request.id,
+                identity(550),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+        let providers = [
+            ConfiguredFulfillmentProvider::new("tv-provider", 100, TV_PROVIDER),
+            ConfiguredFulfillmentProvider::new("movie-provider", 0, MOVIE_PROVIDER),
+        ];
+
+        let planned = service
+            .plan_provider_selection(
+                created.request.id,
+                &providers,
+                &[],
+                Some(RequestEventActor::System),
+            )
+            .await?;
+
+        assert_eq!(
+            planned.selection.decision,
+            FulfillmentPlanDecision::NeedsProvider
+        );
+        assert_eq!(
+            planned.selection.selected_provider_id.as_deref(),
+            Some("movie-provider")
+        );
+        assert_eq!(planned.detail.plan_history.len(), 1);
+        assert_eq!(
+            planned
+                .detail
+                .current_plan
+                .as_ref()
+                .map(|plan| plan.decision),
+            Some(FulfillmentPlanDecision::NeedsProvider)
+        );
+        assert_eq!(
+            planned
+                .detail
+                .current_plan
+                .as_ref()
+                .map(|plan| plan.summary.as_str()),
+            Some("selected provider movie-provider for tmdb:movie:550")
+        );
+        assert_eq!(
+            planned
+                .detail
+                .current_plan
+                .as_ref()
+                .and_then(|plan| plan.actor),
+            Some(RequestEventActor::System)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_provider_selection_records_needs_user_input_when_none_match()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+        service
+            .resolve_identity(
+                created.request.id,
+                identity(550),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+        let providers = [ConfiguredFulfillmentProvider::new(
+            "tv-provider",
+            100,
+            TV_PROVIDER,
+        )];
+
+        let planned = service
+            .plan_provider_selection(created.request.id, &providers, &[], None)
+            .await?;
+
+        assert_eq!(
+            planned.selection.decision,
+            FulfillmentPlanDecision::NeedsUserInput
+        );
+        assert_eq!(planned.selection.selected_provider_id, None);
+        assert!(planned.selection.ranked_providers.is_empty());
+        assert_eq!(
+            planned
+                .detail
+                .current_plan
+                .as_ref()
+                .map(|plan| plan.decision),
+            Some(FulfillmentPlanDecision::NeedsUserInput)
+        );
+        assert_eq!(
+            planned
+                .detail
+                .current_plan
+                .as_ref()
+                .map(|plan| plan.summary.as_str()),
+            Some("no configured provider can satisfy tmdb:movie:550")
+        );
 
         Ok(())
     }
