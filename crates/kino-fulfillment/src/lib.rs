@@ -13,12 +13,14 @@ pub use planning::{
     FulfillmentProviderArgs, FulfillmentUserInputReason, compute_fulfillment_plan,
 };
 pub use provider::{
-    ConfiguredFulfillmentProvider, FulfillmentProviderCapability, ProviderSelectionContext,
-    ProviderSelectionPlan, RankedFulfillmentProvider, select_fulfillment_provider,
+    ConfiguredFulfillmentProvider, FulfillmentProviderCapability, FulfillmentProviderError,
+    PROVIDER_RETRY_INITIAL_BACKOFF, PROVIDER_RETRY_MAX_BACKOFF, PROVIDER_RETRY_MAX_FAILURES,
+    ProviderRetryPolicy, ProviderSelectionContext, ProviderSelectionPlan,
+    RankedFulfillmentProvider, select_fulfillment_provider,
 };
 pub use request::{
     Error, FulfillmentPlan, FulfillmentPlanDecision, NewFulfillmentPlan, NewRequest,
-    ProviderSelectionPlanningResult, REQUEST_AUTO_RESOLVE_MIN_MARGIN,
+    ProviderErrorHandlingResult, ProviderSelectionPlanningResult, REQUEST_AUTO_RESOLVE_MIN_MARGIN,
     REQUEST_AUTO_RESOLVE_MIN_SCORE, REQUEST_LIST_DEFAULT_LIMIT, REQUEST_LIST_MAX_LIMIT,
     REQUEST_MATCH_CANDIDATE_LIMIT, RequestDetail, RequestEventActor, RequestIdentityProvenance,
     RequestIdentityVersion, RequestListPage, RequestListQuery, RequestMatchCandidate,

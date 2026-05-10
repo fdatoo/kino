@@ -1,10 +1,18 @@
-//! Fulfillment provider selection.
+//! Fulfillment provider selection and error handling.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use kino_core::{CanonicalIdentityId, CanonicalIdentityKind};
 
 use crate::request::{Error, FulfillmentPlanDecision, Result};
+
+/// Default number of provider failures allowed before retry is exhausted.
+pub const PROVIDER_RETRY_MAX_FAILURES: u32 = 3;
+/// Default delay after the first transient provider failure.
+pub const PROVIDER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
+/// Maximum delay between provider retry attempts.
+pub const PROVIDER_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 /// A configured fulfillment provider supplied by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +47,124 @@ pub enum FulfillmentProviderCapability {
     AnyMedia,
     /// Provider can attempt one canonical media kind.
     MediaKind(CanonicalIdentityKind),
+}
+
+/// Error returned by a fulfillment provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FulfillmentProviderError {
+    /// Provider failure may clear on a later attempt.
+    Transient {
+        /// Stable provider-specific error code.
+        code: String,
+        /// Human-readable error detail.
+        message: String,
+    },
+    /// Provider failure should fail the request without retrying.
+    Permanent {
+        /// Stable provider-specific error code.
+        code: String,
+        /// Human-readable error detail.
+        message: String,
+    },
+}
+
+impl FulfillmentProviderError {
+    /// Construct a transient provider error.
+    pub fn transient(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Transient {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Construct a permanent provider error.
+    pub fn permanent(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Permanent {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Whether retry policy applies to this error.
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient { .. })
+    }
+
+    /// Stable provider-specific error code.
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Transient { code, .. } | Self::Permanent { code, .. } => code,
+        }
+    }
+
+    /// Human-readable error detail.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Transient { message, .. } | Self::Permanent { message, .. } => message,
+        }
+    }
+
+    /// Message suitable for request status history.
+    pub fn status_message(&self, provider_id: &str) -> String {
+        let class = if self.is_transient() {
+            "transient"
+        } else {
+            "permanent"
+        };
+
+        format!(
+            "provider {provider_id} returned {class} error {}: {}",
+            self.code(),
+            self.message()
+        )
+    }
+}
+
+/// Retry policy for transient provider failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderRetryPolicy {
+    /// Number of failures allowed before the request is failed.
+    pub max_failures: u32,
+    /// Delay after the first transient failure.
+    pub initial_backoff: Duration,
+    /// Maximum retry delay.
+    pub max_backoff: Duration,
+}
+
+impl ProviderRetryPolicy {
+    /// Construct a retry policy.
+    pub const fn new(max_failures: u32, initial_backoff: Duration, max_backoff: Duration) -> Self {
+        Self {
+            max_failures,
+            initial_backoff,
+            max_backoff,
+        }
+    }
+
+    /// Return the delay for `failure_count`, or `None` when retries are exhausted.
+    pub fn retry_after(self, failure_count: u32) -> Option<Duration> {
+        if failure_count == 0 || failure_count >= self.max_failures {
+            return None;
+        }
+
+        let exponent = failure_count.saturating_sub(1);
+        let multiplier = 2_u32.saturating_pow(exponent);
+        Some(
+            self.initial_backoff
+                .saturating_mul(multiplier)
+                .min(self.max_backoff),
+        )
+    }
+}
+
+impl Default for ProviderRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_failures: PROVIDER_RETRY_MAX_FAILURES,
+            initial_backoff: PROVIDER_RETRY_INITIAL_BACKOFF,
+            max_backoff: PROVIDER_RETRY_MAX_BACKOFF,
+        }
+    }
 }
 
 impl FulfillmentProviderCapability {
@@ -248,6 +374,7 @@ fn rank_from_index(index: usize) -> u32 {
 mod tests {
     use super::*;
     use kino_core::TmdbId;
+    use std::time::Duration;
 
     const ANY: &[FulfillmentProviderCapability] = &[FulfillmentProviderCapability::AnyMedia];
     const MOVIE: &[FulfillmentProviderCapability] = &[FulfillmentProviderCapability::MediaKind(
@@ -354,6 +481,32 @@ mod tests {
             err,
             Error::DuplicateFulfillmentProvider { provider_id } if provider_id == "duplicate"
         ));
+    }
+
+    #[test]
+    fn provider_error_records_transient_or_permanent_class() {
+        let transient = FulfillmentProviderError::transient("timeout", "provider timed out");
+        let permanent = FulfillmentProviderError::permanent("not_found", "provider rejected id");
+
+        assert!(transient.is_transient());
+        assert!(!permanent.is_transient());
+        assert_eq!(transient.code(), "timeout");
+        assert_eq!(permanent.message(), "provider rejected id");
+        assert_eq!(
+            transient.status_message("watch-folder"),
+            "provider watch-folder returned transient error timeout: provider timed out"
+        );
+    }
+
+    #[test]
+    fn retry_policy_uses_capped_exponential_backoff() {
+        let policy = ProviderRetryPolicy::new(4, Duration::from_secs(5), Duration::from_secs(12));
+
+        assert_eq!(policy.retry_after(0), None);
+        assert_eq!(policy.retry_after(1), Some(Duration::from_secs(5)));
+        assert_eq!(policy.retry_after(2), Some(Duration::from_secs(10)));
+        assert_eq!(policy.retry_after(3), Some(Duration::from_secs(12)));
+        assert_eq!(policy.retry_after(4), None);
     }
 
     fn movie_identity(tmdb_id: u32) -> CanonicalIdentityId {
