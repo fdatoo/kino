@@ -99,6 +99,7 @@ mod tests {
                 (5, String::from("request match candidates")),
                 (6, String::from("request identity versions")),
                 (7, String::from("canonical identities")),
+                (8, String::from("request fulfillment plans")),
             ]
         );
 

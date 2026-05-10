@@ -8,8 +8,9 @@ use axum::{
 use kino_core::{CanonicalIdentityId, Id, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
-    NewRequest, RequestDetail, RequestEventActor, RequestListPage, RequestListQuery,
-    RequestMatchCandidateInput, RequestService, RequestState, RequestTransition,
+    FulfillmentPlanDecision, NewFulfillmentPlan, NewRequest, RequestDetail, RequestEventActor,
+    RequestListPage, RequestListQuery, RequestMatchCandidateInput, RequestService, RequestState,
+    RequestTransition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,13 @@ struct ReResolveRequest {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordPlanRequest {
+    decision: FulfillmentPlanDecision,
+    summary: String,
+}
+
 pub(crate) fn router(db: Db) -> Router {
     let state = AppState {
         requests: RequestService::new(db),
@@ -59,6 +67,7 @@ pub(crate) fn router(db: Db) -> Router {
             get(get_request).delete(cancel_request),
         )
         .route("/api/requests/{id}/matches", post(score_matches))
+        .route("/api/requests/{id}/plans", post(record_plan))
         .route("/api/requests/{id}/re-resolution", post(re_resolve))
         .with_state(state)
 }
@@ -137,6 +146,23 @@ async fn score_matches(
     Ok(Json(detail))
 }
 
+async fn record_plan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<RecordPlanRequest>,
+) -> ApiResult<Json<RequestDetail>> {
+    let id = parse_id(id)?;
+    let detail = state
+        .requests
+        .record_plan(
+            id,
+            NewFulfillmentPlan::new(payload.decision, payload.summary.as_str())
+                .with_actor(RequestEventActor::System),
+        )
+        .await?;
+    Ok(Json(detail))
+}
+
 async fn re_resolve(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -184,6 +210,9 @@ impl IntoResponse for ApiError {
             Self::Fulfillment(kino_fulfillment::Error::InvalidMatchResolutionState { .. }) => {
                 StatusCode::CONFLICT
             }
+            Self::Fulfillment(kino_fulfillment::Error::InvalidFulfillmentPlanState { .. }) => {
+                StatusCode::CONFLICT
+            }
             Self::Fulfillment(kino_fulfillment::Error::ResolutionRequiresIdentity { .. }) => {
                 StatusCode::CONFLICT
             }
@@ -200,6 +229,9 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST
             }
             Self::Fulfillment(kino_fulfillment::Error::InvalidMatchCandidate { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Fulfillment(kino_fulfillment::Error::EmptyFulfillmentPlanSummary) => {
                 StatusCode::BAD_REQUEST
             }
             Self::Fulfillment(_) => {

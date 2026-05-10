@@ -4,8 +4,8 @@ use axum::{
 };
 use kino_core::{CanonicalIdentityId, TmdbId};
 use kino_fulfillment::{
-    NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage, RequestService,
-    RequestState, RequestTransition,
+    FulfillmentPlanDecision, NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage,
+    RequestService, RequestState, RequestTransition,
 };
 use serde::de::DeserializeOwned;
 use tower::util::ServiceExt;
@@ -313,6 +313,97 @@ async fn re_resolution_api_records_versioned_identity_history()
             .and_then(|event| event.message.as_deref()),
         Some("admin selected a better match")
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_plan_api_records_current_plan_and_history()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let service = RequestService::new(db.clone());
+    let app = kino_server::router(db);
+    let created = service
+        .create(NewRequest::anonymous("Inception (2010)"))
+        .await?;
+    service
+        .resolve_identity(
+            created.request.id,
+            identity(550),
+            RequestIdentityProvenance::Manual,
+            None,
+            None,
+        )
+        .await?;
+    service
+        .transition(
+            created.request.id,
+            RequestTransition::StartPlanning,
+            None,
+            None,
+        )
+        .await?;
+
+    let first_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/requests/{}/plans", created.request.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "decision":"needs_provider",
+                        "summary":"watch-folder provider can satisfy this request"
+                    }"#,
+                ))?,
+        )
+        .await?;
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first: RequestDetail = response_json(first_response).await?;
+    assert_eq!(first.plan_history.len(), 1);
+    assert_eq!(
+        first.current_plan.as_ref().map(|plan| plan.decision),
+        Some(FulfillmentPlanDecision::NeedsProvider)
+    );
+
+    let second_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/requests/{}/plans", created.request.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "decision":"needs_user_input",
+                        "summary":"provider candidates require a user choice"
+                    }"#,
+                ))?,
+        )
+        .await?;
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second: RequestDetail = response_json(second_response).await?;
+    assert_eq!(second.plan_history.len(), 2);
+    assert_eq!(second.plan_history[0].version, 1);
+    assert_eq!(second.plan_history[1].version, 2);
+    assert_eq!(
+        second.current_plan.as_ref().map(|plan| plan.id),
+        Some(second.plan_history[1].id)
+    );
+
+    let get_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/requests/{}", created.request.id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let fetched: RequestDetail = response_json(get_response).await?;
+    assert_eq!(fetched.plan_history, second.plan_history);
+    assert_eq!(fetched.current_plan, second.current_plan);
 
     Ok(())
 }

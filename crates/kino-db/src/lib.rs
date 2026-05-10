@@ -453,6 +453,7 @@ mod tests {
                 (5, String::from("request match candidates")),
                 (6, String::from("request identity versions")),
                 (7, String::from("canonical identities")),
+                (8, String::from("request fulfillment plans")),
             ]
         );
 
@@ -493,7 +494,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            8,
+            9,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -506,7 +507,7 @@ mod tests {
         .fetch_one(db.write_pool())
         .await?;
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 8")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 9")
                 .fetch_one(db.write_pool())
                 .await?;
 
@@ -523,22 +524,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(8, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(9, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 8")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 9")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 8, .. }
+            super::Error::MigrationFailed { version: 9, .. }
         ));
-        assert!(err.to_string().contains("database migration 8 failed"));
+        assert!(err.to_string().contains("database migration 9 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -565,6 +566,7 @@ mod tests {
                 (5, String::from("request match candidates")),
                 (6, String::from("request identity versions")),
                 (7, String::from("canonical identities")),
+                (8, String::from("request fulfillment plans")),
             ]
         );
 

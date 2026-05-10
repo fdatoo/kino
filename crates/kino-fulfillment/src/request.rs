@@ -12,7 +12,7 @@ use thiserror::Error;
 
 mod store;
 
-use store::{NewIdentityVersion, NewStatusEvent, RequestStore};
+use store::{NewFulfillmentPlanRecord, NewIdentityVersion, NewStatusEvent, RequestStore};
 
 /// Default request list page size.
 pub const REQUEST_LIST_DEFAULT_LIMIT: u32 = 50;
@@ -119,6 +119,31 @@ pub enum Error {
         /// Persisted version value.
         version: i64,
     },
+
+    /// A persisted fulfillment plan decision is outside the known enum.
+    #[error("request fulfillment plan decision {value} is invalid")]
+    InvalidFulfillmentPlanDecision {
+        /// Persisted decision value.
+        value: String,
+    },
+
+    /// A persisted fulfillment plan version is outside the accepted range.
+    #[error("request fulfillment plan version {version} is invalid")]
+    InvalidFulfillmentPlanVersion {
+        /// Persisted version value.
+        version: i64,
+    },
+
+    /// Plan persistence cannot run from the current request state.
+    #[error("request fulfillment planning from {from} is invalid")]
+    InvalidFulfillmentPlanState {
+        /// Current request state.
+        from: RequestState,
+    },
+
+    /// A fulfillment plan summary is empty after trimming whitespace.
+    #[error("request fulfillment plan summary is empty")]
+    EmptyFulfillmentPlanSummary,
 
     /// A candidate appears more than once in one scoring request.
     #[error("request match candidate {canonical_identity_id} is duplicated")]
@@ -321,6 +346,88 @@ pub struct RequestIdentityVersion {
     pub actor: Option<RequestEventActor>,
 }
 
+/// Top-level decision produced by fulfillment planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfillmentPlanDecision {
+    /// The requested media already exists in the library.
+    AlreadySatisfied,
+    /// A configured provider must produce candidate media.
+    NeedsProvider,
+    /// The user must provide more input before fulfillment can proceed.
+    NeedsUserInput,
+}
+
+impl FulfillmentPlanDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadySatisfied => "already_satisfied",
+            Self::NeedsProvider => "needs_provider",
+            Self::NeedsUserInput => "needs_user_input",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "already_satisfied" => Some(Self::AlreadySatisfied),
+            "needs_provider" => Some(Self::NeedsProvider),
+            "needs_user_input" => Some(Self::NeedsUserInput),
+            _ => None,
+        }
+    }
+}
+
+/// Versioned fulfillment plan recorded for a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfillmentPlan {
+    /// Plan id.
+    pub id: Id,
+    /// Request id.
+    pub request_id: Id,
+    /// Monotonic per-request plan version.
+    pub version: u32,
+    /// Planner decision.
+    pub decision: FulfillmentPlanDecision,
+    /// Human-readable reason for the decision.
+    pub summary: String,
+    /// Status event associated with planning, when applicable.
+    pub status_event_id: Option<Id>,
+    /// Version creation timestamp.
+    pub created_at: Timestamp,
+    /// Optional actor responsible for the plan.
+    pub actor: Option<RequestEventActor>,
+}
+
+/// Data required to persist a computed fulfillment plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewFulfillmentPlan<'a> {
+    /// Planner decision.
+    pub decision: FulfillmentPlanDecision,
+    /// Human-readable reason for the decision.
+    pub summary: &'a str,
+    /// Optional actor responsible for the plan.
+    pub actor: Option<RequestEventActor>,
+}
+
+impl<'a> NewFulfillmentPlan<'a> {
+    /// Construct a new fulfillment plan input.
+    pub const fn new(decision: FulfillmentPlanDecision, summary: &'a str) -> Self {
+        Self {
+            decision,
+            summary,
+            actor: None,
+        }
+    }
+
+    /// Set the plan actor.
+    pub const fn with_actor(self, actor: RequestEventActor) -> Self {
+        Self {
+            actor: Some(actor),
+            ..self
+        }
+    }
+}
+
 /// Candidate supplied by a resolver before request-level scoring.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestMatchCandidateInput {
@@ -356,6 +463,10 @@ pub struct RequestMatchCandidate {
 pub struct RequestDetail {
     /// Current request projection.
     pub request: Request,
+    /// Current fulfillment plan, if planning has run.
+    pub current_plan: Option<FulfillmentPlan>,
+    /// Fulfillment plan history ordered by version.
+    pub plan_history: Vec<FulfillmentPlan>,
     /// Status events ordered by occurrence.
     pub status_events: Vec<RequestStatusEvent>,
     /// Canonical identity history ordered by version.
@@ -574,6 +685,47 @@ impl RequestService {
             return Err(Error::RequestNotFound { id: request_id });
         }
 
+        self.get(request_id).await
+    }
+
+    /// Persist a newly computed fulfillment plan and make it current.
+    pub async fn record_plan(
+        &self,
+        request_id: Id,
+        plan: NewFulfillmentPlan<'_>,
+    ) -> Result<RequestDetail> {
+        let summary = validate_plan_summary(plan.summary)?;
+        let mut tx = self.store.begin().await?;
+        let current = self.store.request_in_tx(&mut tx, request_id).await?;
+        if current.state != RequestState::Planning {
+            return Err(Error::InvalidFulfillmentPlanState {
+                from: current.state,
+            });
+        }
+
+        let now = Timestamp::now();
+        let plan_id = Id::new();
+        let version = self.store.next_plan_version(&mut tx, request_id).await?;
+        self.store
+            .insert_fulfillment_plan(
+                &mut tx,
+                NewFulfillmentPlanRecord {
+                    id: plan_id,
+                    request_id,
+                    version,
+                    decision: plan.decision,
+                    summary,
+                    status_event_id: None,
+                    created_at: now,
+                    actor: plan.actor,
+                },
+            )
+            .await?;
+        self.store
+            .update_current_plan(&mut tx, request_id, plan_id, now)
+            .await?;
+
+        tx.commit().await?;
         self.get(request_id).await
     }
 
@@ -902,6 +1054,15 @@ fn validate_match_candidates(candidates: &[RequestMatchCandidateInput]) -> Resul
     }
 
     Ok(())
+}
+
+fn validate_plan_summary(summary: &str) -> Result<&str> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return Err(Error::EmptyFulfillmentPlanSummary);
+    }
+
+    Ok(trimmed)
 }
 
 fn score_match_candidates(
@@ -1234,6 +1395,143 @@ mod tests {
         let detail = service.get(created.request.id).await?;
         assert_eq!(detail.request.target.canonical_identity_id, None);
         assert!(detail.identity_versions.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_plan_creates_current_plan_and_history()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+        service
+            .resolve_identity(
+                created.request.id,
+                identity(550),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+
+        let first = service
+            .record_plan(
+                created.request.id,
+                NewFulfillmentPlan::new(
+                    FulfillmentPlanDecision::NeedsProvider,
+                    "watch-folder provider can satisfy this request",
+                )
+                .with_actor(RequestEventActor::System),
+            )
+            .await?;
+        let second = service
+            .record_plan(
+                created.request.id,
+                NewFulfillmentPlan::new(
+                    FulfillmentPlanDecision::NeedsUserInput,
+                    "provider candidates require a user choice",
+                )
+                .with_actor(RequestEventActor::System),
+            )
+            .await?;
+        let loaded = service.get(created.request.id).await?;
+
+        assert_eq!(first.plan_history.len(), 1);
+        assert_eq!(first.plan_history[0].version, 1);
+        assert_eq!(
+            first.plan_history[0].decision,
+            FulfillmentPlanDecision::NeedsProvider
+        );
+        assert_eq!(first.current_plan, Some(first.plan_history[0].clone()));
+        assert_eq!(first.request.plan_id, Some(first.plan_history[0].id));
+
+        assert_eq!(second.plan_history.len(), 2);
+        assert_eq!(second.plan_history[0].version, 1);
+        assert_eq!(second.plan_history[1].version, 2);
+        assert_eq!(
+            second.plan_history[1].decision,
+            FulfillmentPlanDecision::NeedsUserInput
+        );
+        assert_eq!(second.current_plan, Some(second.plan_history[1].clone()));
+        assert_eq!(second.request.plan_id, Some(second.plan_history[1].id));
+        assert_eq!(loaded.plan_history, second.plan_history);
+        assert_eq!(loaded.current_plan, second.current_plan);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_plan_requires_planning_state_and_summary()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+
+        let state_err = match service
+            .record_plan(
+                created.request.id,
+                NewFulfillmentPlan::new(FulfillmentPlanDecision::NeedsProvider, "provider"),
+            )
+            .await
+        {
+            Ok(_) => panic!("plan outside planning was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            state_err,
+            Error::InvalidFulfillmentPlanState {
+                from: RequestState::Pending
+            }
+        ));
+
+        service
+            .resolve_identity(
+                created.request.id,
+                identity(550),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+
+        let summary_err = match service
+            .record_plan(
+                created.request.id,
+                NewFulfillmentPlan::new(FulfillmentPlanDecision::NeedsProvider, "  "),
+            )
+            .await
+        {
+            Ok(_) => panic!("empty plan summary was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(summary_err, Error::EmptyFulfillmentPlanSummary));
+
+        let loaded = service.get(created.request.id).await?;
+        assert!(loaded.current_plan.is_none());
+        assert!(loaded.plan_history.is_empty());
 
         Ok(())
     }
@@ -1757,6 +2055,61 @@ mod tests {
 
         let loaded = service.get(detail.request.id).await?;
         assert_eq!(loaded.identity_versions, detail.identity_versions);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fulfillment_plans_are_append_only()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db.clone());
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+        service
+            .resolve_identity(
+                created.request.id,
+                identity(550),
+                RequestIdentityProvenance::Manual,
+                None,
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                None,
+                None,
+            )
+            .await?;
+        let detail = service
+            .record_plan(
+                created.request.id,
+                NewFulfillmentPlan::new(
+                    FulfillmentPlanDecision::NeedsProvider,
+                    "provider can satisfy this request",
+                ),
+            )
+            .await?;
+
+        let update_result =
+            sqlx::query("UPDATE request_fulfillment_plans SET summary = ?2 WHERE id = ?1")
+                .bind(detail.plan_history[0].id)
+                .bind("changed")
+                .execute(db.write_pool())
+                .await;
+        let delete_result = sqlx::query("DELETE FROM request_fulfillment_plans WHERE id = ?1")
+            .bind(detail.plan_history[0].id)
+            .execute(db.write_pool())
+            .await;
+
+        assert!(update_result.is_err());
+        assert!(delete_result.is_err());
+
+        let loaded = service.get(detail.request.id).await?;
+        assert_eq!(loaded.plan_history, detail.plan_history);
 
         Ok(())
     }
