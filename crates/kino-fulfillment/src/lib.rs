@@ -1,5 +1,6 @@
 //! Request tracking and fulfillment orchestration.
 
+pub mod movie;
 mod request;
 pub mod tv;
 
