@@ -171,7 +171,6 @@ The doc deliberately doesn't resolve these. They're the things to think through 
 
 - **Database choice past v1.** SQLite is right for v1; whether and when to support Postgres for larger deployments is an open question.
 - **Subtitle policy.** OCR for image-based subs, forced-subtitle detection — how much of this is in scope.
-- **Metadata provider strategy.** TMDB is the obvious primary; how to handle gaps (anime, non-English content, home video) without becoming a metadata provider aggregator like Jellyfin did.
 - **Update and migration strategy.** Single-binary upgrades are easy; database migrations across breaking schema changes need a real plan before the first user-facing release.
 - **What "v1" means publicly.** This doc treats Kino as a personal project. If at some point it's worth releasing publicly, the bar for that — docs, support, breaking-change policy — is a separate decision.
 

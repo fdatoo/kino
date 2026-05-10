@@ -24,3 +24,4 @@
 # Local config / env
 .env
 .env.local
+kino.toml
