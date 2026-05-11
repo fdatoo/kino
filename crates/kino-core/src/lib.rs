@@ -17,7 +17,7 @@ pub mod tracing;
 pub mod user;
 
 pub use catalog::{MediaItem, MediaItemKind, SourceFile, TranscodeOutput};
-pub use config::{CanonicalLayoutTransfer, Config, LibraryConfig};
+pub use config::{CanonicalLayoutTransfer, Config, LibraryConfig, OcrConfig, SessionReaperConfig};
 pub use device_token::DeviceToken;
 pub use id::Id;
 pub use identity::{

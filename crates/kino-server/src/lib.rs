@@ -10,6 +10,7 @@ pub mod auth;
 mod openapi;
 mod playback;
 mod request;
+pub mod session_reaper;
 mod token;
 
 /// Errors produced by `kino-server`.
