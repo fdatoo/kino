@@ -4,7 +4,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{HeaderValue, Request as HttpRequest, StatusCode, header},
 };
-use kino_core::{CanonicalIdentityId, Id, Timestamp, TmdbId};
+use kino_core::{CanonicalIdentityId, Id, Timestamp, TmdbId, user::SEEDED_USER_ID};
 use kino_fulfillment::{
     FulfillmentPlanDecision, NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage,
     RequestService, RequestState, RequestTransition,
@@ -91,6 +91,17 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(body["info"]["version"], "0.1.0-phase-2");
     assert_eq!(body["servers"][0]["url"], "https://kino.example.test");
     assert!(body["paths"].get("/api/v1/library/items").is_some());
+    let catalog_params = body["paths"]["/api/v1/library/items"]["get"]["parameters"]
+        .as_array()
+        .ok_or("catalog list parameters should be an array")?;
+    for param in ["kind", "year", "watched", "sort", "cursor"] {
+        assert!(
+            catalog_params
+                .iter()
+                .any(|candidate| candidate["name"] == param),
+            "missing catalog list query parameter: {param}"
+        );
+    }
     assert!(body["paths"].get("/api/v1/admin/config").is_some());
     assert!(
         body["paths"]
@@ -1056,6 +1067,152 @@ async fn catalog_item_detail_includes_multiple_source_file_probe_tracks()
 }
 
 #[tokio::test]
+async fn catalog_api_filters_sorts_and_cursor_paginates() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let alpha_identity = identity(1001);
+    let bravo_identity = identity(1002);
+    let charlie_identity = identity(1003);
+    let show_identity = tv_identity(1004);
+    let alpha = insert_tmdb_media_item(&db, alpha_identity).await?;
+    let bravo = insert_tmdb_media_item(&db, bravo_identity).await?;
+    let charlie = insert_tmdb_media_item(&db, charlie_identity).await?;
+    let show = insert_tmdb_media_item(&db, show_identity).await?;
+    insert_catalog_title_with_release_date(&db, alpha, alpha_identity, "Alpha", Some("2020-01-01"))
+        .await?;
+    insert_catalog_title_with_release_date(&db, bravo, bravo_identity, "Bravo", Some("2021-01-01"))
+        .await?;
+    insert_catalog_title_with_release_date(
+        &db,
+        charlie,
+        charlie_identity,
+        "Charlie",
+        Some("2022-01-01"),
+    )
+    .await?;
+    insert_catalog_title_with_release_date(&db, show, show_identity, "Show", Some("2020-02-01"))
+        .await?;
+    insert_watched(&db, alpha).await?;
+    let app = kino_server::router(db);
+
+    let movies_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?kind=movie")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(movies_response.status(), StatusCode::OK);
+    let movies: Value = response_json(movies_response).await?;
+    let movie_items = movies["items"]
+        .as_array()
+        .ok_or("movie items should be an array")?;
+    assert_eq!(movie_items.len(), 3);
+    assert!(movie_items.iter().all(|item| item["media_kind"] == "movie"));
+
+    let year_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?year=2020&sort=title")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(year_response.status(), StatusCode::OK);
+    let released_in_2020: Value = response_json(year_response).await?;
+    assert_eq!(
+        released_in_2020["items"]
+            .as_array()
+            .ok_or("year items should be an array")?
+            .iter()
+            .map(|item| item["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::String(alpha.to_string()),
+            Value::String(show.to_string())
+        ]
+    );
+
+    let watched_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?watched=true")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(watched_response.status(), StatusCode::OK);
+    let watched: Value = response_json(watched_response).await?;
+    assert_eq!(watched["items"][0]["id"], Value::String(alpha.to_string()));
+    assert_eq!(watched["items"].as_array().map(Vec::len), Some(1));
+
+    let first_page_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?sort=title&limit=2")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(first_page_response.status(), StatusCode::OK);
+    let first_page: Value = response_json(first_page_response).await?;
+    assert_eq!(
+        first_page["items"]
+            .as_array()
+            .ok_or("first page items should be an array")?
+            .iter()
+            .map(|item| item["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::String(alpha.to_string()),
+            Value::String(bravo.to_string())
+        ]
+    );
+    let cursor = first_page["next_cursor"]
+        .as_str()
+        .ok_or("first page should include next cursor")?;
+
+    let second_page_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/library/items?sort=title&limit=2&cursor={cursor}"
+                ))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(second_page_response.status(), StatusCode::OK);
+    let second_page: Value = response_json(second_page_response).await?;
+    assert_eq!(
+        second_page["items"]
+            .as_array()
+            .ok_or("second page items should be an array")?
+            .iter()
+            .map(|item| item["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::String(charlie.to_string()),
+            Value::String(show.to_string())
+        ]
+    );
+    assert_eq!(second_page["next_cursor"], Value::Null);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_reocr_api_archives_old_sidecar_and_catalog_reports_new_current()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
@@ -1158,6 +1315,24 @@ async fn catalog_api_reports_invalid_filters_and_missing_items()
         )
         .await?;
     assert_eq!(invalid_filter.status(), StatusCode::BAD_REQUEST);
+
+    let unknown_param = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?foo=bar")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(unknown_param.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response_json(unknown_param).await?;
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("foo"))
+    );
 
     let missing = app
         .oneshot(
@@ -1605,6 +1780,17 @@ async fn insert_catalog_title(
     canonical_identity_id: CanonicalIdentityId,
     title: &str,
 ) -> Result<(), sqlx::Error> {
+    insert_catalog_title_with_release_date(db, media_item_id, canonical_identity_id, title, None)
+        .await
+}
+
+async fn insert_catalog_title_with_release_date(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    canonical_identity_id: CanonicalIdentityId,
+    title: &str,
+    release_date: Option<&str>,
+) -> Result<(), sqlx::Error> {
     let now = Timestamp::now();
 
     sqlx::query(
@@ -1626,15 +1812,32 @@ async fn insert_catalog_title(
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, 'description', NULL, '', 'poster.jpg', '', 'backdrop.jpg', NULL, NULL, 'metadata.json', ?5, ?6)
+        VALUES (?1, ?2, ?3, ?4, 'description', ?5, '', 'poster.jpg', '', 'backdrop.jpg', NULL, NULL, 'metadata.json', ?6, ?7)
         "#,
     )
     .bind(media_item_id)
     .bind(canonical_identity_id)
     .bind(canonical_identity_id.provider().as_str())
     .bind(title)
+    .bind(release_date)
     .bind(now)
     .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_watched(db: &kino_db::Db, media_item_id: Id) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO watched (user_id, media_item_id, watched_at, source)
+        VALUES (?1, ?2, ?3, 'manual')
+        "#,
+    )
+    .bind(SEEDED_USER_ID)
+    .bind(media_item_id)
+    .bind(Timestamp::now())
     .execute(db.write_pool())
     .await?;
 
@@ -1730,6 +1933,13 @@ async fn insert_catalog_artwork(
 fn identity(tmdb_id: u32) -> CanonicalIdentityId {
     match TmdbId::new(tmdb_id) {
         Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
+        None => panic!("test tmdb id must be positive"),
+    }
+}
+
+fn tv_identity(tmdb_id: u32) -> CanonicalIdentityId {
+    match TmdbId::new(tmdb_id) {
+        Some(tmdb_id) => CanonicalIdentityId::tmdb_tv_series(tmdb_id),
         None => panic!("test tmdb id must be positive"),
     }
 }

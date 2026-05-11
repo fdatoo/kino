@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+base64 = "0.22"
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
 serde = { workspace = true }
