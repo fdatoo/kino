@@ -16,7 +16,8 @@ use axum::{
 };
 use kino_core::Id;
 use kino_db::Db;
-use serde::Serialize;
+use kino_library::{SubtitleFormat, SubtitleProvenance, SubtitleService, SubtitleSidecar};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, SeekFrom};
@@ -27,13 +28,19 @@ use crate::{auth::AuthenticatedUser, session_service};
 #[derive(Clone)]
 pub(crate) struct StreamState {
     db: Db,
+    subtitles: SubtitleService,
 }
 
 pub(crate) fn router(db: Db) -> Router {
+    let subtitles = SubtitleService::new(db.clone());
     Router::new()
         .route("/api/v1/stream/sourcefile/{id}", get(source_file))
         .route("/api/v1/stream/transcode/{id}", get(transcode_output))
-        .with_state(StreamState { db })
+        .route(
+            "/api/v1/stream/items/{id}/subtitles/{track_vtt}",
+            get(subtitle_track),
+        )
+        .with_state(StreamState { db, subtitles })
 }
 
 /// Serve a source file with single-range support.
@@ -107,6 +114,52 @@ pub(crate) async fn transcode_output(
     )
     .await?;
     stream_file(transcode_output.path, headers).await
+}
+
+/// Serve a subtitle sidecar as a WebVTT rendition.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/items/{id}/subtitles/{track}.vtt",
+    tag = "stream",
+    params(
+        ("id" = Id, Path, description = "Media item id"),
+        ("track" = Id, Path, description = "Subtitle sidecar id")
+    ),
+    responses(
+        (status = 200, description = "WebVTT subtitle rendition", content_type = "text/vtt"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Subtitle sidecar not found", body = StreamErrorResponse),
+        (status = 500, description = "Subtitle conversion failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn subtitle_track(
+    State(state): State<StreamState>,
+    _auth: AuthenticatedUser,
+    AxumPath((media_item_id, track_vtt)): AxumPath<(Id, String)>,
+) -> StreamResult<Response> {
+    let track_id = parse_subtitle_track_id(&track_vtt)?;
+    let Some(sidecar) = state.subtitles.get(track_id).await? else {
+        return Err(StreamError::NotFound);
+    };
+    if sidecar.media_item_id != media_item_id {
+        return Err(StreamError::NotFound);
+    }
+
+    let text = read_subtitle_text(&sidecar).await?;
+    let body = subtitle_to_webvtt(&sidecar, &text)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/vtt")
+        .body(Body::from(body))
+        .map_err(StreamError::Response)
+}
+
+fn parse_subtitle_track_id(track_vtt: &str) -> StreamResult<Id> {
+    let Some(track) = track_vtt.strip_suffix(".vtt") else {
+        return Err(StreamError::NotFound);
+    };
+    track.parse().map_err(|_| StreamError::NotFound)
 }
 
 async fn stream_file(path: PathBuf, headers: HeaderMap) -> StreamResult<Response> {
@@ -195,7 +248,13 @@ pub(crate) enum StreamError {
     Sqlx(#[from] sqlx::Error),
 
     #[error(transparent)]
+    Library(#[from] kino_library::Error),
+
+    #[error(transparent)]
     Session(#[from] session_service::Error),
+
+    #[error("invalid subtitle sidecar {path}: {reason}", path = .path.display())]
+    InvalidSubtitle { path: PathBuf, reason: String },
 
     #[error("response build failed: {0}")]
     Response(#[from] axum::http::Error),
@@ -211,7 +270,12 @@ impl IntoResponse for StreamError {
         let status = match &self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
-            Self::Io(_) | Self::Sqlx(_) | Self::Session(_) | Self::Response(_) => {
+            Self::Io(_)
+            | Self::Sqlx(_)
+            | Self::Library(_)
+            | Self::Session(_)
+            | Self::InvalidSubtitle { .. }
+            | Self::Response(_) => {
                 tracing::error!(error = %self, "stream api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -291,6 +355,227 @@ async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow>
         media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
     })
+}
+
+async fn read_subtitle_text(sidecar: &SubtitleSidecar) -> StreamResult<String> {
+    tokio::fs::read_to_string(&sidecar.path)
+        .await
+        .map_err(StreamError::Io)
+}
+
+fn subtitle_to_webvtt(sidecar: &SubtitleSidecar, text: &str) -> StreamResult<String> {
+    match (sidecar.format, sidecar.provenance) {
+        (SubtitleFormat::Srt, SubtitleProvenance::Text) => Ok(srt_to_webvtt(text)),
+        (SubtitleFormat::Ass, SubtitleProvenance::Text) => ass_to_webvtt(&sidecar.path, text),
+        (SubtitleFormat::Json, SubtitleProvenance::Ocr) => ocr_json_to_webvtt(&sidecar.path, text),
+        _ => Err(invalid_subtitle(
+            &sidecar.path,
+            format!(
+                "unsupported subtitle format {} with provenance {}",
+                sidecar.format, sidecar.provenance
+            ),
+        )),
+    }
+}
+
+fn srt_to_webvtt(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut webvtt = String::from("WEBVTT\n\n");
+    for line in text.lines() {
+        if line.contains("-->") {
+            webvtt.push_str(&line.replace(',', "."));
+        } else {
+            webvtt.push_str(line);
+        }
+        webvtt.push('\n');
+    }
+    webvtt
+}
+
+fn ass_to_webvtt(path: &Path, text: &str) -> StreamResult<String> {
+    let mut start_index = 1;
+    let mut end_index = 2;
+    let mut text_index = 9;
+    let mut field_count = 10;
+    let mut webvtt = String::from("WEBVTT\n\n");
+    let mut cues = 0usize;
+
+    for line in text.lines() {
+        if let Some(format) = line.trim().strip_prefix("Format:") {
+            let fields = format
+                .split(',')
+                .map(|field| field.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            start_index = ass_format_index(path, &fields, "start")?;
+            end_index = ass_format_index(path, &fields, "end")?;
+            text_index = ass_format_index(path, &fields, "text")?;
+            field_count = fields.len();
+            continue;
+        }
+
+        let Some(dialogue) = line.trim().strip_prefix("Dialogue:") else {
+            continue;
+        };
+        let split_limit = field_count.max(text_index + 1);
+        let fields = dialogue
+            .splitn(split_limit, ',')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        let Some(start) = fields.get(start_index) else {
+            return Err(invalid_subtitle(
+                path,
+                "dialogue line is missing start time",
+            ));
+        };
+        let Some(end) = fields.get(end_index) else {
+            return Err(invalid_subtitle(path, "dialogue line is missing end time"));
+        };
+        let Some(cue_text) = fields.get(text_index) else {
+            return Err(invalid_subtitle(path, "dialogue line is missing text"));
+        };
+
+        webvtt.push_str(&format!(
+            "{} --> {}\n{}\n\n",
+            ass_timestamp_to_webvtt(path, start)?,
+            ass_timestamp_to_webvtt(path, end)?,
+            clean_ass_text(cue_text)
+        ));
+        cues += 1;
+    }
+
+    if cues == 0 {
+        return Err(invalid_subtitle(path, "ass sidecar has no dialogue cues"));
+    }
+
+    Ok(webvtt)
+}
+
+fn ass_format_index(path: &Path, fields: &[String], name: &str) -> StreamResult<usize> {
+    fields
+        .iter()
+        .position(|field| field == name)
+        .ok_or_else(|| invalid_subtitle(path, format!("ass format is missing {name} field")))
+}
+
+fn ass_timestamp_to_webvtt(path: &Path, timestamp: &str) -> StreamResult<String> {
+    let (hours, rest) = timestamp
+        .split_once(':')
+        .ok_or_else(|| invalid_subtitle(path, format!("invalid ass timestamp: {timestamp}")))?;
+    let (minutes, rest) = rest
+        .split_once(':')
+        .ok_or_else(|| invalid_subtitle(path, format!("invalid ass timestamp: {timestamp}")))?;
+    let (seconds, fraction) = rest
+        .split_once('.')
+        .ok_or_else(|| invalid_subtitle(path, format!("invalid ass timestamp: {timestamp}")))?;
+    let hours = parse_ass_time_part(path, "hour", hours, timestamp)?;
+    let minutes = parse_ass_time_part(path, "minute", minutes, timestamp)?;
+    let seconds = parse_ass_time_part(path, "second", seconds, timestamp)?;
+    let centiseconds = parse_ass_centiseconds(path, fraction, timestamp)?;
+
+    Ok(format!(
+        "{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}",
+        milliseconds = centiseconds * 10
+    ))
+}
+
+fn parse_ass_time_part(
+    path: &Path,
+    field: &'static str,
+    value: &str,
+    timestamp: &str,
+) -> StreamResult<u64> {
+    value.parse().map_err(|_| {
+        invalid_subtitle(
+            path,
+            format!("invalid ass timestamp {field} in {timestamp}: {value}"),
+        )
+    })
+}
+
+fn parse_ass_centiseconds(path: &Path, fraction: &str, timestamp: &str) -> StreamResult<u64> {
+    if fraction.is_empty() || !fraction.chars().all(|value| value.is_ascii_digit()) {
+        return Err(invalid_subtitle(
+            path,
+            format!("invalid ass timestamp fraction in {timestamp}: {fraction}"),
+        ));
+    }
+
+    let mut padded = String::from(fraction);
+    while padded.len() < 2 {
+        padded.push('0');
+    }
+    padded[..2].parse().map_err(|_| {
+        invalid_subtitle(
+            path,
+            format!("invalid ass timestamp fraction in {timestamp}: {fraction}"),
+        )
+    })
+}
+
+fn clean_ass_text(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut in_override = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => in_override = true,
+            '}' => in_override = false,
+            '\\' if !in_override => match chars.peek().copied() {
+                Some('N' | 'n') => {
+                    chars.next();
+                    cleaned.push('\n');
+                }
+                Some('h') => {
+                    chars.next();
+                    cleaned.push(' ');
+                }
+                _ => cleaned.push(ch),
+            },
+            _ if !in_override => cleaned.push(ch),
+            _ => {}
+        }
+    }
+
+    cleaned
+}
+
+fn ocr_json_to_webvtt(path: &Path, text: &str) -> StreamResult<String> {
+    let sidecar = serde_json::from_str::<OcrSubtitleSidecar>(text).map_err(|error| {
+        invalid_subtitle(path, format!("ocr sidecar json parse failed: {error}"))
+    })?;
+    if sidecar.provenance.as_deref() != Some(SubtitleProvenance::Ocr.as_str()) {
+        return Err(invalid_subtitle(
+            path,
+            "ocr sidecar provenance is missing or invalid",
+        ));
+    }
+
+    let mut webvtt = String::from("WEBVTT\n\n");
+    for cue in sidecar.cues {
+        webvtt.push_str(&format!("{} --> {}\n{}\n\n", cue.start, cue.end, cue.text));
+    }
+    Ok(webvtt)
+}
+
+#[derive(Debug, Deserialize)]
+struct OcrSubtitleSidecar {
+    provenance: Option<String>,
+    cues: Vec<OcrSubtitleCue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OcrSubtitleCue {
+    start: String,
+    end: String,
+    text: String,
+}
+
+fn invalid_subtitle(path: &Path, reason: impl Into<String>) -> StreamError {
+    StreamError::InvalidSubtitle {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
 }
 
 fn resolve_range(headers: &HeaderMap, file_size: u64) -> StreamResult<ResolvedRange> {
