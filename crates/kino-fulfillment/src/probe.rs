@@ -424,6 +424,19 @@ impl ProbeSubtitleKind {
     }
 }
 
+impl From<ProbeSubtitleKind> for kino_library::ProbeSubtitleKind {
+    fn from(kind: ProbeSubtitleKind) -> Self {
+        match kind {
+            ProbeSubtitleKind::Srt => Self::Srt,
+            ProbeSubtitleKind::Ass => Self::Ass,
+            ProbeSubtitleKind::ImagePgs => Self::ImagePgs,
+            ProbeSubtitleKind::ImageVobSub => Self::ImageVobSub,
+            ProbeSubtitleKind::ImageDvb => Self::ImageDvb,
+            ProbeSubtitleKind::Other => Self::Other,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct FfprobeOutput {
     #[serde(default)]
