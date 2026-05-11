@@ -1,8 +1,11 @@
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{Request as HttpRequest, StatusCode, header},
 };
-use kino_core::{Id, PlaybackSession, Timestamp, WatchedSource, user::SEEDED_USER_ID};
+use kino_core::{
+    Id, PlaybackProgress, PlaybackSession, Timestamp, WatchedSource, user::SEEDED_USER_ID,
+};
+use serde::Deserialize;
 use tower::util::ServiceExt;
 
 mod common;
@@ -134,6 +137,107 @@ async fn playback_progress_heartbeat_requires_auth() -> Result<(), Box<dyn std::
                 .uri("/api/v1/playback/progress")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(progress_body(Id::new(), 100))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_resume_returns_404_when_unwatched_without_progress()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let app = kino_server::router(db);
+
+    let response = get_progress(&app, &token, media_item_id).await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    assert!(body.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_resume_returns_in_progress_position()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let updated_at = insert_progress(&db, media_item_id, 180).await?;
+    let app = kino_server::router(db);
+
+    let response = get_progress(&app, &token, media_item_id).await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: PlaybackProgressResponse = response_json(response).await?;
+    assert_eq!(body.position_seconds, 180);
+    assert_eq!(body.updated_at, updated_at);
+    assert!(!body.watched);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_resume_returns_watched_flag() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let updated_at = insert_progress(&db, media_item_id, 240).await?;
+    insert_watched(&db, media_item_id).await?;
+    let app = kino_server::router(db);
+
+    let response = get_progress(&app, &token, media_item_id).await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: PlaybackProgressResponse = response_json(response).await?;
+    assert_eq!(body.position_seconds, 240);
+    assert_eq!(body.updated_at, updated_at);
+    assert!(body.watched);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_resume_ignores_manual_unmark_tombstone()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let updated_at = insert_progress(&db, media_item_id, 240).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        delete_watched(&app, &token, media_item_id).await?,
+        StatusCode::NO_CONTENT
+    );
+    let response = get_progress(&app, &token, media_item_id).await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: PlaybackProgressResponse = response_json(response).await?;
+    assert_eq!(body.position_seconds, 240);
+    assert_eq!(body.updated_at, updated_at);
+    assert!(!body.watched);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_resume_requires_auth() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/v1/playback/progress/{media_item_id}"))
+                .body(Body::empty())?,
         )
         .await?;
 
@@ -346,6 +450,25 @@ async fn post_progress(
     Ok(response.status())
 }
 
+async fn get_progress(
+    app: &axum::Router,
+    auth_token: &str,
+    media_item_id: Id,
+) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/v1/playback/progress/{media_item_id}"))
+                .bearer(auth_token)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    Ok(response)
+}
+
 async fn post_watched(
     app: &axum::Router,
     auth_token: &str,
@@ -413,6 +536,43 @@ async fn insert_personal_media_item(db: &kino_db::Db) -> Result<Id, sqlx::Error>
     .await?;
 
     Ok(id)
+}
+
+async fn insert_progress(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    position_seconds: i64,
+) -> Result<Timestamp, Box<dyn std::error::Error>> {
+    let updated_at = Timestamp::now();
+    let progress = PlaybackProgress::new(
+        SEEDED_USER_ID,
+        media_item_id,
+        position_seconds,
+        updated_at,
+        None,
+    )?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO playback_progress (
+            user_id,
+            media_item_id,
+            position_seconds,
+            updated_at,
+            source_device_token_id
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(progress.user_id)
+    .bind(progress.media_item_id)
+    .bind(progress.position_seconds)
+    .bind(progress.updated_at)
+    .bind(progress.source_device_token_id)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(updated_at)
 }
 
 async fn insert_source_file(
@@ -524,6 +684,27 @@ async fn watched_row(
     }))
 }
 
+async fn insert_watched(db: &kino_db::Db, media_item_id: Id) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO watched (
+            user_id,
+            media_item_id,
+            watched_at,
+            source
+        )
+        VALUES (?1, ?2, ?3, 'manual')
+        "#,
+    )
+    .bind(SEEDED_USER_ID)
+    .bind(media_item_id)
+    .bind(Timestamp::now())
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
 async fn playback_progress(
     db: &kino_db::Db,
     media_item_id: Id,
@@ -557,4 +738,18 @@ struct WatchedRow {
     watched_at: Timestamp,
     source: WatchedSource,
     unmarked: bool,
+}
+
+#[derive(Deserialize)]
+struct PlaybackProgressResponse {
+    position_seconds: i64,
+    updated_at: Timestamp,
+    watched: bool,
+}
+
+async fn response_json<T: serde::de::DeserializeOwned>(
+    response: axum::response::Response,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }

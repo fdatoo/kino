@@ -8,6 +8,7 @@ use kino_core::{
     config::{LogFormat, ServerConfig},
 };
 use kino_db::Db;
+use kino_library::SubtitleReocrService;
 
 mod admin_config;
 pub mod auth;
@@ -66,12 +67,26 @@ pub fn router_with_library_root_and_public_base_url(
 
 /// Build the Kino HTTP router with a fully resolved configuration.
 pub fn router_with_config(db: Db, config: Config) -> Router {
+    let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &config.library_root);
+    router_with_config_and_reocr(db, config, subtitle_reocr)
+}
+
+fn router_with_config_and_reocr(
+    db: Db,
+    config: Config,
+    subtitle_reocr: SubtitleReocrService,
+) -> Router {
     let auth_state = auth::AuthState { db: db.clone() };
     let public_base_url = config.server.public_base_url.clone();
     let library_root = config.library_root.clone();
     let artwork_cache_dir = config.artwork_cache_dir();
     let protected_api = Router::new()
-        .merge(request::router(db.clone(), library_root, artwork_cache_dir))
+        .merge(request::router(
+            db.clone(),
+            library_root,
+            artwork_cache_dir,
+            subtitle_reocr,
+        ))
         .merge(stream::router(db.clone()))
         .merge(token::router(db.clone()))
         .merge(playback::router(db))
@@ -166,11 +181,30 @@ pub fn router_with_library_root_artwork_cache_and_public_base_url(
     artwork_cache_dir: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Router {
+    let library_root = library_root.into();
+    let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &library_root);
+    router_with_library_root_artwork_cache_reocr_and_public_base_url(
+        db,
+        library_root,
+        artwork_cache_dir,
+        subtitle_reocr,
+        public_base_url,
+    )
+}
+
+/// Build the Kino HTTP router with explicit library, artwork, re-OCR, and OpenAPI settings.
+pub fn router_with_library_root_artwork_cache_reocr_and_public_base_url(
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    artwork_cache_dir: impl Into<PathBuf>,
+    subtitle_reocr: SubtitleReocrService,
+    public_base_url: impl Into<String>,
+) -> Router {
     let server = ServerConfig {
         public_base_url: public_base_url.into(),
         ..ServerConfig::default()
     };
-    router_with_config(
+    router_with_config_and_reocr(
         db,
         Config {
             database_path: PathBuf::from("kino.db"),
@@ -186,5 +220,6 @@ pub fn router_with_library_root_artwork_cache_and_public_base_url(
             log_level: "info".to_owned(),
             log_format: LogFormat::Pretty,
         },
+        subtitle_reocr,
     )
 }

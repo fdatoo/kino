@@ -1,3 +1,5 @@
+use std::{future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
+
 use axum::{
     body::{Body, to_bytes},
     http::{HeaderValue, Request as HttpRequest, StatusCode, header},
@@ -6,6 +8,11 @@ use kino_core::{CanonicalIdentityId, Id, Timestamp, TmdbId};
 use kino_fulfillment::{
     FulfillmentPlanDecision, NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage,
     RequestService, RequestState, RequestTransition,
+};
+use kino_library::{
+    ImageSubtitleExtraction, ImageSubtitleExtractionInput, ImageSubtitleFrame, ProbeSubtitleKind,
+    SubtitleReocrService,
+    subtitle_ocr::{OcrEngine, OcrFrameResult},
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -20,6 +27,35 @@ trait AuthRequestBuilder {
 impl AuthRequestBuilder for axum::http::request::Builder {
     fn bearer(self, token: &str) -> Self {
         self.header(header::AUTHORIZATION, common::bearer(token))
+    }
+}
+
+struct FakeSubtitleExtractor {
+    frames: Vec<ImageSubtitleFrame>,
+}
+
+impl ImageSubtitleExtraction for FakeSubtitleExtractor {
+    fn extract_image_subtitle_track<'a>(
+        &'a self,
+        input: ImageSubtitleExtractionInput,
+    ) -> Pin<Box<dyn Future<Output = kino_library::Result<Vec<ImageSubtitleFrame>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            assert_eq!(input.stream_index, 4);
+            assert_eq!(input.kind, ProbeSubtitleKind::ImagePgs);
+            Ok(self.frames.clone())
+        })
+    }
+}
+
+struct FakeOcrEngine;
+
+impl OcrEngine for FakeOcrEngine {
+    fn ocr(&self, _image_path: &Path) -> kino_library::Result<OcrFrameResult> {
+        Ok(OcrFrameResult {
+            text: String::from("UPDATED OCR"),
+            avg_confidence: 94.0,
+        })
     }
 }
 
@@ -76,6 +112,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert!(
         body["paths"]["/api/v1/admin/tokens/{token_id}"]
             .get("delete")
+            .is_some()
+    );
+    assert!(
+        body["paths"]
+            .get("/api/v1/admin/items/{id}/subtitles/{track}/re-ocr")
             .is_some()
     );
 
@@ -818,6 +859,91 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     assert_eq!(fetched["subtitle_tracks"][1]["label"], "JPN (OCR)");
     assert_eq!(fetched["subtitle_tracks"][1]["format"], "json");
     assert_eq!(fetched["subtitle_tracks"][1]["provenance"], "ocr");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_reocr_api_archives_old_sidecar_and_catalog_reports_new_current()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let library_root = tempfile::tempdir()?;
+    let artwork_cache = tempfile::tempdir()?;
+    let matrix_identity = identity(603);
+    let media_item_id = insert_tmdb_media_item(&db, matrix_identity).await?;
+    insert_catalog_title(&db, media_item_id, matrix_identity, "The Matrix").await?;
+    let source_path = library_root.path().join("matrix.mkv");
+    tokio::fs::write(&source_path, b"media bytes").await?;
+    insert_source_file(&db, media_item_id, &source_path).await?;
+    let sidecar_dir = library_root.path().join(".kino").join("sidecars");
+    tokio::fs::create_dir_all(&sidecar_dir).await?;
+    let old_path = sidecar_dir.join("matrix.jpn.json");
+    tokio::fs::write(&old_path, br#"{"provenance":"ocr","cues":[]}"#).await?;
+    let old_path_text = old_path.to_string_lossy().into_owned();
+    let old_sidecar_id =
+        insert_subtitle_sidecar(&db, media_item_id, "jpn", "json", "ocr", 4, &old_path_text)
+            .await?;
+    let reocr = SubtitleReocrService::new(
+        db.clone(),
+        Arc::new(FakeSubtitleExtractor {
+            frames: vec![ImageSubtitleFrame::new(
+                Duration::from_secs(3),
+                Duration::from_secs(4),
+                library_root.path().join("frame.png"),
+            )],
+        }),
+        Arc::new(FakeOcrEngine),
+    );
+    let app = kino_server::router_with_library_root_artwork_cache_reocr_and_public_base_url(
+        db.clone(),
+        library_root.path(),
+        artwork_cache.path(),
+        reocr,
+        "https://kino.example.test",
+    );
+
+    let reocr_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/items/{media_item_id}/subtitles/4/re-ocr"
+                ))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(reocr_response.status(), StatusCode::ACCEPTED);
+    let accepted: Value = response_json(reocr_response).await?;
+    let job_id = accepted["job_id"]
+        .as_str()
+        .ok_or("job_id should be a string")?;
+
+    let archived_at: Option<Timestamp> =
+        sqlx::query_scalar("SELECT archived_at FROM subtitle_sidecars WHERE id = ?1")
+            .bind(old_sidecar_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert!(archived_at.is_some());
+
+    let catalog_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/v1/library/items/{media_item_id}"))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let fetched: Value = response_json(catalog_response).await?;
+    assert_eq!(fetched["subtitle_tracks"].as_array().map(Vec::len), Some(1));
+    assert_eq!(fetched["subtitle_tracks"][0]["id"], job_id);
+    assert_eq!(fetched["subtitle_tracks"][0]["language"], "jpn");
+    assert_eq!(fetched["subtitle_tracks"][0]["label"], "JPN (OCR)");
+    assert_eq!(fetched["subtitle_tracks"][0]["provenance"], "ocr");
 
     Ok(())
 }

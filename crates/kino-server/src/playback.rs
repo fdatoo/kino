@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use kino_core::{Id, PlaybackProgress, Timestamp, Watched, WatchedSource};
 use kino_db::Db;
@@ -28,9 +28,23 @@ pub(crate) struct PlaybackProgressRequest {
     position_seconds: i64,
 }
 
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub(crate) struct PlaybackProgressResponse {
+    /// Latest recorded playback position in seconds.
+    position_seconds: i64,
+    /// Timestamp of the latest recorded progress update.
+    updated_at: Timestamp,
+    /// Whether the media item is marked watched for the current user.
+    watched: bool,
+}
+
 pub(crate) fn router(db: Db) -> Router {
     Router::new()
         .route("/api/v1/playback/progress", post(record_progress))
+        .route(
+            "/api/v1/playback/progress/{media_item_id}",
+            get(get_progress),
+        )
         .route(
             "/api/v1/playback/watched/{media_item_id}",
             post(mark_watched).delete(unmark_watched),
@@ -113,6 +127,63 @@ pub(crate) async fn record_progress(
     .await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/playback/progress/{media_item_id}",
+    tag = "playback",
+    params(
+        ("media_item_id" = Id, Path, description = "Media item id")
+    ),
+    responses(
+        (status = 200, description = "Playback progress found", body = PlaybackProgressResponse),
+        (status = 404, description = "Playback progress not found"),
+        (status = 500, description = "Playback progress read failed", body = PlaybackErrorResponse)
+    )
+)]
+pub(crate) async fn get_progress(
+    State(state): State<PlaybackState>,
+    AuthenticatedUser { user, .. }: AuthenticatedUser,
+    Path(media_item_id): Path<Id>,
+) -> PlaybackResult<Response> {
+    let Some((position_seconds, updated_at)) = sqlx::query_as::<_, (i64, Timestamp)>(
+        r#"
+        SELECT position_seconds, updated_at
+        FROM playback_progress
+        WHERE user_id = ?1 AND media_item_id = ?2
+        "#,
+    )
+    .bind(user.id)
+    .bind(media_item_id)
+    .fetch_optional(state.db.read_pool())
+    .await?
+    else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+
+    let watched = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT 1
+        FROM watched
+        WHERE user_id = ?1
+            AND media_item_id = ?2
+            AND unmarked = 0
+        LIMIT 1
+        "#,
+    )
+    .bind(user.id)
+    .bind(media_item_id)
+    .fetch_optional(state.db.read_pool())
+    .await?
+    .is_some();
+
+    Ok(Json(PlaybackProgressResponse {
+        position_seconds,
+        updated_at,
+        watched,
+    })
+    .into_response())
 }
 
 #[utoipa::path(

@@ -15,6 +15,7 @@ use std::{
 
 pub mod subtitle_image_extraction;
 pub mod subtitle_ocr;
+pub mod subtitle_reocr;
 
 use kino_core::{
     CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, Config, Id,
@@ -31,6 +32,7 @@ pub use subtitle_image_extraction::{
     ImageSubtitleFrame, ProbeSubtitleKind, default_subtitle_staging_dir,
     image_subtitle_track_output_dir,
 };
+pub use subtitle_reocr::{ReocrJob, SubtitleReocrService, reocr_track};
 
 /// Errors produced by `kino-library`.
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +159,15 @@ pub enum Error {
     SubtitleTrackMissing {
         /// Probed subtitle stream index.
         stream_index: u32,
+    },
+
+    /// A requested OCR sidecar is not currently active for a media item.
+    #[error("current ocr sidecar not found for media item {media_item_id} track {track_index}")]
+    CurrentOcrSidecarNotFound {
+        /// Media item id.
+        media_item_id: Id,
+        /// Probed subtitle stream index.
+        track_index: u32,
     },
 
     /// Image subtitle extraction failed while running ffmpeg or reading its output.
@@ -1236,7 +1247,7 @@ impl CatalogService {
             separated.push_bind(item.id);
         }
         separated
-            .push_unseparated(") ORDER BY media_item_id, language, track_index, provenance, id");
+            .push_unseparated(") AND archived_at IS NULL ORDER BY media_item_id, language, track_index, provenance, id");
 
         let rows = builder.build().fetch_all(self.db.read_pool()).await?;
         let mut by_media_item = HashMap::<Id, Vec<CatalogSubtitleTrack>>::new();
@@ -2123,6 +2134,8 @@ pub struct SubtitleSidecar {
     pub track_index: u32,
     /// Filesystem path to the sidecar file.
     pub path: PathBuf,
+    /// Time this sidecar stopped being current.
+    pub archived_at: Option<Timestamp>,
     /// Creation timestamp.
     pub created_at: Timestamp,
     /// Last update timestamp.
@@ -2198,6 +2211,7 @@ impl SubtitleService {
                 provenance: SubtitleProvenance::Text,
                 track_index: track.track_index,
                 path,
+                archived_at: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -2281,6 +2295,7 @@ impl SubtitleService {
                 provenance: SubtitleProvenance::Ocr,
                 track_index: track.track_index,
                 path,
+                archived_at: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -2332,6 +2347,7 @@ impl SubtitleService {
             SELECT DISTINCT language
             FROM subtitle_sidecars
             WHERE media_item_id = ?1
+                AND archived_at IS NULL
             ORDER BY language
             "#,
         )
@@ -2356,6 +2372,7 @@ impl SubtitleService {
                 provenance,
                 track_index,
                 path,
+                archived_at,
                 created_at,
                 updated_at
             FROM subtitle_sidecars
@@ -2371,7 +2388,7 @@ impl SubtitleService {
     }
 }
 
-async fn create_dir_all(path: &Path) -> Result<()> {
+pub(crate) async fn create_dir_all(path: &Path) -> Result<()> {
     tokio::fs::create_dir_all(path)
         .await
         .map_err(|source| Error::Io {
@@ -2487,7 +2504,7 @@ async fn write_sidecar(path: &Path, text: &str) -> Result<()> {
         })
 }
 
-async fn write_ocr_sidecar(path: &Path, cues: &[subtitle_ocr::OcrCue]) -> Result<()> {
+pub(crate) async fn write_ocr_sidecar(path: &Path, cues: &[subtitle_ocr::OcrCue]) -> Result<()> {
     let sidecar = OcrSubtitleSidecar {
         provenance: SubtitleProvenance::Ocr.as_str(),
         cues: cues.iter().map(OcrSubtitleCue::from).collect(),
@@ -2717,7 +2734,7 @@ fn format_duration(duration: Duration) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
-fn path_to_db_text(path: &Path) -> Result<String> {
+pub(crate) fn path_to_db_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| Error::NonUtf8Path {
@@ -2897,7 +2914,7 @@ fn catalog_subtitle_track_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Cata
     })
 }
 
-fn subtitle_sidecar_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SubtitleSidecar> {
+pub(crate) fn subtitle_sidecar_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SubtitleSidecar> {
     let path: String = row.try_get("path")?;
 
     Ok(SubtitleSidecar {
@@ -2908,6 +2925,7 @@ fn subtitle_sidecar_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SubtitleSi
         provenance: subtitle_provenance_from_row(row)?,
         track_index: subtitle_track_index_from_row(row)?,
         path: PathBuf::from(path),
+        archived_at: row.try_get("archived_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
