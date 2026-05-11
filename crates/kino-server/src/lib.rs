@@ -20,6 +20,7 @@ pub mod session_reaper;
 pub mod session_service;
 mod stream;
 mod token;
+pub mod variant_select;
 
 /// Errors produced by `kino-server`.
 #[derive(Debug, thiserror::Error)]
