@@ -5,9 +5,12 @@ use std::{
     process::ExitCode,
 };
 
-use kino_core::Config;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use kino_core::{Config, DeviceToken, Id, Timestamp, user::SEEDED_USER_ID};
 use kino_db::Db;
-use tracing::warn;
+use rand::{RngCore, rngs::OsRng};
+use sha2::{Digest, Sha256};
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -29,8 +32,66 @@ async fn start() -> Result<(), Error> {
 
 async fn run(config: Config) -> Result<(), Error> {
     let db = Db::open(&config).await?;
+    ensure_bootstrap_device_token(&db).await?;
     kino_server::serve(&config, db).await?;
     Ok(())
+}
+
+async fn ensure_bootstrap_device_token(db: &Db) -> Result<Option<String>, Error> {
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_tokens")
+        .fetch_one(db.read_pool())
+        .await?;
+
+    if token_count > 0 {
+        return Ok(None);
+    }
+
+    let plaintext = generate_plaintext_token()?;
+    let token = DeviceToken::new(
+        Id::new(),
+        SEEDED_USER_ID,
+        "bootstrap",
+        hash_token(&plaintext),
+        Timestamp::now(),
+    );
+
+    sqlx::query(
+        r#"
+        INSERT INTO device_tokens (
+            id,
+            user_id,
+            label,
+            hash,
+            last_seen_at,
+            revoked_at,
+            created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(token.id)
+    .bind(token.user_id)
+    .bind(&token.label)
+    .bind(&token.hash)
+    .bind(token.last_seen_at)
+    .bind(token.revoked_at)
+    .bind(token.created_at)
+    .execute(db.write_pool())
+    .await?;
+
+    info!(token = %plaintext, "bootstrap token issued");
+
+    Ok(Some(plaintext))
+}
+
+fn generate_plaintext_token() -> Result<String, Error> {
+    let mut bytes = [0_u8; 32];
+    OsRng.try_fill_bytes(&mut bytes)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn hash_token(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 fn report_error(err: &Error) {
@@ -83,6 +144,12 @@ enum Error {
 
     #[error(transparent)]
     Server(#[from] kino_server::Error),
+
+    #[error("secure random token generation failed: {0}")]
+    Random(#[from] rand::Error),
+
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
 
     #[error("reading library_root {path}: {source}", path = .path.display())]
     LibraryRootRead {
@@ -157,6 +224,37 @@ mod tests {
         );
 
         db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_device_token_is_minted_once() -> Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+
+        let first_plaintext = ensure_bootstrap_device_token(&db)
+            .await?
+            .ok_or("bootstrap token was not minted")?;
+        let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_tokens")
+            .fetch_one(db.read_pool())
+            .await?;
+        let stored: (String, String) =
+            sqlx::query_as("SELECT label, hash FROM device_tokens LIMIT 1")
+                .fetch_one(db.read_pool())
+                .await?;
+
+        assert_eq!(token_count, 1);
+        assert_eq!(stored.0, "bootstrap");
+        assert_ne!(stored.1, first_plaintext);
+        assert_eq!(stored.1.len(), 64);
+
+        let second_plaintext = ensure_bootstrap_device_token(&db).await?;
+        let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_tokens")
+            .fetch_one(db.read_pool())
+            .await?;
+
+        assert_eq!(second_plaintext, None);
+        assert_eq!(token_count, 1);
+
         Ok(())
     }
 

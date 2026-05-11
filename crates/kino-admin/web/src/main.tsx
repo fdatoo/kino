@@ -1,24 +1,33 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { createBrowserRouter, RouterProvider } from 'react-router-dom';
+import {
+    createBrowserRouter,
+    Navigate,
+    RouterProvider,
+} from 'react-router-dom';
+import { TokensPage } from './admin/tokens/TokensPage';
+import { AuthGate } from './auth/AuthGate';
+import { LoginPage } from './auth/LoginPage';
 import './styles.css';
 
 const router = createBrowserRouter(
     [
         {
-            path: '/',
-            element: (
-                <main className="app-shell">
-                    <section className="panel">
-                        <p className="eyebrow">Kino Admin</p>
-                        <h1>Library operations</h1>
-                        <p>
-                            This workspace will host the browser-based tools for
-                            managing Kino.
-                        </p>
-                    </section>
-                </main>
-            ),
+            path: '/login',
+            element: <LoginPage />,
+        },
+        {
+            element: <AuthGate />,
+            children: [
+                {
+                    path: '/',
+                    element: <Navigate to="/tokens" replace />,
+                },
+                {
+                    path: '/tokens',
+                    element: <TokensPage />,
+                },
+            ],
         },
     ],
     { basename: '/admin' },

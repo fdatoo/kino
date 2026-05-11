@@ -126,6 +126,33 @@ async fn token_api_rejects_empty_label() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+#[tokio::test]
+async fn token_api_revokes_token() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db.clone());
+    let created = create_token(&app, "Kitchen display").await?;
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/admin/tokens/{}", created.token_id))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let revoked_at: Option<Timestamp> =
+        sqlx::query_scalar("SELECT revoked_at FROM device_tokens WHERE id = ?1")
+            .bind(created.token_id)
+            .fetch_one(db.read_pool())
+            .await?;
+
+    assert!(revoked_at.is_some());
+
+    Ok(())
+}
+
 async fn create_token(
     app: &axum::Router,
     label: &str,
