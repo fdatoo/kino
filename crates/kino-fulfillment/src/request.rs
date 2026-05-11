@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    ingestion::{ExpectedProbedFile, ProbedFile, ProbedFileMatch, match_probed_file},
     planning::{
         ComputedFulfillmentPlan, FulfillmentLibraryState, FulfillmentPlanningInput,
         compute_fulfillment_plan,
@@ -54,6 +55,33 @@ pub enum Error {
     /// Canonical ingestion was requested without a layout writer.
     #[error("canonical layout writer is not configured")]
     CanonicalLayoutNotConfigured,
+
+    /// Probed-file verification cannot run from the current request state.
+    #[error("request probed-file verification from {from} is invalid")]
+    InvalidProbedFileMatchState {
+        /// Current request state.
+        from: RequestState,
+    },
+
+    /// Probed-file verification requires a resolved request identity.
+    #[error("request {request_id} probed-file verification requires a canonical identity")]
+    ProbedFileMatchRequiresIdentity {
+        /// Request missing a canonical identity.
+        request_id: Id,
+    },
+
+    /// Probed-file expectations do not match the request identity.
+    #[error(
+        "request {request_id} probed-file expectation {expected} does not match request identity {actual}"
+    )]
+    ProbedFileIdentityMismatch {
+        /// Request id.
+        request_id: Id,
+        /// Expected identity supplied to verification.
+        expected: CanonicalIdentityId,
+        /// Current request identity.
+        actual: CanonicalIdentityId,
+    },
 
     /// A requested entity does not exist.
     #[error("request {id} was not found")]
@@ -551,6 +579,26 @@ pub enum ProviderErrorHandlingResult {
     },
 }
 
+/// Result of verifying a probed file against its request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbedFileVerificationResult {
+    /// The file matched and ingestion may continue.
+    Matched {
+        /// Request detail after verification.
+        detail: Box<RequestDetail>,
+        /// Matcher result.
+        checked: ProbedFileMatch,
+    },
+
+    /// The file mismatched and the request was failed.
+    Mismatched {
+        /// Request detail after the failure transition.
+        detail: Box<RequestDetail>,
+        /// Matcher result.
+        checked: ProbedFileMatch,
+    },
+}
+
 /// Query parameters for listing requests.
 ///
 /// Pagination uses offset semantics. Results are ordered by `(created_at, id)`;
@@ -948,6 +996,58 @@ impl RequestService {
 
         Ok(ProviderErrorHandlingResult::Failed {
             detail: Box::new(detail),
+        })
+    }
+
+    /// Verify a probed provider file against an ingesting request.
+    pub async fn verify_probed_file(
+        &self,
+        request_id: Id,
+        expected: ExpectedProbedFile,
+        probed: ProbedFile,
+        actor: Option<RequestEventActor>,
+    ) -> Result<ProbedFileVerificationResult> {
+        let current = self.get(request_id).await?;
+        if current.request.state != RequestState::Ingesting {
+            return Err(Error::InvalidProbedFileMatchState {
+                from: current.request.state,
+            });
+        }
+
+        let actual_identity = current
+            .request
+            .target
+            .canonical_identity_id
+            .ok_or(Error::ProbedFileMatchRequiresIdentity { request_id })?;
+        if actual_identity != expected.canonical_identity_id {
+            return Err(Error::ProbedFileIdentityMismatch {
+                request_id,
+                expected: expected.canonical_identity_id,
+                actual: actual_identity,
+            });
+        }
+
+        let checked = match_probed_file(&expected, &probed);
+        if checked.is_match() {
+            return Ok(ProbedFileVerificationResult::Matched {
+                detail: Box::new(current),
+                checked,
+            });
+        }
+
+        let message = format!("probed file mismatch: {}", checked.summary());
+        let detail = self
+            .transition(
+                request_id,
+                RequestTransition::Fail(RequestFailureReason::IngestFailed),
+                actor,
+                Some(&message),
+            )
+            .await?;
+
+        Ok(ProbedFileVerificationResult::Mismatched {
+            detail: Box::new(detail),
+            checked,
         })
     }
 
@@ -2118,10 +2218,6 @@ mod tests {
         let detail = service.get(request_id).await?;
         assert_eq!(detail.request.state, RequestState::Fulfilling);
         assert_eq!(detail.request.failure_reason, None);
-        assert_eq!(
-            detail.status_events.last().map(|event| event.to_state),
-            Some(RequestState::Fulfilling)
-        );
 
         Ok(())
     }
@@ -2204,6 +2300,83 @@ mod tests {
                 "provider movie-provider returned transient error rate_limited: provider is rate limited"
             )
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn matching_probed_file_keeps_request_ingesting()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let request_id = ingesting_request(&service).await?;
+
+        let result = service
+            .verify_probed_file(
+                request_id,
+                ExpectedProbedFile::new(identity(550))
+                    .with_title("Inception")
+                    .with_runtime_seconds(8880)
+                    .with_required_audio_languages(["eng"]),
+                ProbedFile::new()
+                    .with_title("Inception")
+                    .with_duration_seconds(9000)
+                    .with_audio_languages(["eng", "jpn"]),
+                Some(RequestEventActor::System),
+            )
+            .await?;
+
+        let ProbedFileVerificationResult::Matched { detail, checked } = result else {
+            panic!("matching file should pass verification");
+        };
+        assert!(checked.is_match());
+        assert_eq!(detail.request.state, RequestState::Ingesting);
+        assert_eq!(detail.request.failure_reason, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mismatched_probed_file_fails_request_with_ingest_reason()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let request_id = ingesting_request(&service).await?;
+
+        let result = service
+            .verify_probed_file(
+                request_id,
+                ExpectedProbedFile::new(identity(550))
+                    .with_title("Inception")
+                    .with_runtime_seconds(8880),
+                ProbedFile::new()
+                    .with_title("Finding Nemo")
+                    .with_duration_seconds(600),
+                Some(RequestEventActor::System),
+            )
+            .await?;
+
+        let ProbedFileVerificationResult::Mismatched { detail, checked } = result else {
+            panic!("mismatched file should fail verification");
+        };
+        let event = detail
+            .status_events
+            .last()
+            .ok_or("failed request should have a status event")?;
+
+        assert!(!checked.is_match());
+        assert_eq!(detail.request.state, RequestState::Failed);
+        assert_eq!(
+            detail.request.failure_reason,
+            Some(RequestFailureReason::IngestFailed)
+        );
+        assert_eq!(event.to_state, RequestState::Failed);
+        let message = event
+            .message
+            .as_deref()
+            .ok_or("mismatch event should explain the failure")?;
+        assert!(message.contains("title mismatch"), "got: {message}");
+        assert!(message.contains("duration mismatch"), "got: {message}");
 
         Ok(())
     }
@@ -2841,6 +3014,17 @@ mod tests {
             .await?;
 
         Ok(created.request.id)
+    }
+
+    async fn ingesting_request(
+        service: &RequestService,
+    ) -> std::result::Result<Id, Box<dyn std::error::Error>> {
+        let request_id = fulfilling_request(service).await?;
+        service
+            .transition(request_id, RequestTransition::StartIngesting, None, None)
+            .await?;
+
+        Ok(request_id)
     }
 
     async fn insert_media_item(

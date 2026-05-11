@@ -1,14 +1,19 @@
 //! Source-file ingestion handoff.
 
-use std::path::PathBuf;
+use std::{collections::HashSet, fmt, path::PathBuf};
 
-use kino_core::Id;
+use kino_core::{CanonicalIdentityId, Id};
 use kino_library::{
     CanonicalLayoutInput, CanonicalLayoutResult, CanonicalLayoutWriter, CanonicalMediaTarget,
 };
 use kino_transcode::{SourceFile, TranscodeHandOff, TranscodeReceipt};
 
 use crate::{Error, Result};
+
+/// Percentage of expected runtime accepted when matching probed files.
+pub const PROBED_FILE_DURATION_TOLERANCE_PERCENT: u32 = 20;
+/// Minimum runtime tolerance in seconds when matching probed files.
+pub const PROBED_FILE_DURATION_MIN_TOLERANCE_SECONDS: u32 = 300;
 
 /// Minimal ingestion pipeline entry point for a ready source file.
 pub struct IngestionPipeline<T> {
@@ -159,10 +164,310 @@ pub struct IngestedCanonicalSourceFile {
     pub transcode: TranscodeReceipt,
 }
 
+/// Request-side facts used to verify a probed provider file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedProbedFile {
+    /// Canonical identity this file is expected to satisfy.
+    pub canonical_identity_id: CanonicalIdentityId,
+    /// Expected display title, when known.
+    pub title: Option<String>,
+    /// Expected runtime in seconds, when known.
+    pub runtime_seconds: Option<u32>,
+    /// Audio languages explicitly required by the request.
+    pub required_audio_languages: Vec<String>,
+    /// Subtitle languages explicitly required by the request.
+    pub required_subtitle_languages: Vec<String>,
+}
+
+impl ExpectedProbedFile {
+    /// Construct expected probe facts for a canonical identity.
+    pub fn new(canonical_identity_id: CanonicalIdentityId) -> Self {
+        Self {
+            canonical_identity_id,
+            title: None,
+            runtime_seconds: None,
+            required_audio_languages: Vec::new(),
+            required_subtitle_languages: Vec::new(),
+        }
+    }
+
+    /// Set the expected display title.
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set the expected runtime in seconds.
+    pub const fn with_runtime_seconds(mut self, runtime_seconds: u32) -> Self {
+        self.runtime_seconds = Some(runtime_seconds);
+        self
+    }
+
+    /// Set required audio languages.
+    pub fn with_required_audio_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_audio_languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set required subtitle languages.
+    pub fn with_required_subtitle_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_subtitle_languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// Probe output used to verify a provider file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProbedFile {
+    /// Detected title, when the probe could identify one.
+    pub title: Option<String>,
+    /// Detected duration in seconds, when available.
+    pub duration_seconds: Option<u32>,
+    /// Audio languages detected in the file.
+    pub audio_languages: Vec<String>,
+    /// Subtitle languages detected in the file.
+    pub subtitle_languages: Vec<String>,
+}
+
+impl ProbedFile {
+    /// Construct an empty probed-file projection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the detected title.
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set the detected duration in seconds.
+    pub const fn with_duration_seconds(mut self, duration_seconds: u32) -> Self {
+        self.duration_seconds = Some(duration_seconds);
+        self
+    }
+
+    /// Set detected audio languages.
+    pub fn with_audio_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.audio_languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set detected subtitle languages.
+    pub fn with_subtitle_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.subtitle_languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// Mismatch found while verifying a probed file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbedFileMismatch {
+    /// Expected a title but the probe did not identify one.
+    MissingTitle {
+        /// Expected display title.
+        expected: String,
+    },
+
+    /// The detected title does not match the expected title.
+    WrongTitle {
+        /// Expected display title.
+        expected: String,
+        /// Detected title.
+        actual: String,
+    },
+
+    /// Expected a duration but the probe did not identify one.
+    MissingDuration {
+        /// Expected runtime in seconds.
+        expected_seconds: u32,
+    },
+
+    /// The detected duration is outside the accepted tolerance.
+    DurationMismatch {
+        /// Expected runtime in seconds.
+        expected_seconds: u32,
+        /// Detected duration in seconds.
+        actual_seconds: u32,
+        /// Accepted absolute tolerance in seconds.
+        tolerance_seconds: u32,
+    },
+
+    /// A required audio language was not detected.
+    MissingAudioLanguage {
+        /// Required language code.
+        language: String,
+    },
+
+    /// A required subtitle language was not detected.
+    MissingSubtitleLanguage {
+        /// Required language code.
+        language: String,
+    },
+}
+
+impl fmt::Display for ProbedFileMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTitle { expected } => write!(f, "missing title expected {expected:?}"),
+            Self::WrongTitle { expected, actual } => {
+                write!(f, "title mismatch expected {expected:?} got {actual:?}")
+            }
+            Self::MissingDuration { expected_seconds } => {
+                write!(f, "missing duration expected {expected_seconds}s")
+            }
+            Self::DurationMismatch {
+                expected_seconds,
+                actual_seconds,
+                tolerance_seconds,
+            } => write!(
+                f,
+                "duration mismatch expected {expected_seconds}s got {actual_seconds}s tolerance {tolerance_seconds}s"
+            ),
+            Self::MissingAudioLanguage { language } => {
+                write!(f, "missing audio language {language}")
+            }
+            Self::MissingSubtitleLanguage { language } => {
+                write!(f, "missing subtitle language {language}")
+            }
+        }
+    }
+}
+
+/// Result of matching a probed file against request-side expectations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbedFileMatch {
+    /// Mismatches found during verification.
+    pub mismatches: Vec<ProbedFileMismatch>,
+}
+
+impl ProbedFileMatch {
+    /// Whether the probed file satisfies all provided expectations.
+    pub fn is_match(&self) -> bool {
+        self.mismatches.is_empty()
+    }
+
+    /// Human-readable mismatch summary.
+    pub fn summary(&self) -> String {
+        if self.mismatches.is_empty() {
+            return "probed file matched request".to_owned();
+        }
+
+        self.mismatches
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Verify probe output against request-side expectations.
+pub fn match_probed_file(expected: &ExpectedProbedFile, probed: &ProbedFile) -> ProbedFileMatch {
+    let mut mismatches = Vec::new();
+
+    if let Some(expected_title) = &expected.title {
+        match &probed.title {
+            Some(actual_title) => {
+                if normalize_title(expected_title) != normalize_title(actual_title) {
+                    mismatches.push(ProbedFileMismatch::WrongTitle {
+                        expected: expected_title.clone(),
+                        actual: actual_title.clone(),
+                    });
+                }
+            }
+            None => mismatches.push(ProbedFileMismatch::MissingTitle {
+                expected: expected_title.clone(),
+            }),
+        }
+    }
+
+    if let Some(expected_seconds) = expected.runtime_seconds {
+        match probed.duration_seconds {
+            Some(actual_seconds) => {
+                let tolerance_seconds = duration_tolerance_seconds(expected_seconds);
+                let delta = expected_seconds.abs_diff(actual_seconds);
+                if delta > tolerance_seconds {
+                    mismatches.push(ProbedFileMismatch::DurationMismatch {
+                        expected_seconds,
+                        actual_seconds,
+                        tolerance_seconds,
+                    });
+                }
+            }
+            None => mismatches.push(ProbedFileMismatch::MissingDuration { expected_seconds }),
+        }
+    }
+
+    let audio_languages = normalized_language_set(&probed.audio_languages);
+    for language in normalized_languages(&expected.required_audio_languages) {
+        if !audio_languages.contains(&language) {
+            mismatches.push(ProbedFileMismatch::MissingAudioLanguage { language });
+        }
+    }
+
+    let subtitle_languages = normalized_language_set(&probed.subtitle_languages);
+    for language in normalized_languages(&expected.required_subtitle_languages) {
+        if !subtitle_languages.contains(&language) {
+            mismatches.push(ProbedFileMismatch::MissingSubtitleLanguage { language });
+        }
+    }
+
+    ProbedFileMatch { mismatches }
+}
+
+fn duration_tolerance_seconds(expected_seconds: u32) -> u32 {
+    let percent = expected_seconds.saturating_mul(PROBED_FILE_DURATION_TOLERANCE_PERCENT) / 100;
+    percent.max(PROBED_FILE_DURATION_MIN_TOLERANCE_SECONDS)
+}
+
+fn normalize_title(title: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_space = false;
+
+    for ch in title.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_was_space = false;
+        } else if !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+
+    normalized.trim().to_owned()
+}
+
+fn normalized_language_set(languages: &[String]) -> HashSet<String> {
+    normalized_languages(languages).collect()
+}
+
+fn normalized_languages(languages: &[String]) -> impl Iterator<Item = String> + '_ {
+    languages.iter().filter_map(|language| {
+        let language = language.trim().to_ascii_lowercase();
+        (!language.is_empty()).then_some(language)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kino_core::CanonicalLayoutTransfer;
+    use kino_core::{CanonicalIdentityId, CanonicalLayoutTransfer, TmdbId};
     use kino_transcode::NoopTranscodeHandOff;
 
     #[tokio::test]
@@ -225,5 +530,65 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn match_probed_file_reports_title_duration_and_language_mismatches() {
+        let expected = ExpectedProbedFile::new(identity(550))
+            .with_title("The Matrix")
+            .with_runtime_seconds(8160)
+            .with_required_audio_languages(["eng"])
+            .with_required_subtitle_languages(["spa"]);
+        let probed = ProbedFile::new()
+            .with_title("Toy Story")
+            .with_duration_seconds(1200)
+            .with_audio_languages(["jpn"])
+            .with_subtitle_languages(["eng"]);
+
+        let result = match_probed_file(&expected, &probed);
+
+        assert_eq!(
+            result.mismatches,
+            vec![
+                ProbedFileMismatch::WrongTitle {
+                    expected: String::from("The Matrix"),
+                    actual: String::from("Toy Story"),
+                },
+                ProbedFileMismatch::DurationMismatch {
+                    expected_seconds: 8160,
+                    actual_seconds: 1200,
+                    tolerance_seconds: 1632,
+                },
+                ProbedFileMismatch::MissingAudioLanguage {
+                    language: String::from("eng"),
+                },
+                ProbedFileMismatch::MissingSubtitleLanguage {
+                    language: String::from("spa"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn match_probed_file_accepts_normalized_title_and_close_duration() {
+        let expected = ExpectedProbedFile::new(identity(550))
+            .with_title("Spider-Man: Into the Spider-Verse")
+            .with_runtime_seconds(7000)
+            .with_required_audio_languages(["ENG"]);
+        let probed = ProbedFile::new()
+            .with_title("spider man into the spider verse")
+            .with_duration_seconds(7600)
+            .with_audio_languages(["eng", "jpn"]);
+
+        let result = match_probed_file(&expected, &probed);
+
+        assert!(result.is_match(), "got: {}", result.summary());
+    }
+
+    fn identity(tmdb_id: u32) -> CanonicalIdentityId {
+        let Some(tmdb_id) = TmdbId::new(tmdb_id) else {
+            panic!("test tmdb id must be positive");
+        };
+        CanonicalIdentityId::tmdb_movie(tmdb_id)
     }
 }
