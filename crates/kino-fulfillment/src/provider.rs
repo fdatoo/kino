@@ -234,10 +234,10 @@ pub enum FulfillmentProviderJobStatus {
         /// Current progress.
         progress: FulfillmentProviderProgress,
     },
-    /// Provider completed fulfillment and produced a source file for ingestion.
+    /// Provider completed fulfillment and produced source files for ingestion.
     Completed {
-        /// Source file ready for ingestion.
-        source_path: PathBuf,
+        /// Source files ready for ingestion.
+        source_paths: Vec<PathBuf>,
     },
     /// Provider cancelled fulfillment and cleaned up partial state.
     Cancelled {

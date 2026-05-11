@@ -90,9 +90,25 @@ pub struct TmdbConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
+    /// Disc-rip import provider settings.
+    #[serde(default)]
+    pub disc_rip: Option<DiscRipProviderConfig>,
+
     /// Watch-folder provider settings.
     #[serde(default)]
     pub watch_folder: Option<WatchFolderProviderConfig>,
+}
+
+/// Configuration for the first-party disc-rip import provider.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscRipProviderConfig {
+    /// Directory containing MakeMKV-style output files.
+    pub path: PathBuf,
+
+    /// User preference used when ranking matching providers.
+    #[serde(default)]
+    pub preference: i32,
 }
 
 /// Configuration for the first-party watch-folder fulfillment provider.
@@ -300,6 +316,9 @@ fn validate_tmdb_config(config: &TmdbConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_provider_configs(config: &ProvidersConfig) -> Result<(), ConfigError> {
+    if let Some(disc_rip) = &config.disc_rip {
+        validate_provider_directory("disc_rip", &disc_rip.path)?;
+    }
     if let Some(watch_folder) = &config.watch_folder {
         validate_watch_folder_provider_config(watch_folder)?;
     }
@@ -312,32 +331,37 @@ fn validate_watch_folder_provider_config(
 ) -> Result<(), ConfigError> {
     const PROVIDER: &str = "watch_folder";
 
-    if config.path.as_os_str().is_empty() {
-        return Err(ConfigError::InvalidProviderConfig {
-            provider: PROVIDER,
-            reason: "path is empty",
-        });
-    }
-
-    let metadata =
-        fs::metadata(&config.path).map_err(|source| ConfigError::InvalidProviderPath {
-            provider: PROVIDER,
-            path: config.path.clone(),
-            source,
-        })?;
-
-    if !metadata.is_dir() {
-        return Err(ConfigError::InvalidProviderPath {
-            provider: PROVIDER,
-            path: config.path.clone(),
-            source: io::Error::other("path is not a directory"),
-        });
-    }
+    validate_provider_directory(PROVIDER, &config.path)?;
 
     if config.stability_seconds == 0 {
         return Err(ConfigError::InvalidProviderConfig {
             provider: PROVIDER,
             reason: "stability_seconds must be positive",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_provider_directory(provider: &'static str, path: &Path) -> Result<(), ConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidProviderConfig {
+            provider,
+            reason: "path is empty",
+        });
+    }
+
+    let metadata = fs::metadata(path).map_err(|source| ConfigError::InvalidProviderPath {
+        provider,
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(ConfigError::InvalidProviderPath {
+            provider,
+            path: path.to_path_buf(),
+            source: io::Error::other("path is not a directory"),
         });
     }
 
@@ -419,6 +443,7 @@ mod tests {
             fs::create_dir(&database_dir).map_err(|e| e.to_string())?;
             fs::create_dir(&library_root).map_err(|e| e.to_string())?;
             fs::create_dir(library_root.join("incoming")).map_err(|e| e.to_string())?;
+            fs::create_dir(library_root.join("rips")).map_err(|e| e.to_string())?;
 
             Ok(Self {
                 database_path: database_dir.join("kino.db"),
@@ -445,6 +470,7 @@ mod tests {
     }
 
     fn full_toml(database_path: &Path, library_root: &Path) -> String {
+        let disc_rip = library_root.join("rips");
         let watch_folder = library_root.join("incoming");
         format!(
             r#"
@@ -459,6 +485,10 @@ mod tests {
                 api_key = "test-api-key"
                 max_requests_per_second = 10
 
+                [providers.disc_rip]
+                path = "{}"
+                preference = 30
+
                 [providers.watch_folder]
                 path = "{}"
                 preference = 25
@@ -466,6 +496,7 @@ mod tests {
             "#,
             database_path.display(),
             library_root.display(),
+            disc_rip.display(),
             watch_folder.display()
         )
     }
@@ -486,6 +517,9 @@ mod tests {
             assert_eq!(cfg.log_format, LogFormat::Pretty);
             assert_eq!(cfg.tmdb.api_key.as_deref(), Some("test-api-key"));
             assert_eq!(cfg.tmdb.max_requests_per_second, 10);
+            let disc_rip = cfg.providers.disc_rip.expect("disc rip should parse");
+            assert_eq!(disc_rip.path, fixture.library_root.join("rips"));
+            assert_eq!(disc_rip.preference, 30);
             let watch_folder = cfg
                 .providers
                 .watch_folder
@@ -516,6 +550,7 @@ mod tests {
             );
             assert_eq!(cfg.tmdb.api_key, None);
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
+            assert!(cfg.providers.disc_rip.is_none());
             assert!(cfg.providers.watch_folder.is_none());
             Ok(())
         });
@@ -618,6 +653,27 @@ mod tests {
     }
 
     #[test]
+    fn nested_env_override_for_disc_rip_provider() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let disc_rip = fixture.library_root.join("env-rips");
+            fs::create_dir(&disc_rip).map_err(|e| e.to_string())?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_PROVIDERS__DISC_RIP__PATH", disc_rip.display());
+            jail.set_env("KINO_PROVIDERS__DISC_RIP__PREFERENCE", "12");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            let provider = cfg
+                .providers
+                .disc_rip
+                .expect("disc rip should be configured");
+            assert_eq!(provider.path, disc_rip);
+            assert_eq!(provider.preference, 12);
+            Ok(())
+        });
+    }
+
+    #[test]
     fn nested_env_override_for_watch_folder_provider() {
         Jail::expect_with(|jail| {
             let fixture = ConfigFixture::new()?;
@@ -666,6 +722,96 @@ mod tests {
                 .watch_folder
                 .expect("watch folder should be configured");
             assert_eq!(provider.stability_seconds, 5);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_disc_rip_provider_without_path() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [providers.disc_rip]
+                        preference = 9
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid(_)), "got: {err:?}");
+            assert!(err.to_string().contains("disc_rip"), "got: {err}");
+            assert!(err.to_string().contains("path"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_disc_rip_provider_path_that_is_not_directory() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let provider_file = fixture.library_root.join("provider-file");
+            fs::write(&provider_file, b"not a directory").map_err(|e| e.to_string())?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [providers.disc_rip]
+                        path = "{}"
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display(),
+                    provider_file.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidProviderPath { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("disc_rip"), "got: {err}");
+            assert!(err.to_string().contains("path"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_empty_disc_rip_provider_path() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [providers.disc_rip]
+                        path = ""
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidProviderConfig { .. }),
+                "got: {err:?}"
+            );
+            assert!(err.to_string().contains("disc_rip"), "got: {err}");
+            assert!(err.to_string().contains("path"), "got: {err}");
             Ok(())
         });
     }
