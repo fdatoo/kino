@@ -48,6 +48,20 @@ impl fmt::Debug for Timestamp {
     }
 }
 
+impl utoipa::PartialSchema for Timestamp {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .format(Some(utoipa::openapi::schema::SchemaFormat::KnownFormat(
+                utoipa::openapi::schema::KnownFormat::DateTime,
+            )))
+            .build()
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for Timestamp {}
+
 impl FromStr for Timestamp {
     type Err = ParseTimestampError;
 
