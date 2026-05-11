@@ -20,7 +20,7 @@ use kino_fulfillment::{
 };
 use kino_library::{
     CatalogArtworkKind, CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService,
-    LibraryScanReport, LibraryScanService,
+    LibraryScanReport, LibraryScanService, ReocrJob, SubtitleReocrService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,7 @@ pub(crate) struct AppState {
     manual_imports: Arc<ManualImportProvider>,
     catalog: CatalogService,
     library_scans: LibraryScanService,
+    subtitle_reocr: SubtitleReocrService,
     artwork_cache_dir: PathBuf,
 }
 
@@ -104,12 +105,30 @@ struct ManualImportResponse {
     path: PathBuf,
 }
 
-pub(crate) fn router(db: Db, library_root: PathBuf, artwork_cache_dir: PathBuf) -> Router {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ReocrTrackResponse {
+    /// Tracking id for this synchronous re-OCR execution.
+    job_id: Id,
+}
+
+impl From<ReocrJob> for ReocrTrackResponse {
+    fn from(job: ReocrJob) -> Self {
+        Self { job_id: job.job_id }
+    }
+}
+
+pub(crate) fn router(
+    db: Db,
+    library_root: PathBuf,
+    artwork_cache_dir: PathBuf,
+    subtitle_reocr: SubtitleReocrService,
+) -> Router {
     let state = AppState {
         requests: RequestService::new(db.clone()),
         manual_imports: Arc::new(ManualImportProvider::new()),
         catalog: CatalogService::new(db.clone()),
         library_scans: LibraryScanService::new(db.clone(), library_root),
+        subtitle_reocr,
         artwork_cache_dir,
     };
 
@@ -133,6 +152,10 @@ pub(crate) fn router(db: Db, library_root: PathBuf, artwork_cache_dir: PathBuf) 
             get(get_catalog_item_image),
         )
         .route("/api/v1/admin/library/scan", get(scan_library))
+        .route(
+            "/api/v1/admin/items/{id}/subtitles/{track}/re-ocr",
+            post(reocr_subtitle_track),
+        )
         .with_state(state)
 }
 
@@ -295,6 +318,30 @@ async fn manual_import(
 async fn scan_library(State(state): State<AppState>) -> ApiResult<Json<LibraryScanReport>> {
     let report = state.library_scans.scan().await?;
     Ok(Json(report))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/items/{id}/subtitles/{track}/re-ocr",
+    tag = "admin",
+    params(
+        ("id" = Id, Path, description = "Media item id"),
+        ("track" = u32, Path, description = "Probed subtitle stream index")
+    ),
+    responses(
+        (status = 202, description = "Synchronous re-OCR accepted", body = ReocrTrackResponse),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Media item or current OCR sidecar not found", body = ErrorResponse),
+        (status = 500, description = "Re-OCR failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn reocr_subtitle_track(
+    State(state): State<AppState>,
+    Path((id, track_index)): Path<(String, u32)>,
+) -> ApiResult<(StatusCode, Json<ReocrTrackResponse>)> {
+    let id = parse_id(id)?;
+    let job = state.subtitle_reocr.reocr_track(id, track_index).await?;
+    Ok((StatusCode::ACCEPTED, Json(job.into())))
 }
 
 #[utoipa::path(
@@ -476,6 +523,9 @@ impl IntoResponse for ApiError {
             Self::ManualImport(error) if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
             Self::ManualImport(_) => StatusCode::BAD_REQUEST,
             Self::Library(kino_library::Error::MediaItemNotFound { .. }) => StatusCode::NOT_FOUND,
+            Self::Library(kino_library::Error::CurrentOcrSidecarNotFound { .. }) => {
+                StatusCode::NOT_FOUND
+            }
             Self::Library(kino_library::Error::InvalidCatalogListLimit { .. }) => {
                 StatusCode::BAD_REQUEST
             }

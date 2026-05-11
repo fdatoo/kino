@@ -469,6 +469,7 @@ mod tests {
                 (18, String::from("subtitle provenance")),
                 (19, String::from("catalog fts")),
                 (20, String::from("metadata artwork")),
+                (21, String::from("subtitle archive")),
             ]
         );
 
@@ -978,7 +979,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            21,
+            22,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -993,7 +994,7 @@ mod tests {
         assert_eq!(table_name, "migration_runner_test");
 
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 21")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 22")
                 .fetch_one(db.write_pool())
                 .await?;
         assert_eq!(recorded, 1);
@@ -1008,22 +1009,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(21, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(22, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 21")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 22")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 21, .. }
+            super::Error::MigrationFailed { version: 22, .. }
         ));
-        assert!(err.to_string().contains("database migration 21 failed"));
+        assert!(err.to_string().contains("database migration 22 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -1063,6 +1064,7 @@ mod tests {
                 (18, String::from("subtitle provenance")),
                 (19, String::from("catalog fts")),
                 (20, String::from("metadata artwork")),
+                (21, String::from("subtitle archive")),
             ]
         );
 
