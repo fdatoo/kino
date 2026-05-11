@@ -98,10 +98,12 @@ pub struct Watched {
     pub watched_at: Timestamp,
     /// Source that marked the media item watched.
     pub source: WatchedSource,
+    /// Manual-unmark tombstone; when true, auto heartbeats must not recreate the marker.
+    pub unmarked: bool,
 }
 
 impl Watched {
-    /// Construct a watched row projection.
+    /// Construct an active watched row projection.
     pub const fn new(
         user_id: Id,
         media_item_id: Id,
@@ -113,6 +115,18 @@ impl Watched {
             media_item_id,
             watched_at,
             source,
+            unmarked: false,
+        }
+    }
+
+    /// Construct the durable manual-unmark tombstone used to block auto re-marking.
+    pub const fn manual_unmarked(user_id: Id, media_item_id: Id, watched_at: Timestamp) -> Self {
+        Self {
+            user_id,
+            media_item_id,
+            watched_at,
+            source: WatchedSource::Manual,
+            unmarked: true,
         }
     }
 }
@@ -178,5 +192,19 @@ mod tests {
         assert_eq!(watched.media_item_id, media_item_id);
         assert_eq!(watched.watched_at, watched_at);
         assert_eq!(watched.source, WatchedSource::Manual);
+        assert!(!watched.unmarked);
+    }
+
+    #[test]
+    fn watched_manual_unmark_is_a_manual_tombstone() {
+        let user_id = Id::new();
+        let media_item_id = Id::new();
+        let watched = Watched::manual_unmarked(user_id, media_item_id, Timestamp::UNIX_EPOCH);
+
+        assert_eq!(watched.user_id, user_id);
+        assert_eq!(watched.media_item_id, media_item_id);
+        assert_eq!(watched.watched_at, Timestamp::UNIX_EPOCH);
+        assert_eq!(watched.source, WatchedSource::Manual);
+        assert!(watched.unmarked);
     }
 }
