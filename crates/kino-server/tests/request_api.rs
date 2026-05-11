@@ -97,12 +97,15 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
             .get("/api/v1/stream/sourcefile/{id}")
             .is_some()
     );
+    assert!(body["paths"].get("/api/v1/stream/transcode/{id}").is_some());
+    assert!(body["paths"].get("/api/v1/library/items/{id}").is_some());
     assert!(
         body["paths"]
             .get("/api/v1/library/items/{id}/images/{kind}")
             .is_some()
     );
     assert!(body["paths"].get("/api/v1/admin/tokens").is_some());
+    assert!(body["paths"].get("/api/v1/admin/sessions").is_some());
     assert!(body["paths"].get("/api/v1/playback/progress").is_some());
     assert!(
         body["paths"]
@@ -761,7 +764,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     insert_catalog_title(&db, fight_club, fight_club_identity, "Fight Club").await?;
     let matrix_path =
         std::path::PathBuf::from("/library/Movies/The Matrix (1999)/The Matrix (1999).mkv");
-    insert_source_file(&db, matrix, &matrix_path).await?;
+    let matrix_source_file = insert_source_file(&db, matrix, &matrix_path).await?;
     insert_subtitle_sidecar(
         &db,
         matrix,
@@ -802,6 +805,23 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     assert_eq!(
         listed["items"][0]["source_files"][0]["path"],
         matrix_path.display().to_string()
+    );
+    assert_eq!(
+        listed["items"][0]["variants"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        listed["items"][0]["variants"][0]["variant_id"],
+        matrix_source_file.to_string()
+    );
+    assert_eq!(listed["items"][0]["variants"][0]["kind"], "source");
+    assert_eq!(
+        listed["items"][0]["variants"][0]["capabilities"]["container"],
+        "mkv"
+    );
+    assert_eq!(
+        listed["items"][0]["variants"][0]["stream_url"],
+        format!("/api/v1/stream/sourcefile/{matrix_source_file}")
     );
     assert_eq!(listed["next_offset"], Value::Null);
 
@@ -851,6 +871,11 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
         matrix_identity.to_string()
     );
     assert_eq!(fetched["source_files"].as_array().map(Vec::len), Some(1));
+    assert_eq!(fetched["variants"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        fetched["variants"][0]["stream_url"],
+        format!("/api/v1/stream/sourcefile/{matrix_source_file}")
+    );
     assert_eq!(fetched["subtitle_tracks"][0]["language"], "eng");
     assert_eq!(fetched["subtitle_tracks"][0]["label"], "ENG");
     assert_eq!(fetched["subtitle_tracks"][0]["format"], "srt");
