@@ -20,10 +20,25 @@ pnpm dev
 Run the same web checks used by CI:
 
 ```sh
+pnpm gen
 pnpm typecheck
 pnpm lint
 pnpm build
 ```
+
+## API client generation
+
+The typed API client is generated from the committed OpenAPI spec:
+
+```sh
+pnpm gen
+```
+
+This reads `../../kino-server/openapi.json` and writes
+`src/api/schema.ts`. The generated file is ignored by git; update the source
+spec with `just openapi` from the repository root before regenerating the web
+client. `pnpm build` runs `pnpm gen` first so production builds use the current
+committed spec.
 
 ## Binary consumption
 
