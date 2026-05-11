@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# kino-admin web
+crates/kino-admin/web/node_modules/
+crates/kino-admin/web/dist/
+
 # macOS
 .DS_Store
 
