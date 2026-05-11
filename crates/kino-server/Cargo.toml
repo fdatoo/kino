@@ -28,6 +28,7 @@ tracing = { workspace = true }
 utoipa = { workspace = true, features = ["axum_extras"] }
 
 [dev-dependencies]
+m3u8-rs = "6.0.0"
 oas3 = "0.22.0"
 kino-db = { path = "../kino-db", features = ["test-helpers"] }
 serde_json = { workspace = true }

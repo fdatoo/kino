@@ -16,6 +16,7 @@ use axum::{
 };
 use kino_core::Id;
 use kino_db::Db;
+use kino_fulfillment::{FfprobeFileProbe, ProbeAudioStream, ProbeResult, ProbeVideoStream};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -31,9 +32,52 @@ pub(crate) struct StreamState {
 
 pub(crate) fn router(db: Db) -> Router {
     Router::new()
+        .route(
+            "/api/v1/stream/items/{id}/{variant_id}/master.m3u8",
+            get(master_playlist),
+        )
         .route("/api/v1/stream/sourcefile/{id}", get(source_file))
         .route("/api/v1/stream/transcode/{id}", get(transcode_output))
         .with_state(StreamState { db })
+}
+
+/// Serve an HLS master playlist for a media item stream variant.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/items/{id}/{variant_id}/master.m3u8",
+    tag = "stream",
+    params(
+        ("id" = Id, Path, description = "Media item id"),
+        ("variant_id" = String, Path, description = "Catalog stream variant id")
+    ),
+    responses(
+        (status = 200, description = "HLS master playlist", content_type = "application/vnd.apple.mpegurl"),
+        (status = 404, description = "Stream variant not found", body = StreamErrorResponse),
+        (status = 500, description = "Master playlist generation failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn master_playlist(
+    State(state): State<StreamState>,
+    AxumPath((media_item_id, variant_id)): AxumPath<(Id, Id)>,
+) -> StreamResult<Response> {
+    let source_file = lookup_source_variant(&state.db, media_item_id, variant_id).await?;
+    let probe = FfprobeFileProbe::new().probe(&source_file.path).await?;
+    let metadata = tokio::fs::metadata(&source_file.path).await?;
+    let subtitles = lookup_subtitle_tracks(&state.db, media_item_id).await?;
+    let playlist = build_master_playlist(
+        media_item_id,
+        variant_id,
+        metadata.len(),
+        source_file.probe_duration_seconds,
+        &probe,
+        &subtitles,
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HLS_CONTENT_TYPE)
+        .body(Body::from(playlist))
+        .map_err(StreamError::Response)
 }
 
 /// Serve a source file with single-range support.
@@ -140,6 +184,14 @@ async fn stream_file(path: PathBuf, headers: HeaderMap) -> StreamResult<Response
 struct SourceFileRow {
     media_item_id: Id,
     path: PathBuf,
+    probe_duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtitleTrackRow {
+    language: String,
+    track_index: u32,
+    forced: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +244,9 @@ pub(crate) enum StreamError {
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
+    Probe(#[from] kino_fulfillment::ProbeError),
+
+    #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
 
     #[error(transparent)]
@@ -211,7 +266,7 @@ impl IntoResponse for StreamError {
         let status = match &self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
-            Self::Io(_) | Self::Sqlx(_) | Self::Session(_) | Self::Response(_) => {
+            Self::Io(_) | Self::Probe(_) | Self::Sqlx(_) | Self::Session(_) | Self::Response(_) => {
                 tracing::error!(error = %self, "stream api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -251,7 +306,7 @@ impl IntoResponse for StreamError {
 async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
     let Some(row) = sqlx::query(
         r#"
-        SELECT media_item_id, path
+        SELECT media_item_id, path, probe_duration_seconds
         FROM source_files
         WHERE id = ?1
         "#,
@@ -263,17 +318,13 @@ async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
         return Err(StreamError::NotFound);
     };
 
-    let path: String = row.try_get("path")?;
-    Ok(SourceFileRow {
-        media_item_id: row.try_get("media_item_id")?,
-        path: PathBuf::from(path),
-    })
+    source_file_row(&row)
 }
 
 async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
     let Some(row) = sqlx::query(
         r#"
-        SELECT source_files.media_item_id, transcode_outputs.path
+        SELECT source_files.media_item_id, transcode_outputs.path, NULL AS probe_duration_seconds
         FROM transcode_outputs
         JOIN source_files ON source_files.id = transcode_outputs.source_file_id
         WHERE transcode_outputs.id = ?1
@@ -286,11 +337,241 @@ async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow>
         return Err(StreamError::NotFound);
     };
 
+    source_file_row(&row)
+}
+
+async fn lookup_source_variant(
+    db: &Db,
+    media_item_id: Id,
+    variant_id: Id,
+) -> StreamResult<SourceFileRow> {
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT media_item_id, path, probe_duration_seconds
+        FROM source_files
+        WHERE media_item_id = ?1 AND id = ?2
+        "#,
+    )
+    .bind(media_item_id)
+    .bind(variant_id)
+    .fetch_optional(db.read_pool())
+    .await?
+    else {
+        return Err(StreamError::NotFound);
+    };
+
+    source_file_row(&row)
+}
+
+fn source_file_row(row: &sqlx::sqlite::SqliteRow) -> StreamResult<SourceFileRow> {
     let path: String = row.try_get("path")?;
+    let probe_duration_seconds = row
+        .try_get::<Option<i64>, _>("probe_duration_seconds")?
+        .and_then(|value| u64::try_from(value).ok());
     Ok(SourceFileRow {
         media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
+        probe_duration_seconds,
     })
+}
+
+async fn lookup_subtitle_tracks(db: &Db, media_item_id: Id) -> StreamResult<Vec<SubtitleTrackRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT language, track_index, forced
+        FROM subtitle_sidecars
+        WHERE media_item_id = ?1 AND archived_at IS NULL
+        ORDER BY language, track_index, provenance, id
+        "#,
+    )
+    .bind(media_item_id)
+    .fetch_all(db.read_pool())
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let track_index: i64 = row.try_get("track_index")?;
+            Ok(SubtitleTrackRow {
+                language: row.try_get("language")?,
+                track_index: u32::try_from(track_index).map_err(|_| sqlx::Error::ColumnDecode {
+                    index: "track_index".to_owned(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "subtitle track index is outside u32 range",
+                    )),
+                })?,
+                forced: row.try_get::<i64, _>("forced")? != 0,
+            })
+        })
+        .collect::<std::result::Result<_, sqlx::Error>>()
+        .map_err(StreamError::Sqlx)
+}
+
+const HLS_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
+const DEFAULT_HLS_BANDWIDTH: u64 = 2_000_000;
+
+fn build_master_playlist(
+    media_item_id: Id,
+    variant_id: Id,
+    file_size_bytes: u64,
+    source_duration_seconds: Option<u64>,
+    probe: &ProbeResult,
+    subtitles: &[SubtitleTrackRow],
+) -> String {
+    let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+    let media_playlist_uri =
+        format!("/api/v1/stream/items/{media_item_id}/{variant_id}/media.m3u8");
+
+    for (position, audio) in probe.audio_streams.iter().enumerate() {
+        let language = audio.language.as_deref();
+        let name = language
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Audio {}", position + 1));
+        playlist.push_str("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\"");
+        push_quoted_attribute(&mut playlist, "NAME", &name);
+        if let Some(language) = language.filter(|value| !value.is_empty()) {
+            push_quoted_attribute(&mut playlist, "LANGUAGE", language);
+        }
+        playlist.push_str(",DEFAULT=");
+        playlist.push_str(yes_no(position == 0));
+        playlist.push_str(",AUTOSELECT=YES");
+        push_quoted_attribute(
+            &mut playlist,
+            "URI",
+            &format!("{media_playlist_uri}?audio={}", audio.index),
+        );
+        playlist.push('\n');
+    }
+
+    for subtitle in subtitles {
+        playlist.push_str("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\"");
+        push_quoted_attribute(&mut playlist, "NAME", &subtitle.language);
+        push_quoted_attribute(&mut playlist, "LANGUAGE", &subtitle.language);
+        playlist.push_str(",FORCED=");
+        playlist.push_str(yes_no(subtitle.forced));
+        push_quoted_attribute(
+            &mut playlist,
+            "URI",
+            &format!(
+                "/api/v1/stream/items/{media_item_id}/subtitles/{}.m3u8",
+                subtitle.track_index
+            ),
+        );
+        playlist.push('\n');
+    }
+
+    playlist.push_str("#EXT-X-STREAM-INF:");
+    playlist.push_str(&format!(
+        "BANDWIDTH={},CODECS=\"{}\"",
+        estimate_bandwidth(
+            file_size_bytes,
+            probe.duration_seconds().or(source_duration_seconds)
+        ),
+        codec_string(probe)
+    ));
+    if let Some((width, height)) = primary_resolution(&probe.video_streams) {
+        playlist.push_str(&format!(",RESOLUTION={width}x{height}"));
+    }
+    if !probe.audio_streams.is_empty() {
+        playlist.push_str(",AUDIO=\"audio\"");
+    }
+    if !subtitles.is_empty() {
+        playlist.push_str(",SUBTITLES=\"subs\"");
+    }
+    playlist.push('\n');
+    playlist.push_str(&media_playlist_uri);
+    playlist.push('\n');
+
+    playlist
+}
+
+trait ProbeResultExt {
+    fn duration_seconds(&self) -> Option<u64>;
+}
+
+impl ProbeResultExt for ProbeResult {
+    fn duration_seconds(&self) -> Option<u64> {
+        self.duration
+            .and_then(|duration| (duration.as_secs() > 0).then_some(duration.as_secs()))
+    }
+}
+
+fn estimate_bandwidth(file_size_bytes: u64, duration_seconds: Option<u64>) -> u64 {
+    let Some(duration_seconds) = duration_seconds.filter(|duration| *duration > 0) else {
+        return DEFAULT_HLS_BANDWIDTH;
+    };
+
+    file_size_bytes
+        .saturating_mul(8)
+        .checked_div(duration_seconds)
+        .filter(|bandwidth| *bandwidth > 0)
+        .unwrap_or(DEFAULT_HLS_BANDWIDTH)
+}
+
+fn codec_string(probe: &ProbeResult) -> String {
+    let video_codec = probe
+        .video_streams
+        .iter()
+        .find_map(|stream| video_codec_string(stream));
+    let audio_codec = probe
+        .audio_streams
+        .iter()
+        .find_map(|stream| audio_codec_string(stream));
+
+    match (video_codec, audio_codec) {
+        (Some(video), Some(audio)) => format!("{video},{audio}"),
+        (Some(video), None) => format!("{video},mp4a"),
+        (None, Some(audio)) => format!("avc1,{audio}"),
+        (None, None) => "avc1,mp4a".to_owned(),
+    }
+}
+
+fn video_codec_string(stream: &ProbeVideoStream) -> Option<&'static str> {
+    match stream.codec_name.as_deref() {
+        Some("h264") => Some("avc1.64001f"),
+        Some("hevc" | "h265") => Some("hvc1.1.6.L93.B0"),
+        Some("av1") => Some("av01.0.08M.08"),
+        Some("vp9") => Some("vp09.00.10.08"),
+        _ => None,
+    }
+}
+
+fn audio_codec_string(stream: &ProbeAudioStream) -> Option<&'static str> {
+    match stream.codec_name.as_deref() {
+        Some("aac") => Some("mp4a.40.2"),
+        Some("mp3") => Some("mp4a.40.34"),
+        Some("ac3") => Some("ac-3"),
+        Some("eac3") => Some("ec-3"),
+        Some("alac") => Some("alac"),
+        Some("flac") => Some("fLaC"),
+        Some("opus") => Some("opus"),
+        _ => None,
+    }
+}
+
+fn primary_resolution(video_streams: &[ProbeVideoStream]) -> Option<(u32, u32)> {
+    video_streams
+        .iter()
+        .find_map(|stream| stream.width.zip(stream.height))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+}
+
+fn push_quoted_attribute(playlist: &mut String, name: &str, value: &str) {
+    playlist.push(',');
+    playlist.push_str(name);
+    playlist.push_str("=\"");
+    for character in value.chars() {
+        if matches!(character, '"' | '\\') {
+            playlist.push('\\');
+        }
+        playlist.push(character);
+    }
+    playlist.push('"');
+}
+
+const fn yes_no(value: bool) -> &'static str {
+    if value { "YES" } else { "NO" }
 }
 
 fn resolve_range(headers: &HeaderMap, file_size: u64) -> StreamResult<ResolvedRange> {
