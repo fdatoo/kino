@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 axum = "0.8"
+kino-admin = { path = "../kino-admin" }
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
 kino-fulfillment = { path = "../kino-fulfillment" }
