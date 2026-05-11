@@ -35,3 +35,8 @@ path = "/srv/kino/incoming"
 # Provider ranking preference. Optional. Defaults to 0.
 # Runtime override: KINO_PROVIDERS__WATCH_FOLDER__PREFERENCE.
 preference = 0
+
+# Seconds file size must remain unchanged before ingestion. Optional. Defaults
+# to 5.
+# Runtime override: KINO_PROVIDERS__WATCH_FOLDER__STABILITY_SECONDS.
+stability_seconds = 5

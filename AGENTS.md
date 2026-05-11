@@ -108,8 +108,9 @@ plan in `docs/agents/plans/`.
   `KINO_SERVER__LISTEN`, `KINO_TMDB__API_KEY`,
   `KINO_TMDB__MAX_REQUESTS_PER_SECOND`,
   `KINO_PROVIDERS__WATCH_FOLDER__PATH`,
-  `KINO_PROVIDERS__WATCH_FOLDER__PREFERENCE`. The reference TOML lives at
-  `kino.toml.example` in the repo root.
+  `KINO_PROVIDERS__WATCH_FOLDER__PREFERENCE`,
+  `KINO_PROVIDERS__WATCH_FOLDER__STABILITY_SECONDS`. The reference TOML lives
+  at `kino.toml.example` in the repo root.
 - **Tests:** colocated with the code (`#[cfg(test)] mod tests`) or under a crate's
   `tests/` directory for integration. A change isn't done until tests pass.
 - **DB tests:** DB-touching tests use `kino_db::test_db().await?`, which returns

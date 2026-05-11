@@ -105,6 +105,10 @@ pub struct WatchFolderProviderConfig {
     /// User preference used when ranking matching providers.
     #[serde(default)]
     pub preference: i32,
+
+    /// Seconds a file size must remain unchanged before it can be ingested.
+    #[serde(default = "default_watch_folder_stability_seconds")]
+    pub stability_seconds: u64,
 }
 
 fn default_listen() -> SocketAddr {
@@ -113,6 +117,10 @@ fn default_listen() -> SocketAddr {
 
 fn default_tmdb_max_requests_per_second() -> u32 {
     20
+}
+
+fn default_watch_folder_stability_seconds() -> u64 {
+    5
 }
 
 fn default_log_level() -> String {
@@ -326,6 +334,13 @@ fn validate_watch_folder_provider_config(
         });
     }
 
+    if config.stability_seconds == 0 {
+        return Err(ConfigError::InvalidProviderConfig {
+            provider: PROVIDER,
+            reason: "stability_seconds must be positive",
+        });
+    }
+
     Ok(())
 }
 
@@ -447,6 +462,7 @@ mod tests {
                 [providers.watch_folder]
                 path = "{}"
                 preference = 25
+                stability_seconds = 7
             "#,
             database_path.display(),
             library_root.display(),
@@ -476,6 +492,7 @@ mod tests {
                 .expect("watch folder should parse");
             assert_eq!(watch_folder.path, fixture.library_root.join("incoming"));
             assert_eq!(watch_folder.preference, 25);
+            assert_eq!(watch_folder.stability_seconds, 7);
             assert_eq!(
                 cfg.server.listen,
                 "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
@@ -610,6 +627,7 @@ mod tests {
             jail.create_file("kino.toml", &fixture.required_only_toml())?;
             jail.set_env("KINO_PROVIDERS__WATCH_FOLDER__PATH", watch_folder.display());
             jail.set_env("KINO_PROVIDERS__WATCH_FOLDER__PREFERENCE", "9");
+            jail.set_env("KINO_PROVIDERS__WATCH_FOLDER__STABILITY_SECONDS", "11");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             let provider = cfg
                 .providers
@@ -617,6 +635,37 @@ mod tests {
                 .expect("watch folder should be configured");
             assert_eq!(provider.path, watch_folder);
             assert_eq!(provider.preference, 9);
+            assert_eq!(provider.stability_seconds, 11);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn watch_folder_provider_stability_seconds_defaults() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let watch_folder = fixture.library_root.join("incoming");
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        {}
+
+                        [providers.watch_folder]
+                        path = "{}"
+                    "#,
+                    fixture.required_only_toml(),
+                    watch_folder.display()
+                ),
+            )?;
+
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            let provider = cfg
+                .providers
+                .watch_folder
+                .expect("watch folder should be configured");
+            assert_eq!(provider.stability_seconds, 5);
             Ok(())
         });
     }
@@ -932,6 +981,33 @@ mod tests {
                 "got: {err:?}"
             );
             assert!(err.to_string().contains("database_path"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_zero_watch_folder_stability_seconds() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let watch_folder = fixture.library_root.join("incoming");
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        {}
+
+                        [providers.watch_folder]
+                        path = "{}"
+                        stability_seconds = 0
+                    "#,
+                    fixture.required_only_toml(),
+                    watch_folder.display()
+                ),
+            )?;
+
+            let err = Config::load().expect_err("zero stability should fail validation");
+            assert!(err.to_string().contains("stability_seconds"), "got: {err}");
             Ok(())
         });
     }
