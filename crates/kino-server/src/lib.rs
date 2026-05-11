@@ -15,6 +15,7 @@ pub mod auth;
 mod openapi;
 mod playback;
 mod request;
+mod session_admin;
 pub mod session_reaper;
 mod stream;
 mod token;
@@ -89,7 +90,8 @@ fn router_with_config_and_reocr(
         ))
         .merge(stream::router(db.clone()))
         .merge(token::router(db.clone()))
-        .merge(playback::router(db))
+        .merge(playback::router(db.clone()))
+        .merge(session_admin::router(db))
         .merge(admin_config::router(config))
         .route_layer(middleware::from_fn_with_state(
             auth_state,
