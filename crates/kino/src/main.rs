@@ -150,6 +150,7 @@ mod tests {
                 (11, String::from("metadata cache")),
                 (12, String::from("source files")),
                 (13, String::from("core catalog schemas")),
+                (14, String::from("users")),
             ]
         );
 

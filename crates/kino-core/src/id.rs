@@ -32,7 +32,7 @@ impl Id {
     ///
     /// Use this on the persistence read path where the value has already
     /// been validated. New ids should be created with [`Id::new`].
-    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+    pub const fn from_uuid(uuid: uuid::Uuid) -> Self {
         Self(uuid)
     }
 

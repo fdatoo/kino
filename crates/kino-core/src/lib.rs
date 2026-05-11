@@ -11,6 +11,7 @@ pub mod identity;
 pub mod request;
 pub mod time;
 pub mod tracing;
+pub mod user;
 
 pub use catalog::{MediaItem, MediaItemKind, SourceFile, TranscodeOutput};
 pub use config::{CanonicalLayoutTransfer, Config, LibraryConfig};
@@ -21,3 +22,4 @@ pub use identity::{
 };
 pub use request::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use time::Timestamp;
+pub use user::{SEEDED_USER_ID, User};

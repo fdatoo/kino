@@ -378,7 +378,7 @@ mod tests {
     use std::borrow::Cow;
     use std::path::PathBuf;
 
-    use kino_core::{CanonicalIdentityId, Config, Id, Timestamp, TmdbId};
+    use kino_core::{CanonicalIdentityId, Config, Id, SEEDED_USER_ID, Timestamp, TmdbId};
     use sqlx::migrate::{Migration, MigrationType, Migrator};
 
     #[tokio::test]
@@ -459,8 +459,46 @@ mod tests {
                 (11, String::from("metadata cache")),
                 (12, String::from("source files")),
                 (13, String::from("core catalog schemas")),
+                (14, String::from("users")),
             ]
         );
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn users_migration_seeds_owner_user_once()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+
+        let seeded: (Id, String, Timestamp) =
+            sqlx::query_as("SELECT id, display_name, created_at FROM users")
+                .fetch_one(db.read_pool())
+                .await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db.read_pool())
+            .await?;
+
+        assert_eq!(seeded.0, SEEDED_USER_ID);
+        assert_eq!(seeded.1, "Owner");
+        assert_eq!(seeded.2.to_string(), "2026-05-11T00:00:00Z");
+        assert_eq!(count, 1);
+
+        db.migrate().await?;
+
+        let count_after_rerun: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db.read_pool())
+            .await?;
+        let seeded_after_rerun: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE id = ?1 AND display_name = 'Owner'",
+        )
+        .bind(SEEDED_USER_ID)
+        .fetch_one(db.read_pool())
+        .await?;
+
+        assert_eq!(count_after_rerun, 1);
+        assert_eq!(seeded_after_rerun, 1);
 
         db.close().await;
         Ok(())
@@ -499,7 +537,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            14,
+            15,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -511,12 +549,12 @@ mod tests {
         )
         .fetch_one(db.write_pool())
         .await?;
+        assert_eq!(table_name, "migration_runner_test");
+
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 14")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 15")
                 .fetch_one(db.write_pool())
                 .await?;
-
-        assert_eq!(table_name, "migration_runner_test");
         assert_eq!(recorded, 1);
 
         db.close().await;
@@ -529,22 +567,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(14, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(15, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 14")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 15")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 14, .. }
+            super::Error::MigrationFailed { version: 15, .. }
         ));
-        assert!(err.to_string().contains("database migration 14 failed"));
+        assert!(err.to_string().contains("database migration 15 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -577,6 +615,7 @@ mod tests {
                 (11, String::from("metadata cache")),
                 (12, String::from("source files")),
                 (13, String::from("core catalog schemas")),
+                (14, String::from("users")),
             ]
         );
 
