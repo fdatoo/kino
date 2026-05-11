@@ -29,6 +29,7 @@ async fn config_api_returns_resolved_config_with_masked_secrets() -> TestResult 
             library: kino_core::LibraryConfig::default(),
             server: ServerConfig {
                 public_base_url: "https://kino.example.test".to_owned(),
+                cors_allowed_origins: vec!["https://tools.example.test".to_owned()],
                 ..ServerConfig::default()
             },
             tmdb: TmdbConfig {
@@ -71,6 +72,10 @@ async fn config_api_returns_resolved_config_with_masked_secrets() -> TestResult 
     assert_eq!(
         body.pointer("/log/format/value"),
         Some(&Value::String("json".to_owned()))
+    );
+    assert_eq!(
+        body.pointer("/server/cors_allowed_origins/value/0"),
+        Some(&Value::String("https://tools.example.test".to_owned()))
     );
     assert!(
         !std::str::from_utf8(&bytes)?.contains("super-secret-tmdb-key"),

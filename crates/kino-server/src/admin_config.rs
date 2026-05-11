@@ -40,6 +40,12 @@ pub(crate) struct StringConfigValue {
 }
 
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub(crate) struct StringListConfigValue {
+    value: Vec<String>,
+    source: ConfigSource,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub(crate) struct OptionalStringConfigValue {
     value: Option<String>,
     source: ConfigSource,
@@ -78,6 +84,7 @@ pub(crate) struct AdminConfigResponse {
 pub(crate) struct AdminServerConfig {
     listen: StringConfigValue,
     public_base_url: StringConfigValue,
+    cors_allowed_origins: StringListConfigValue,
     session_reaper: AdminSessionReaperConfig,
 }
 
@@ -155,6 +162,7 @@ struct LibraryConfigSources {
 struct ServerConfigSources {
     listen: ConfigSource,
     public_base_url: ConfigSource,
+    cors_allowed_origins: ConfigSource,
     session_reaper: SessionReaperConfigSources,
 }
 
@@ -247,6 +255,10 @@ impl AdminServerConfig {
         Self {
             listen: socket_value(config.listen, sources.listen),
             public_base_url: string_value(config.public_base_url.clone(), sources.public_base_url),
+            cors_allowed_origins: string_list_value(
+                config.cors_allowed_origins.clone(),
+                sources.cors_allowed_origins,
+            ),
             session_reaper: AdminSessionReaperConfig::from_config(
                 &config.session_reaper,
                 &sources.session_reaper,
@@ -379,6 +391,11 @@ impl ConfigSources {
                     "server.public_base_url",
                     ConfigSource::Default,
                 ),
+                cors_allowed_origins: source_or(
+                    &figment,
+                    "server.cors_allowed_origins",
+                    ConfigSource::Default,
+                ),
                 session_reaper: SessionReaperConfigSources {
                     tick_seconds: source_or(
                         &figment,
@@ -479,6 +496,10 @@ fn classify_metadata(metadata: &Metadata) -> ConfigSource {
 
 fn string_value(value: String, source: ConfigSource) -> StringConfigValue {
     StringConfigValue { value, source }
+}
+
+fn string_list_value(value: Vec<String>, source: ConfigSource) -> StringListConfigValue {
+    StringListConfigValue { value, source }
 }
 
 fn optional_path_value(value: Option<&Path>, source: ConfigSource) -> OptionalStringConfigValue {
