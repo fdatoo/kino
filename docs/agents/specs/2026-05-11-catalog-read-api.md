@@ -28,7 +28,7 @@ GET /api/library/items/{id}
 
 Supported query parameters:
 
-- `type=movie|tv|tv_series|personal`
+- `type=movie|tv|tv_episode|tv_series|personal`
 - `title_contains=<text>`
 - `has_source_file=true|false`
 - `limit=<1..200>`
@@ -43,3 +43,6 @@ without enriched metadata has `title: null` and does not match
 The API returns stable ids, media kind, canonical identity, optional title,
 source-file rows, and timestamps. It does not expose client presentation fields
 or playback state.
+
+`tv_series` remains accepted as a legacy filter alias, but persisted media-item
+rows use `tv_episode`.

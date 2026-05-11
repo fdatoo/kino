@@ -842,15 +842,19 @@ async fn insert_tmdb_media_item(
             id,
             media_kind,
             canonical_identity_id,
+            season_number,
+            episode_number,
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         "#,
     )
     .bind(id)
-    .bind(canonical_identity_id.kind().as_str())
+    .bind(media_item_kind_for_identity(canonical_identity_id).as_str())
     .bind(canonical_identity_id)
+    .bind(media_item_season_number(canonical_identity_id))
+    .bind(media_item_episode_number(canonical_identity_id))
     .bind(now)
     .bind(now)
     .execute(db.write_pool())
@@ -902,6 +906,29 @@ fn identity(tmdb_id: u32) -> CanonicalIdentityId {
     match TmdbId::new(tmdb_id) {
         Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
         None => panic!("test tmdb id must be positive"),
+    }
+}
+
+fn media_item_kind_for_identity(
+    canonical_identity_id: CanonicalIdentityId,
+) -> kino_core::MediaItemKind {
+    match canonical_identity_id.kind() {
+        kino_core::CanonicalIdentityKind::Movie => kino_core::MediaItemKind::Movie,
+        kino_core::CanonicalIdentityKind::TvSeries => kino_core::MediaItemKind::TvEpisode,
+    }
+}
+
+fn media_item_season_number(canonical_identity_id: CanonicalIdentityId) -> Option<i64> {
+    match canonical_identity_id.kind() {
+        kino_core::CanonicalIdentityKind::Movie => None,
+        kino_core::CanonicalIdentityKind::TvSeries => Some(1),
+    }
+}
+
+fn media_item_episode_number(canonical_identity_id: CanonicalIdentityId) -> Option<i64> {
+    match canonical_identity_id.kind() {
+        kino_core::CanonicalIdentityKind::Movie => None,
+        kino_core::CanonicalIdentityKind::TvSeries => Some(1),
     }
 }
 

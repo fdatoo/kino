@@ -12,7 +12,8 @@ use std::{
 };
 
 use kino_core::{
-    CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, Config, Id, Timestamp,
+    CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, Config, Id,
+    MediaItemKind, Timestamp,
 };
 use kino_db::Db;
 use serde::Serialize;
@@ -179,6 +180,15 @@ pub enum Error {
         offset: u64,
         /// Maximum accepted offset.
         max: u64,
+    },
+
+    /// A positive catalog number could not fit into the public type.
+    #[error("invalid catalog {field} value: {value}")]
+    InvalidCatalogNumber {
+        /// Field name.
+        field: &'static str,
+        /// Persisted value.
+        value: i64,
     },
 }
 
@@ -555,38 +565,6 @@ impl MetadataService {
     }
 }
 
-/// Stable media item kind used by catalog reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaItemKind {
-    /// Movie media item.
-    Movie,
-    /// TV series media item.
-    TvSeries,
-    /// Personal media item.
-    Personal,
-}
-
-impl MediaItemKind {
-    /// Database representation for this media item kind.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Movie => "movie",
-            Self::TvSeries => "tv_series",
-            Self::Personal => "personal",
-        }
-    }
-
-    fn from_db_str(value: String) -> Result<Self> {
-        match value.as_str() {
-            "movie" => Ok(Self::Movie),
-            "tv_series" => Ok(Self::TvSeries),
-            "personal" => Ok(Self::Personal),
-            _ => Err(Error::InvalidMediaItemKind { value }),
-        }
-    }
-}
-
 /// Query filters and pagination for catalog item listing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogListQuery {
@@ -657,6 +635,10 @@ pub struct CatalogMediaItem {
     pub media_kind: MediaItemKind,
     /// Canonical identity for provider-backed media.
     pub canonical_identity_id: Option<CanonicalIdentityId>,
+    /// TV season number for episode rows.
+    pub season_number: Option<u32>,
+    /// TV episode number for episode rows.
+    pub episode_number: Option<u32>,
     /// Cached display title, when metadata has been enriched.
     pub title: Option<String>,
     /// Source files attached to this media item.
@@ -712,6 +694,8 @@ impl CatalogService {
                 media_items.id,
                 media_items.media_kind,
                 media_items.canonical_identity_id,
+                media_items.season_number,
+                media_items.episode_number,
                 media_items.created_at,
                 media_items.updated_at,
                 media_metadata_cache.title
@@ -747,6 +731,8 @@ impl CatalogService {
                 media_items.id,
                 media_items.media_kind,
                 media_items.canonical_identity_id,
+                media_items.season_number,
+                media_items.episode_number,
                 media_items.created_at,
                 media_items.updated_at,
                 media_metadata_cache.title
@@ -2012,13 +1998,26 @@ fn catalog_media_item_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogM
     let media_kind: String = row.try_get("media_kind")?;
     Ok(CatalogMediaItem {
         id: row.try_get("id")?,
-        media_kind: MediaItemKind::from_db_str(media_kind)?,
+        media_kind: MediaItemKind::parse(&media_kind)
+            .ok_or(Error::InvalidMediaItemKind { value: media_kind })?,
         canonical_identity_id: row.try_get("canonical_identity_id")?,
+        season_number: optional_u32_from_row(row, "season_number")?,
+        episode_number: optional_u32_from_row(row, "episode_number")?,
         title: row.try_get("title")?,
         source_files: Vec::new(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+fn optional_u32_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    field: &'static str,
+) -> Result<Option<u32>> {
+    let value: Option<i64> = row.try_get(field)?;
+    value
+        .map(|value| u32::try_from(value).map_err(|_| Error::InvalidCatalogNumber { field, value }))
+        .transpose()
 }
 
 fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<LibrarySourceFile> {
@@ -2614,15 +2613,19 @@ mod tests {
                 id,
                 media_kind,
                 canonical_identity_id,
+                season_number,
+                episode_number,
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
         )
         .bind(media_item_id)
-        .bind(canonical_identity_id.kind().as_str())
+        .bind(media_item_kind_for_identity(canonical_identity_id).as_str())
         .bind(canonical_identity_id)
+        .bind(media_item_season_number(canonical_identity_id))
+        .bind(media_item_episode_number(canonical_identity_id))
         .bind(now)
         .bind(now)
         .execute(db.write_pool())
@@ -2643,6 +2646,27 @@ mod tests {
             panic!("test tmdb id should be valid");
         };
         CanonicalIdentityId::tmdb_tv_series(tmdb_id)
+    }
+
+    fn media_item_kind_for_identity(canonical_identity_id: CanonicalIdentityId) -> MediaItemKind {
+        match canonical_identity_id.kind() {
+            kino_core::CanonicalIdentityKind::Movie => MediaItemKind::Movie,
+            kino_core::CanonicalIdentityKind::TvSeries => MediaItemKind::TvEpisode,
+        }
+    }
+
+    fn media_item_season_number(canonical_identity_id: CanonicalIdentityId) -> Option<i64> {
+        match canonical_identity_id.kind() {
+            kino_core::CanonicalIdentityKind::Movie => None,
+            kino_core::CanonicalIdentityKind::TvSeries => Some(1),
+        }
+    }
+
+    fn media_item_episode_number(canonical_identity_id: CanonicalIdentityId) -> Option<i64> {
+        match canonical_identity_id.kind() {
+            kino_core::CanonicalIdentityKind::Movie => None,
+            kino_core::CanonicalIdentityKind::TvSeries => Some(1),
+        }
     }
 
     fn sample_metadata() -> TmdbMetadata {
