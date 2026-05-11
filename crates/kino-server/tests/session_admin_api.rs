@@ -119,6 +119,71 @@ async fn admin_sessions_list_filters_each_status() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
+async fn admin_sessions_list_accepts_comma_separated_statuses()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let (auth, token_id) = common::issued_token_with_id(&db).await?;
+    let active = insert_session(
+        &db,
+        token_id,
+        PlaybackSessionStatus::Active,
+        "2026-05-11T01:00:00Z".parse()?,
+        None,
+    )
+    .await?;
+    let idle = insert_session(
+        &db,
+        token_id,
+        PlaybackSessionStatus::Idle,
+        "2026-05-11T01:01:00Z".parse()?,
+        None,
+    )
+    .await?;
+    let ended = insert_session(
+        &db,
+        token_id,
+        PlaybackSessionStatus::Ended,
+        "2026-05-11T01:02:00Z".parse()?,
+        Some("2026-05-11T01:03:00Z".parse()?),
+    )
+    .await?;
+    let app = kino_server::router(db);
+
+    let body: Vec<SessionResponse> =
+        response_json(get_sessions(&app, &auth, Some("active,idle")).await?).await?;
+
+    assert_session_ids(&body, &[active.id, idle.id]);
+    assert!(!body.iter().any(|session| session.id == ended.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_sessions_list_includes_known_progress_position()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let (auth, token_id) = common::issued_token_with_id(&db).await?;
+    let session = insert_session(
+        &db,
+        token_id,
+        PlaybackSessionStatus::Active,
+        "2026-05-11T01:00:00Z".parse()?,
+        None,
+    )
+    .await?;
+    insert_progress(&db, session.media_item_id, token_id, 372).await?;
+    let app = kino_server::router(db);
+
+    let body: Vec<SessionResponse> =
+        response_json(get_sessions(&app, &auth, Some("active")).await?).await?;
+
+    assert_session_ids(&body, &[session.id]);
+    assert_eq!(body[0].position_seconds, Some(372));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_sessions_list_requires_auth() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let _auth = common::issued_token(&db).await?;
@@ -252,6 +317,35 @@ async fn insert_personal_media_item(db: &kino_db::Db) -> Result<Id, sqlx::Error>
     Ok(id)
 }
 
+async fn insert_progress(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    token_id: Id,
+    position_seconds: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO playback_progress (
+            user_id,
+            media_item_id,
+            position_seconds,
+            updated_at,
+            source_device_token_id
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(SEEDED_USER_ID)
+    .bind(media_item_id)
+    .bind(position_seconds)
+    .bind(Timestamp::now())
+    .bind(token_id)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
 async fn response_json<T: serde::de::DeserializeOwned>(
     response: axum::response::Response,
 ) -> Result<T, Box<dyn std::error::Error>> {
@@ -277,6 +371,7 @@ struct SessionResponse {
     token_id: Id,
     media_item_id: Id,
     variant_id: String,
+    position_seconds: Option<i64>,
     status: PlaybackSessionStatus,
     started_at: Timestamp,
     last_seen_at: Timestamp,
