@@ -45,6 +45,6 @@ pub use request::{
     REQUEST_LIST_MAX_LIMIT, REQUEST_MATCH_CANDIDATE_LIMIT, RequestDetail, RequestEventActor,
     RequestIdentityProvenance, RequestIdentityVersion, RequestListPage, RequestListQuery,
     RequestMatchCandidate, RequestMatchCandidateInput, RequestModelUpdate, RequestService,
-    RequestStatusEvent, RequestTransition, Result,
+    RequestStatusEvent, RequestTransition, Result, rank_match_candidates,
 };
 pub use watch_folder::{WATCH_FOLDER_PROVIDER_ID, WatchFolderProvider};

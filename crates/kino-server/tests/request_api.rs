@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, num::NonZeroU32, path::Path, pin::Pin, sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -8,6 +8,7 @@ use kino_core::{CanonicalIdentityId, Id, Timestamp, TmdbId, user::SEEDED_USER_ID
 use kino_fulfillment::{
     FulfillmentPlanDecision, NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage,
     RequestService, RequestState, RequestTransition,
+    tmdb::{TmdbClient, TmdbClientConfig},
 };
 use kino_library::{
     ImageSubtitleExtraction, ImageSubtitleExtractionInput, ImageSubtitleFrame, ProbeSubtitleKind,
@@ -56,6 +57,89 @@ impl OcrEngine for FakeOcrEngine {
             text: String::from("UPDATED OCR"),
             avg_confidence: 94.0,
         })
+    }
+}
+
+struct TmdbTestServer {
+    base_url: String,
+    requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+impl TmdbTestServer {
+    async fn new(responses: Vec<TmdbTestResponse>) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0_u8; 4096];
+                let Ok(bytes_read) = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await
+                else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                if let Some(line) = request.lines().next()
+                    && let Some(target) = line.split_whitespace().nth(1)
+                {
+                    request_log.lock().await.push(target.to_owned());
+                }
+                let body = response.body.as_bytes();
+                let header = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.status.as_u16(),
+                    body.len()
+                );
+                if tokio::io::AsyncWriteExt::write_all(&mut stream, header.as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if tokio::io::AsyncWriteExt::write_all(&mut stream, body)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        Ok(Self {
+            base_url: format!("http://{address}/3/"),
+            requests,
+        })
+    }
+
+    fn client(&self) -> Result<TmdbClient, Box<dyn std::error::Error>> {
+        let config = TmdbClientConfig::new("test-api-key")?
+            .with_base_url(&self.base_url)?
+            .with_max_requests_per_second(
+                NonZeroU32::new(50).ok_or("test TMDB request rate must be positive")?,
+            );
+        Ok(TmdbClient::new(config))
+    }
+
+    async fn requests(&self) -> Vec<String> {
+        self.requests.lock().await.clone()
+    }
+}
+
+struct TmdbTestResponse {
+    status: StatusCode,
+    body: String,
+}
+
+impl TmdbTestResponse {
+    fn json(status: StatusCode, body: &str) -> Self {
+        Self {
+            status,
+            body: body.to_owned(),
+        }
     }
 }
 
@@ -278,103 +362,44 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
-async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dyn std::error::Error>>
-{
-    let db = kino_db::test_db().await?;
-    let auth = common::issued_token(&db).await?;
-    let app = kino_server::router(db);
-    let created = create_request(&app, &auth, "Inception (2010)").await?;
-    let winner_id = identity(550);
-
-    let response = app
-        .oneshot(
-            HttpRequest::builder()
-                .method("POST")
-                .uri(format!("/api/v1/requests/{}/matches", created.request.id))
-                .bearer(&auth)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(
-                    r#"{{
-                        "message":"matched canonical media",
-                        "candidates":[
-                            {{
-                                "canonical_identity_id":"{winner_id}",
-                                "title":"Inception",
-                                "year":2010,
-                                "popularity":80.0
-                            }},
-                            {{
-                                "canonical_identity_id":"{}",
-                                "title":"Interstellar",
-                                "year":2014,
-                                "popularity":70.0
-                            }}
-                        ]
-                    }}"#,
-                    identity(157_336)
-                )))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let resolved: RequestDetail = response_json(response).await?;
-    assert_eq!(resolved.request.state, RequestState::Resolved);
-    assert_eq!(
-        resolved.request.target.canonical_identity_id,
-        Some(winner_id)
-    );
-    assert!(resolved.candidates.is_empty());
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn request_match_api_parks_low_confidence_match_with_candidates()
+async fn request_resolve_api_fetches_and_scores_tmdb_candidates()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
-    let app = kino_server::router(db);
-    let created = create_request(&app, &auth, "Dune").await?;
-    let newer_id = identity(438_631);
-    let older_id = identity(841);
+    let tmdb = TmdbTestServer::new(vec![
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","popularity":83.1}]}"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, r#"{"results":[]}"#),
+    ])
+    .await?;
+    let app = kino_server::router_with_tmdb_client(db, tmdb.client()?);
+    let created = create_request(&app, &auth, "Inception (2010)").await?;
+    let winner_id = identity(27_205);
 
     let response = app
         .clone()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri(format!("/api/v1/requests/{}/matches", created.request.id))
+                .uri(format!("/api/v1/requests/{}/resolve", created.request.id))
                 .bearer(&auth)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(
-                    r#"{{
-                        "message":"needs user choice",
-                        "candidates":[
-                            {{
-                                "canonical_identity_id":"{older_id}",
-                                "title":"Dune",
-                                "year":1984,
-                                "popularity":60.0
-                            }},
-                            {{
-                                "canonical_identity_id":"{newer_id}",
-                                "title":"Dune",
-                                "year":2021,
-                                "popularity":90.0
-                            }}
-                        ]
-                    }}"#
-                )))?,
+                .body(Body::empty())?,
         )
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    let parked: RequestDetail = response_json(response).await?;
-    assert_eq!(parked.request.state, RequestState::NeedsDisambiguation);
-    assert_eq!(parked.candidates.len(), 2);
-    assert_eq!(parked.candidates[0].canonical_identity_id, newer_id);
+    let body: Value = response_json(response).await?;
+    assert_eq!(
+        body["candidates"][0]["canonical_identity_id"],
+        "tmdb:movie:27205"
+    );
+    assert_eq!(body["candidates"][0]["title"], "Inception");
+    assert_eq!(body["candidates"][0]["year"], 2010);
+    assert_eq!(body["candidates"][0]["score"], 1.0);
 
-    let get_response = app
+    let resolved_response = app
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
@@ -383,9 +408,41 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
                 .body(Body::empty())?,
         )
         .await?;
-    assert_eq!(get_response.status(), StatusCode::OK);
-    let fetched: RequestDetail = response_json(get_response).await?;
-    assert_eq!(fetched.candidates, parked.candidates);
+    assert_eq!(resolved_response.status(), StatusCode::OK);
+    let resolved: RequestDetail = response_json(resolved_response).await?;
+    assert_eq!(
+        resolved.request.target.canonical_identity_id,
+        Some(winner_id)
+    );
+    assert_eq!(resolved.request.state, RequestState::Resolved);
+
+    let requests = tmdb.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("/3/search/movie?"));
+    assert!(requests[1].starts_with("/3/search/tv?"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_match_api_returns_not_found() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let app = kino_server::router(db);
+    let created = create_request(&app, &auth, "Dune").await?;
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/matches", created.request.id))
+                .bearer(&auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"candidates":[]}"#))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     Ok(())
 }
