@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CanonicalIdentityId, Id, Timestamp};
 
 /// User-facing media item kind stored in the catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaItemKind {
     /// A movie identified directly by a canonical identity.
@@ -140,13 +140,14 @@ impl SourceFile {
 }
 
 /// Derived stream output produced from a source file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TranscodeOutput {
     /// Transcode output id.
     pub id: Id,
     /// Source file this output was derived from.
     pub source_file_id: Id,
     /// Output path.
+    #[schema(value_type = String)]
     pub path: PathBuf,
     /// Creation timestamp.
     pub created_at: Timestamp,

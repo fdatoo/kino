@@ -23,6 +23,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/kino-admin/web/pnpm-lock.yaml
+
+      - name: Build admin SPA
+        working-directory: crates/kino-admin/web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
@@ -32,7 +50,7 @@ jobs:
         id: cargo-cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: cargo-lock-${{ hashFiles('Cargo.lock') }}
+          key: cargo-lock-${{ hashFiles('Cargo.lock', 'crates/kino-db/migrations/**', 'crates/kino-server/openapi.json') }}
           cache-workspace-crates: "true"
 
       - name: Log Cargo cache result
@@ -81,6 +99,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Generate API client
+        run: pnpm gen
 
       - name: Typecheck
         run: pnpm typecheck

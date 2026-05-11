@@ -10,6 +10,7 @@ pub mod device_token;
 pub mod id;
 pub mod identity;
 pub mod playback_session;
+pub mod playback_state;
 pub mod request;
 pub mod time;
 pub mod tracing;
@@ -24,6 +25,7 @@ pub use identity::{
     CanonicalIdentitySource, TmdbId,
 };
 pub use playback_session::{PlaybackSession, PlaybackSessionStatus};
+pub use playback_state::{InvalidPlaybackPosition, PlaybackProgress, Watched, WatchedSource};
 pub use request::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use time::Timestamp;
 pub use user::{SEEDED_USER_ID, User};

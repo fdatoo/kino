@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+base64 = "0.22"
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
 kino-fulfillment = { path = "../kino-fulfillment" }
@@ -16,10 +17,13 @@ kino-transcode = { path = "../kino-transcode" }
 kino-server = { path = "../kino-server" }
 kino-admin = { path = "../kino-admin" }
 kino-cli = { path = "../kino-cli" }
+rand = "0.8"
+sha2 = "0.10"
+sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-sqlx = { workspace = true }
+kino-db = { path = "../kino-db", features = ["test-helpers"] }
 tempfile = { workspace = true }

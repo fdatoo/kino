@@ -379,8 +379,8 @@ mod tests {
     use std::path::PathBuf;
 
     use kino_core::{
-        CanonicalIdentityId, Config, DeviceToken, Id, PlaybackSession, PlaybackSessionStatus,
-        SEEDED_USER_ID, Timestamp, TmdbId,
+        CanonicalIdentityId, Config, DeviceToken, Id, PlaybackProgress, PlaybackSession,
+        PlaybackSessionStatus, SEEDED_USER_ID, Timestamp, TmdbId, Watched, WatchedSource,
     };
     use sqlx::migrate::{Migration, MigrationType, Migrator};
 
@@ -789,6 +789,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playback_progress_upsert_preserves_higher_position()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let initial_updated_at = Timestamp::now();
+        let progress =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 100, initial_updated_at, None)?;
+
+        insert_playback_progress(&db, &progress).await?;
+
+        let lower_position =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 50, Timestamp::now(), None)?;
+        upsert_playback_progress(&db, &lower_position).await?;
+
+        let stored: (i64, Timestamp, Option<Id>) = sqlx::query_as(
+            r#"
+            SELECT position_seconds, updated_at, source_device_token_id
+            FROM playback_progress
+            WHERE user_id = ?1 AND media_item_id = ?2
+            "#,
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+
+        assert_eq!(stored.0, 100);
+        assert_eq!(stored.1, initial_updated_at);
+        assert_eq!(stored.2, None);
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_progress_upsert_accepts_higher_position()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let progress =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 100, Timestamp::now(), None)?;
+
+        insert_playback_progress(&db, &progress).await?;
+
+        let updated_at = Timestamp::now();
+        let higher_position =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 200, updated_at, None)?;
+        upsert_playback_progress(&db, &higher_position).await?;
+
+        let stored: (i64, Timestamp) = sqlx::query_as(
+            r#"
+            SELECT position_seconds, updated_at
+            FROM playback_progress
+            WHERE user_id = ?1 AND media_item_id = ?2
+            "#,
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+
+        assert_eq!(stored.0, 200);
+        assert_eq!(stored.1, updated_at);
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watched_rows_support_insert_manual_toggle_and_delete()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let watched = Watched::new(
+            SEEDED_USER_ID,
+            media_item_id,
+            Timestamp::now(),
+            WatchedSource::Auto,
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO watched (
+                user_id,
+                media_item_id,
+                watched_at,
+                source
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(watched.user_id)
+        .bind(watched.media_item_id)
+        .bind(watched.watched_at)
+        .bind(watched.source.as_str())
+        .execute(db.write_pool())
+        .await?;
+
+        let inserted_source: String = sqlx::query_scalar(
+            "SELECT source FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(
+            WatchedSource::parse(&inserted_source),
+            Some(WatchedSource::Auto)
+        );
+
+        let watched_at = Timestamp::now();
+        sqlx::query(
+            r#"
+            UPDATE watched
+            SET watched_at = ?1, source = ?2
+            WHERE user_id = ?3 AND media_item_id = ?4
+            "#,
+        )
+        .bind(watched_at)
+        .bind(WatchedSource::Manual.as_str())
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .execute(db.write_pool())
+        .await?;
+
+        let updated: (Timestamp, String) = sqlx::query_as(
+            "SELECT watched_at, source FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(updated.0, watched_at);
+        assert_eq!(
+            WatchedSource::parse(&updated.1),
+            Some(WatchedSource::Manual)
+        );
+
+        sqlx::query("DELETE FROM watched WHERE user_id = ?1 AND media_item_id = ?2")
+            .bind(SEEDED_USER_ID)
+            .bind(media_item_id)
+            .execute(db.write_pool())
+            .await?;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watched")
+            .fetch_one(db.read_pool())
+            .await?;
+        assert_eq!(count, 0);
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn migration_runner_rejects_modified_applied_migration()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
@@ -1061,6 +1215,90 @@ mod tests {
         assert!(missing_source_file.is_err());
 
         db.close().await;
+        Ok(())
+    }
+
+    async fn insert_personal_media_item(db: &super::Db) -> std::result::Result<Id, sqlx::Error> {
+        let id = Id::new();
+        let now = Timestamp::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, 'personal', NULL, ?2, ?3)
+            "#,
+        )
+        .bind(id)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(id)
+    }
+
+    async fn insert_playback_progress(
+        db: &super::Db,
+        progress: &PlaybackProgress,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO playback_progress (
+                user_id,
+                media_item_id,
+                position_seconds,
+                updated_at,
+                source_device_token_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(progress.user_id)
+        .bind(progress.media_item_id)
+        .bind(progress.position_seconds)
+        .bind(progress.updated_at)
+        .bind(progress.source_device_token_id)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(())
+    }
+
+    async fn upsert_playback_progress(
+        db: &super::Db,
+        progress: &PlaybackProgress,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO playback_progress (
+                user_id,
+                media_item_id,
+                position_seconds,
+                updated_at,
+                source_device_token_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(user_id, media_item_id) DO UPDATE SET
+                position_seconds = excluded.position_seconds,
+                updated_at = excluded.updated_at,
+                source_device_token_id = excluded.source_device_token_id
+            WHERE excluded.position_seconds > playback_progress.position_seconds
+            "#,
+        )
+        .bind(progress.user_id)
+        .bind(progress.media_item_id)
+        .bind(progress.position_seconds)
+        .bind(progress.updated_at)
+        .bind(progress.source_device_token_id)
+        .execute(db.write_pool())
+        .await?;
+
         Ok(())
     }
 

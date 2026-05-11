@@ -6,7 +6,10 @@ use axum::Router;
 use kino_core::Config;
 use kino_db::Db;
 
+pub mod auth;
+mod openapi;
 mod request;
+mod token;
 
 /// Errors produced by `kino-server`.
 #[derive(Debug, thiserror::Error)]
@@ -26,12 +29,40 @@ pub fn router(db: Db) -> Router {
 
 /// Build the Kino HTTP router with an explicit library root.
 pub fn router_with_library_root(db: Db, library_root: impl Into<PathBuf>) -> Router {
-    Router::new().merge(request::router(db, library_root.into()))
+    router_with_library_root_and_public_base_url(
+        db,
+        library_root,
+        kino_core::config::ServerConfig::default().public_base_url,
+    )
+}
+
+/// Build the Kino HTTP router with an explicit public base URL for OpenAPI.
+pub fn router_with_public_base_url(db: Db, public_base_url: impl Into<String>) -> Router {
+    router_with_library_root_and_public_base_url(db, PathBuf::from("."), public_base_url)
+}
+
+/// Build the Kino HTTP router with explicit library and OpenAPI settings.
+pub fn router_with_library_root_and_public_base_url(
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    public_base_url: impl Into<String>,
+) -> Router {
+    Router::new()
+        .merge(openapi::router(public_base_url))
+        .merge(request::router(db.clone(), library_root.into()))
+        .merge(token::router(db))
+        .merge(kino_admin::router())
 }
 
 /// Serve the Kino HTTP API until the listener exits.
 pub async fn serve(config: &Config, db: Db) -> Result<()> {
-    serve_with_library_root(config.server.listen, db, config.library_root.clone()).await
+    serve_with_library_root_and_public_base_url(
+        config.server.listen,
+        db,
+        config.library_root.clone(),
+        config.server.public_base_url.clone(),
+    )
+    .await
 }
 
 /// Serve the Kino HTTP API on an explicit socket address.
@@ -45,9 +76,29 @@ pub async fn serve_with_library_root(
     db: Db,
     library_root: impl Into<PathBuf>,
 ) -> Result<()> {
+    serve_with_library_root_and_public_base_url(
+        listen,
+        db,
+        library_root,
+        kino_core::config::ServerConfig::default().public_base_url,
+    )
+    .await
+}
+
+/// Serve the Kino HTTP API with explicit library and OpenAPI settings.
+pub async fn serve_with_library_root_and_public_base_url(
+    listen: SocketAddr,
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    public_base_url: impl Into<String>,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(listen = %local_addr, "server listening");
-    axum::serve(listener, router_with_library_root(db, library_root)).await?;
+    axum::serve(
+        listener,
+        router_with_library_root_and_public_base_url(db, library_root, public_base_url),
+    )
+    .await?;
     Ok(())
 }

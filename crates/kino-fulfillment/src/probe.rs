@@ -392,9 +392,11 @@ pub enum ProbeSubtitleKind {
     /// Advanced SubStation Alpha text subtitles.
     Ass,
     /// Presentation Graphic Stream image subtitles.
-    Pgs,
-    /// VOBSUB image subtitles.
-    VobSub,
+    ImagePgs,
+    /// DVD VOBSUB image subtitles.
+    ImageVobSub,
+    /// DVB image subtitles.
+    ImageDvb,
     /// Subtitle codec is not yet classified by Kino.
     Other,
 }
@@ -405,13 +407,32 @@ impl ProbeSubtitleKind {
         matches!(self, Self::Srt | Self::Ass)
     }
 
+    /// Whether this subtitle stream is an image format.
+    pub const fn is_image(self) -> bool {
+        matches!(self, Self::ImagePgs | Self::ImageVobSub | Self::ImageDvb)
+    }
+
     fn from_codec(codec_name: Option<&str>) -> Self {
         match codec_name {
             Some("subrip" | "srt") => Self::Srt,
             Some("ass" | "ssa") => Self::Ass,
-            Some("hdmv_pgs_subtitle") => Self::Pgs,
-            Some("dvd_subtitle" | "dvb_subtitle") => Self::VobSub,
+            Some("hdmv_pgs_subtitle") => Self::ImagePgs,
+            Some("dvd_subtitle") => Self::ImageVobSub,
+            Some("dvb_subtitle") => Self::ImageDvb,
             _ => Self::Other,
+        }
+    }
+}
+
+impl From<ProbeSubtitleKind> for kino_library::ProbeSubtitleKind {
+    fn from(kind: ProbeSubtitleKind) -> Self {
+        match kind {
+            ProbeSubtitleKind::Srt => Self::Srt,
+            ProbeSubtitleKind::Ass => Self::Ass,
+            ProbeSubtitleKind::ImagePgs => Self::ImagePgs,
+            ProbeSubtitleKind::ImageVobSub => Self::ImageVobSub,
+            ProbeSubtitleKind::ImageDvb => Self::ImageDvb,
+            ProbeSubtitleKind::Other => Self::Other,
         }
     }
 }
@@ -606,10 +627,11 @@ JSON
             vec![
                 ProbeSubtitleKind::Srt,
                 ProbeSubtitleKind::Ass,
-                ProbeSubtitleKind::Pgs,
+                ProbeSubtitleKind::ImagePgs,
             ]
         );
         assert!(result.subtitle_streams[0].kind.is_text());
+        assert!(result.subtitle_streams[2].kind.is_image());
         assert_eq!(
             result.as_probed_file(),
             ProbedFile::new()
@@ -620,6 +642,41 @@ JSON
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn image_subtitle_codecs_keep_source_format() {
+        let result = ProbeResult::from_ffprobe_output(
+            PathBuf::from("movie.mkv"),
+            FfprobeOutput {
+                streams: vec![
+                    subtitle_stream(1, "hdmv_pgs_subtitle"),
+                    subtitle_stream(2, "dvd_subtitle"),
+                    subtitle_stream(3, "dvb_subtitle"),
+                ],
+                format: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .subtitle_streams
+                .iter()
+                .map(|stream| stream.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ProbeSubtitleKind::ImagePgs,
+                ProbeSubtitleKind::ImageVobSub,
+                ProbeSubtitleKind::ImageDvb,
+            ]
+        );
+        assert!(
+            result
+                .subtitle_streams
+                .iter()
+                .all(|stream| stream.kind.is_image())
+        );
     }
 
     #[tokio::test]
@@ -680,6 +737,19 @@ exit 66
         }
         fs::set_permissions(&path, permissions)?;
         Ok(path)
+    }
+
+    fn subtitle_stream(index: u32, codec_name: &str) -> FfprobeStream {
+        FfprobeStream {
+            index,
+            codec_type: Some(String::from("subtitle")),
+            codec_name: Some(String::from(codec_name)),
+            codec_long_name: None,
+            width: None,
+            height: None,
+            channels: None,
+            tags: None,
+        }
     }
 
     #[test]
