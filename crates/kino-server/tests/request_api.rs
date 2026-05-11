@@ -11,6 +11,18 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
+mod common;
+
+trait AuthRequestBuilder {
+    fn bearer(self, token: &str) -> Self;
+}
+
+impl AuthRequestBuilder for axum::http::request::Builder {
+    fn bearer(self, token: &str) -> Self {
+        self.header(header::AUTHORIZATION, common::bearer(token))
+    }
+}
+
 #[tokio::test]
 async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
@@ -60,6 +72,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
 #[tokio::test]
 async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
 
     let create_response = app
@@ -68,6 +81,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
             HttpRequest::builder()
                 .method("POST")
                 .uri("/api/v1/requests")
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"target":"Inception (2010)","message":"requested from curl"}"#,
@@ -90,6 +104,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!("/api/v1/requests/{}", created.request.id))
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -104,6 +119,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/requests")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -119,6 +135,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
             HttpRequest::builder()
                 .method("DELETE")
                 .uri(format!("/api/v1/requests/{}", created.request.id))
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -140,11 +157,12 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
 async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn std::error::Error>>
 {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
 
-    let first = create_request(&app, "first").await?;
-    let second = create_request(&app, "second").await?;
-    create_request(&app, "third").await?;
+    let first = create_request(&app, &auth, "first").await?;
+    let second = create_request(&app, &auth, "second").await?;
+    create_request(&app, &auth, "third").await?;
 
     let first_page_response = app
         .clone()
@@ -152,6 +170,7 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/requests?state=pending&limit=2&offset=0")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -172,6 +191,7 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/requests?limit=0")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -184,8 +204,9 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
 async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dyn std::error::Error>>
 {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
-    let created = create_request(&app, "Inception (2010)").await?;
+    let created = create_request(&app, &auth, "Inception (2010)").await?;
     let winner_id = identity(550);
 
     let response = app
@@ -193,6 +214,7 @@ async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dy
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!("/api/v1/requests/{}/matches", created.request.id))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{
@@ -233,8 +255,9 @@ async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dy
 async fn request_match_api_parks_low_confidence_match_with_candidates()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
-    let created = create_request(&app, "Dune").await?;
+    let created = create_request(&app, &auth, "Dune").await?;
     let newer_id = identity(438_631);
     let older_id = identity(841);
 
@@ -244,6 +267,7 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!("/api/v1/requests/{}/matches", created.request.id))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{
@@ -278,6 +302,7 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!("/api/v1/requests/{}", created.request.id))
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -292,6 +317,7 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
 async fn re_resolution_api_records_versioned_identity_history()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let service = RequestService::new(db.clone());
     let app = kino_server::router(db);
     let first_identity = identity(550);
@@ -325,6 +351,7 @@ async fn re_resolution_api_records_versioned_identity_history()
                     "/api/v1/requests/{}/re-resolution",
                     created.request.id
                 ))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{
@@ -368,6 +395,7 @@ async fn re_resolution_api_records_versioned_identity_history()
 async fn request_plan_api_records_current_plan_and_history()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let service = RequestService::new(db.clone());
     let app = kino_server::router(db);
     let created = service
@@ -397,6 +425,7 @@ async fn request_plan_api_records_current_plan_and_history()
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!("/api/v1/requests/{}/plans", created.request.id))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{
@@ -420,6 +449,7 @@ async fn request_plan_api_records_current_plan_and_history()
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!("/api/v1/requests/{}/plans", created.request.id))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{
@@ -444,6 +474,7 @@ async fn request_plan_api_records_current_plan_and_history()
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!("/api/v1/requests/{}", created.request.id))
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -459,6 +490,7 @@ async fn request_plan_api_records_current_plan_and_history()
 async fn manual_import_api_accepts_readable_file_and_starts_ingesting()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let service = RequestService::new(db.clone());
     let app = kino_server::router(db);
     let request = fulfilling_request(&service).await?;
@@ -470,6 +502,7 @@ async fn manual_import_api_accepts_readable_file_and_starts_ingesting()
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!("/api/v1/admin/requests/{request}/manual-import"))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{
@@ -510,6 +543,7 @@ async fn manual_import_api_accepts_readable_file_and_starts_ingesting()
 #[tokio::test]
 async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let service = RequestService::new(db.clone());
     let app = kino_server::router(db);
     let request = fulfilling_request(&service).await?;
@@ -521,6 +555,7 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!("/api/v1/admin/requests/{request}/manual-import"))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
         )
@@ -540,6 +575,7 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!("/api/v1/requests/{request}"))
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -553,8 +589,9 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
 async fn manual_import_api_rejects_invalid_request_state() -> Result<(), Box<dyn std::error::Error>>
 {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
-    let created = create_request(&app, "Inception (2010)").await?;
+    let created = create_request(&app, &auth, "Inception (2010)").await?;
     let path = std::env::temp_dir().join(format!(
         "kino-manual-import-invalid-state-{}.mkv",
         created.request.id
@@ -569,6 +606,7 @@ async fn manual_import_api_rejects_invalid_request_state() -> Result<(), Box<dyn
                     "/api/v1/admin/requests/{}/manual-import",
                     created.request.id
                 ))
+                .bearer(&auth)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
         )
@@ -584,6 +622,7 @@ async fn manual_import_api_rejects_invalid_request_state() -> Result<(), Box<dyn
 async fn admin_library_scan_reports_orphans_and_missing_files()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let library_root = tempfile::tempdir()?;
     let orphan = library_root
         .path()
@@ -607,6 +646,7 @@ async fn admin_library_scan_reports_orphans_and_missing_files()
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/admin/library/scan")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -633,8 +673,28 @@ async fn admin_library_scan_reports_orphans_and_missing_files()
 }
 
 #[tokio::test]
+async fn admin_library_scan_rejects_unauthenticated() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/admin/library/scan")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let matrix_identity = identity(603);
     let fight_club_identity = identity(550);
     let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
@@ -652,6 +712,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/library/items?type=movie&title_contains=matrix&has_source_file=true&limit=1")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -672,6 +733,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/library/items?limit=1")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -685,6 +747,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!("/api/v1/library/items/{matrix}"))
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -704,6 +767,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
 async fn catalog_api_reports_invalid_filters_and_missing_items()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
 
     let invalid_filter = app
@@ -712,6 +776,7 @@ async fn catalog_api_reports_invalid_filters_and_missing_items()
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/library/items?type=episode")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -722,6 +787,7 @@ async fn catalog_api_reports_invalid_filters_and_missing_items()
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!("/api/v1/library/items/{}", Id::new()))
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
@@ -730,8 +796,28 @@ async fn catalog_api_reports_invalid_filters_and_missing_items()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_api_rejects_unauthenticated_list() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
 async fn create_request(
     app: &axum::Router,
+    auth_token: &str,
     message: &str,
 ) -> Result<RequestDetail, Box<dyn std::error::Error>> {
     let response = app
@@ -740,6 +826,7 @@ async fn create_request(
             HttpRequest::builder()
                 .method("POST")
                 .uri("/api/v1/requests")
+                .bearer(auth_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"target":"{message}","message":"{message}"}}"#
@@ -981,6 +1068,7 @@ fn media_item_episode_number(canonical_identity_id: CanonicalIdentityId) -> Opti
 #[tokio::test]
 async fn create_request_requires_target() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
 
     let response = app
@@ -988,11 +1076,32 @@ async fn create_request_requires_target() -> Result<(), Box<dyn std::error::Erro
             HttpRequest::builder()
                 .method("POST")
                 .uri("/api/v1/requests")
+                .bearer(&auth)
                 .body(Body::empty())?,
         )
         .await?;
 
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_api_rejects_unauthenticated_create() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"Inception (2010)"}"#))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     Ok(())
 }

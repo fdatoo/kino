@@ -9,13 +9,10 @@ use kino_core::{Id, Timestamp, user::User};
 use kino_server::auth::{AuthState, AuthenticatedUser, require_auth};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tower::util::ServiceExt;
 
-#[derive(Debug, Deserialize)]
-struct CreateTokenResponse {
-    token: String,
-    token_id: Id,
-}
+mod common;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ProtectedResponse {
@@ -24,10 +21,15 @@ struct ProtectedResponse {
     display_name: String,
 }
 
+struct TestToken {
+    token: String,
+    token_id: Id,
+}
+
 #[tokio::test]
 async fn auth_middleware_accepts_valid_bearer_token() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
-    let token = create_token(&db, "Office iPad").await?;
+    let token = issued_token(&db).await?;
     let app = protected_router(db.clone());
 
     let response = app
@@ -35,7 +37,7 @@ async fn auth_middleware_accepts_valid_bearer_token() -> Result<(), Box<dyn std:
             HttpRequest::builder()
                 .method("GET")
                 .uri("/protected")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                .header(header::AUTHORIZATION, common::bearer(&token.token))
                 .body(Body::empty())?,
         )
         .await?;
@@ -107,7 +109,7 @@ async fn auth_middleware_rejects_unknown_bearer_token() -> Result<(), Box<dyn st
 #[tokio::test]
 async fn auth_middleware_rejects_revoked_bearer_token() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
-    let token = create_token(&db, "Office iPad").await?;
+    let token = issued_token(&db).await?;
     let app = protected_router(db.clone());
 
     sqlx::query("UPDATE device_tokens SET revoked_at = ?1 WHERE id = ?2")
@@ -121,7 +123,7 @@ async fn auth_middleware_rejects_revoked_bearer_token() -> Result<(), Box<dyn st
             HttpRequest::builder()
                 .method("GET")
                 .uri("/protected")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                .header(header::AUTHORIZATION, common::bearer(&token.token))
                 .body(Body::empty())?,
         )
         .await?;
@@ -153,25 +155,6 @@ async fn protected_handler(
     })
 }
 
-async fn create_token(
-    db: &kino_db::Db,
-    label: &str,
-) -> Result<CreateTokenResponse, Box<dyn std::error::Error>> {
-    let app = kino_server::router(db.clone());
-    let response = app
-        .oneshot(
-            HttpRequest::builder()
-                .method("POST")
-                .uri("/api/v1/admin/tokens")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(r#"{{"label":"{label}"}}"#)))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-    response_json(response).await
-}
-
 async fn wait_for_last_seen(
     db: &kino_db::Db,
     token_id: Id,
@@ -189,6 +172,17 @@ async fn wait_for_last_seen(
     }
 
     panic!("last_seen_at was not updated");
+}
+
+async fn issued_token(db: &kino_db::Db) -> Result<TestToken, Box<dyn std::error::Error>> {
+    let token = common::issued_token(db).await?;
+    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let token_id = sqlx::query_scalar("SELECT id FROM device_tokens WHERE hash = ?1")
+        .bind(hash)
+        .fetch_one(db.read_pool())
+        .await?;
+
+    Ok(TestToken { token, token_id })
 }
 
 async fn assert_auth_error(
