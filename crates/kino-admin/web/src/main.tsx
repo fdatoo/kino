@@ -7,6 +7,7 @@ import {
 } from 'react-router-dom';
 import { ConfigPage } from './admin/config/ConfigPage';
 import { ItemDetailPage } from './admin/items/ItemDetailPage';
+import { SessionsPage } from './admin/sessions/SessionsPage';
 import { TokensPage } from './admin/tokens/TokensPage';
 import { AuthGate } from './auth/AuthGate';
 import { LoginPage } from './auth/LoginPage';
@@ -36,6 +37,10 @@ const router = createBrowserRouter(
                 {
                     path: '/items/:id',
                     element: <ItemDetailPage />,
+                },
+                {
+                    path: '/sessions',
+                    element: <SessionsPage />,
                 },
             ],
         },
