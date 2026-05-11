@@ -106,6 +106,7 @@ mod tests {
                 (8, String::from("request fulfillment plans")),
                 (9, String::from("minimal media items")),
                 (10, String::from("subtitle sidecars")),
+                (11, String::from("metadata cache")),
             ]
         );
 

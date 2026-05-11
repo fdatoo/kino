@@ -6,11 +6,16 @@
 use std::{
     collections::HashSet,
     fmt,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
 };
 
-use kino_core::{CanonicalLayoutTransfer, Config, Id, Timestamp};
+use kino_core::{
+    CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, Config, Id, Timestamp,
+};
 use kino_db::Db;
+use serde::Serialize;
 use sqlx::Row;
 
 /// Errors produced by `kino-library`.
@@ -19,6 +24,10 @@ pub enum Error {
     /// A database operation failed.
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+
+    /// A metadata sidecar could not be serialized.
+    #[error("metadata sidecar serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
 
     /// A filesystem operation failed for a library path.
     #[error("library filesystem io failed for {path}: {source}")]
@@ -65,6 +74,49 @@ pub enum Error {
         field: &'static str,
     },
 
+    /// A media item does not exist with the requested canonical identity.
+    #[error("media item {media_item_id} does not match canonical identity {canonical_identity_id}")]
+    MediaItemIdentityMismatch {
+        /// Media item id.
+        media_item_id: Id,
+        /// Expected canonical identity id.
+        canonical_identity_id: CanonicalIdentityId,
+    },
+
+    /// A metadata field is empty after trimming whitespace.
+    #[error("metadata field {field} is empty")]
+    EmptyMetadataField {
+        /// Metadata field name.
+        field: &'static str,
+    },
+
+    /// A metadata enrichment response did not include cast members.
+    #[error("metadata cast is empty")]
+    EmptyMetadataCast,
+
+    /// A cached metadata cast order is outside the accepted range.
+    #[error("metadata cast order {position} is invalid")]
+    InvalidMetadataCastOrder {
+        /// Persisted cast position.
+        position: i64,
+    },
+
+    /// A metadata image asset did not contain bytes.
+    #[error("metadata asset {asset} is empty")]
+    EmptyMetadataAsset {
+        /// Asset name.
+        asset: &'static str,
+    },
+
+    /// A metadata image asset extension is not safe for sidecar filenames.
+    #[error("metadata asset {asset} extension is invalid: {extension}")]
+    InvalidMetadataAssetExtension {
+        /// Asset name.
+        asset: &'static str,
+        /// Invalid extension.
+        extension: String,
+    },
+
     /// A probed subtitle track did not include a language.
     #[error("subtitle track {track_index} has no language")]
     EmptyLanguage {
@@ -100,6 +152,372 @@ pub enum Error {
 
 /// Crate-local `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Boxed future returned by metadata provider implementations.
+pub type MetadataFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Provider that fetches TMDB metadata and image bytes for enrichment.
+pub trait TmdbMetadataProvider: Send + Sync {
+    /// Fetch metadata for a TMDB canonical identity.
+    fn fetch_metadata<'a>(
+        &'a self,
+        identity_id: CanonicalIdentityId,
+    ) -> MetadataFuture<'a, TmdbMetadata>;
+}
+
+/// Image bytes returned by the TMDB metadata provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataAsset {
+    /// File extension to use when storing the image sidecar.
+    pub extension: String,
+    /// Raw asset bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl MetadataAsset {
+    /// Construct a metadata asset from an extension and bytes.
+    pub fn new(extension: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            extension: extension.into(),
+            bytes: bytes.into(),
+        }
+    }
+}
+
+/// Ordered cast member returned by the TMDB metadata provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetadataCastMember {
+    /// Cast order from TMDB.
+    pub order: u32,
+    /// Person display name.
+    pub name: String,
+    /// Character display name.
+    pub character: String,
+    /// Optional local or provider profile path.
+    pub profile_path: Option<String>,
+}
+
+impl MetadataCastMember {
+    /// Construct a metadata cast member.
+    pub fn new(
+        order: u32,
+        name: impl Into<String>,
+        character: impl Into<String>,
+        profile_path: Option<String>,
+    ) -> Self {
+        Self {
+            order,
+            name: name.into(),
+            character: character.into(),
+            profile_path,
+        }
+    }
+}
+
+/// TMDB metadata payload used for write-through enrichment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmdbMetadata {
+    /// TMDB display title or series name.
+    pub title: String,
+    /// Overview or description text.
+    pub description: String,
+    /// Release or first-air date, when TMDB provided one.
+    pub release_date: Option<String>,
+    /// Poster image bytes.
+    pub poster: MetadataAsset,
+    /// Backdrop image bytes.
+    pub backdrop: MetadataAsset,
+    /// Logo image bytes, when available.
+    pub logo: Option<MetadataAsset>,
+    /// Ordered cast members.
+    pub cast: Vec<MetadataCastMember>,
+}
+
+impl TmdbMetadata {
+    /// Construct a TMDB metadata payload.
+    pub fn new(
+        title: impl Into<String>,
+        description: impl Into<String>,
+        release_date: Option<String>,
+        poster: MetadataAsset,
+        backdrop: MetadataAsset,
+        logo: Option<MetadataAsset>,
+        cast: Vec<MetadataCastMember>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            description: description.into(),
+            release_date,
+            poster,
+            backdrop,
+            logo,
+            cast,
+        }
+    }
+}
+
+/// Cached metadata served by catalog reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedMediaMetadata {
+    /// Media item id.
+    pub media_item_id: Id,
+    /// Canonical identity this metadata describes.
+    pub canonical_identity_id: CanonicalIdentityId,
+    /// TMDB display title or series name.
+    pub title: String,
+    /// Overview or description text.
+    pub description: String,
+    /// Release or first-air date, when known.
+    pub release_date: Option<String>,
+    /// Local poster sidecar path.
+    pub poster_path: PathBuf,
+    /// Local backdrop sidecar path.
+    pub backdrop_path: PathBuf,
+    /// Local logo sidecar path, when present.
+    pub logo_path: Option<PathBuf>,
+    /// Local JSON metadata sidecar path.
+    pub metadata_path: PathBuf,
+    /// Ordered cast members.
+    pub cast: Vec<MetadataCastMember>,
+    /// Cache creation timestamp.
+    pub created_at: Timestamp,
+    /// Cache update timestamp.
+    pub updated_at: Timestamp,
+}
+
+/// Library service for write-through TMDB metadata enrichment.
+#[derive(Clone)]
+pub struct MetadataService {
+    db: Db,
+    metadata_root: PathBuf,
+}
+
+impl MetadataService {
+    /// Construct a metadata service with an explicit metadata root.
+    pub fn new(db: Db, metadata_root: impl Into<PathBuf>) -> Self {
+        Self {
+            db,
+            metadata_root: metadata_root.into(),
+        }
+    }
+
+    /// Construct a metadata service from process configuration.
+    pub fn from_config(db: Db, config: &Config) -> Self {
+        Self::new(db, config.library_root.join("Metadata"))
+    }
+
+    /// Enrich a media item from TMDB, returning the local cache projection.
+    pub async fn enrich_tmdb_media_item<P>(
+        &self,
+        media_item_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
+        provider: &P,
+    ) -> Result<CachedMediaMetadata>
+    where
+        P: TmdbMetadataProvider,
+    {
+        if let Some(cached) = self.cached_metadata(media_item_id).await? {
+            if cached.canonical_identity_id != canonical_identity_id {
+                return Err(Error::MediaItemIdentityMismatch {
+                    media_item_id,
+                    canonical_identity_id,
+                });
+            }
+
+            return Ok(cached);
+        }
+
+        self.ensure_media_item_identity(media_item_id, canonical_identity_id)
+            .await?;
+
+        let metadata = provider.fetch_metadata(canonical_identity_id).await?;
+        let metadata = validate_tmdb_metadata(metadata)?;
+        let directory = self.metadata_directory(canonical_identity_id);
+        create_dir_all(&directory).await?;
+
+        let poster_path = write_metadata_asset(&directory, "poster", &metadata.poster).await?;
+        let backdrop_path =
+            write_metadata_asset(&directory, "backdrop", &metadata.backdrop).await?;
+        let logo_path = match &metadata.logo {
+            Some(asset) => Some(write_metadata_asset(&directory, "logo", asset).await?),
+            None => None,
+        };
+        let metadata_path = directory.join("metadata.json");
+        write_metadata_sidecar(
+            &metadata_path,
+            canonical_identity_id,
+            &metadata,
+            &poster_path,
+            &backdrop_path,
+            logo_path.as_deref(),
+        )
+        .await?;
+
+        let now = Timestamp::now();
+        let cached = CachedMediaMetadata {
+            media_item_id,
+            canonical_identity_id,
+            title: metadata.title,
+            description: metadata.description,
+            release_date: metadata.release_date,
+            poster_path,
+            backdrop_path,
+            logo_path,
+            metadata_path,
+            cast: metadata.cast,
+            created_at: now,
+            updated_at: now,
+        };
+        self.insert_metadata_cache(&cached).await?;
+
+        Ok(cached)
+    }
+
+    /// Return cached media metadata without calling TMDB.
+    pub async fn cached_metadata(&self, media_item_id: Id) -> Result<Option<CachedMediaMetadata>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                media_item_id,
+                canonical_identity_id,
+                title,
+                description,
+                release_date,
+                poster_path,
+                backdrop_path,
+                logo_path,
+                metadata_path,
+                created_at,
+                updated_at
+            FROM media_metadata_cache
+            WHERE media_item_id = ?1
+            "#,
+        )
+        .bind(media_item_id)
+        .fetch_optional(self.db.read_pool())
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let cast_rows = sqlx::query(
+            r#"
+            SELECT position, name, character, profile_path
+            FROM media_metadata_cast_members
+            WHERE media_item_id = ?1
+            ORDER BY position
+            "#,
+        )
+        .bind(media_item_id)
+        .fetch_all(self.db.read_pool())
+        .await?;
+        let cast = cast_rows
+            .iter()
+            .map(cast_member_from_row)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Some(metadata_from_row(&row, cast)?))
+    }
+
+    async fn ensure_media_item_identity(
+        &self,
+        media_item_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
+    ) -> Result<()> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM media_items
+                WHERE id = ?1 AND canonical_identity_id = ?2
+            )
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(canonical_identity_id)
+        .fetch_one(self.db.read_pool())
+        .await?;
+
+        if !exists {
+            return Err(Error::MediaItemIdentityMismatch {
+                media_item_id,
+                canonical_identity_id,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn insert_metadata_cache(&self, cached: &CachedMediaMetadata) -> Result<()> {
+        let mut tx = self.db.write_pool().begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_metadata_cache (
+                media_item_id,
+                canonical_identity_id,
+                provider,
+                title,
+                description,
+                release_date,
+                poster_path,
+                backdrop_path,
+                logo_path,
+                metadata_path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+        )
+        .bind(cached.media_item_id)
+        .bind(cached.canonical_identity_id)
+        .bind(CanonicalIdentityProvider::Tmdb.as_str())
+        .bind(&cached.title)
+        .bind(&cached.description)
+        .bind(&cached.release_date)
+        .bind(path_to_db_text(&cached.poster_path)?)
+        .bind(path_to_db_text(&cached.backdrop_path)?)
+        .bind(path_option_to_db_text(cached.logo_path.as_deref())?)
+        .bind(path_to_db_text(&cached.metadata_path)?)
+        .bind(cached.created_at)
+        .bind(cached.updated_at)
+        .execute(&mut *tx)
+        .await?;
+
+        for cast in &cached.cast {
+            sqlx::query(
+                r#"
+                INSERT INTO media_metadata_cast_members (
+                    media_item_id,
+                    position,
+                    name,
+                    character,
+                    profile_path
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+            )
+            .bind(cached.media_item_id)
+            .bind(i64::from(cast.order))
+            .bind(&cast.name)
+            .bind(&cast.character)
+            .bind(&cast.profile_path)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    fn metadata_directory(&self, identity_id: CanonicalIdentityId) -> PathBuf {
+        self.metadata_root
+            .join(identity_id.provider().as_str())
+            .join(identity_id.kind().as_str())
+            .join(identity_id.tmdb_id().to_string())
+    }
+}
 
 /// Library media target for canonical layout placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +989,52 @@ async fn rename(source: &Path, destination: &Path) -> Result<()> {
         })
 }
 
+async fn write_metadata_asset(
+    directory: &Path,
+    asset: &'static str,
+    metadata_asset: &MetadataAsset,
+) -> Result<PathBuf> {
+    let extension = validate_asset_extension(asset, &metadata_asset.extension)?;
+    let path = directory.join(format!("{asset}.{extension}"));
+    tokio::fs::write(&path, &metadata_asset.bytes)
+        .await
+        .map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+    Ok(path)
+}
+
+async fn write_metadata_sidecar(
+    path: &Path,
+    identity_id: CanonicalIdentityId,
+    metadata: &TmdbMetadata,
+    poster_path: &Path,
+    backdrop_path: &Path,
+    logo_path: Option<&Path>,
+) -> Result<()> {
+    let sidecar = MetadataSidecar {
+        provider: identity_id.provider().as_str(),
+        media_kind: identity_id.kind().as_str(),
+        tmdb_id: identity_id.tmdb_id().get(),
+        title: &metadata.title,
+        description: &metadata.description,
+        release_date: metadata.release_date.as_deref(),
+        poster_path: path_to_db_text(poster_path)?,
+        backdrop_path: path_to_db_text(backdrop_path)?,
+        logo_path: path_option_to_db_text(logo_path)?,
+        cast: &metadata.cast,
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar)?;
+
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 async fn write_sidecar(path: &Path, text: &str) -> Result<()> {
     tokio::fs::write(path, text.as_bytes())
         .await
@@ -578,6 +1042,20 @@ async fn write_sidecar(path: &Path, text: &str) -> Result<()> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[derive(Serialize)]
+struct MetadataSidecar<'a> {
+    provider: &'static str,
+    media_kind: &'static str,
+    tmdb_id: u32,
+    title: &'a str,
+    description: &'a str,
+    release_date: Option<&'a str>,
+    poster_path: String,
+    backdrop_path: String,
+    logo_path: Option<String>,
+    cast: &'a [MetadataCastMember],
 }
 
 fn source_extension(path: &Path) -> Result<&str> {
@@ -588,6 +1066,59 @@ fn source_extension(path: &Path) -> Result<&str> {
     extension.to_str().ok_or_else(|| Error::NonUtf8Path {
         path: path.to_path_buf(),
     })
+}
+
+fn validate_tmdb_metadata(mut metadata: TmdbMetadata) -> Result<TmdbMetadata> {
+    metadata.title = require_metadata_text("title", metadata.title)?;
+    metadata.description = require_metadata_text("description", metadata.description)?;
+    validate_asset("poster", &metadata.poster)?;
+    validate_asset("backdrop", &metadata.backdrop)?;
+    if let Some(logo) = &metadata.logo {
+        validate_asset("logo", logo)?;
+    }
+    if metadata.cast.is_empty() {
+        return Err(Error::EmptyMetadataCast);
+    }
+
+    for member in &mut metadata.cast {
+        member.name = require_metadata_text("cast.name", std::mem::take(&mut member.name))?;
+    }
+    metadata.cast.sort_by_key(|member| member.order);
+
+    Ok(metadata)
+}
+
+fn require_metadata_text(field: &'static str, value: String) -> Result<String> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(Error::EmptyMetadataField { field });
+    }
+
+    Ok(value)
+}
+
+fn validate_asset(asset: &'static str, metadata_asset: &MetadataAsset) -> Result<()> {
+    if metadata_asset.bytes.is_empty() {
+        return Err(Error::EmptyMetadataAsset { asset });
+    }
+
+    validate_asset_extension(asset, &metadata_asset.extension).map(|_| ())
+}
+
+fn validate_asset_extension(asset: &'static str, extension: &str) -> Result<String> {
+    let extension = extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if extension.is_empty()
+        || !extension
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(Error::InvalidMetadataAssetExtension { asset, extension });
+    }
+
+    Ok(extension)
 }
 
 fn normalize_path_segment(value: &str) -> String {
@@ -661,9 +1192,123 @@ fn path_to_db_text(path: &Path) -> Result<String> {
         })
 }
 
+fn path_option_to_db_text(path: Option<&Path>) -> Result<Option<String>> {
+    path.map(path_to_db_text).transpose()
+}
+
+fn metadata_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    cast: Vec<MetadataCastMember>,
+) -> Result<CachedMediaMetadata> {
+    let poster_path: String = row.try_get("poster_path")?;
+    let backdrop_path: String = row.try_get("backdrop_path")?;
+    let logo_path: Option<String> = row.try_get("logo_path")?;
+    let metadata_path: String = row.try_get("metadata_path")?;
+
+    Ok(CachedMediaMetadata {
+        media_item_id: row.try_get("media_item_id")?,
+        canonical_identity_id: row.try_get("canonical_identity_id")?,
+        title: row.try_get("title")?,
+        description: row.try_get("description")?,
+        release_date: row.try_get("release_date")?,
+        poster_path: PathBuf::from(poster_path),
+        backdrop_path: PathBuf::from(backdrop_path),
+        logo_path: logo_path.map(PathBuf::from),
+        metadata_path: PathBuf::from(metadata_path),
+        cast,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn cast_member_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<MetadataCastMember> {
+    let position: i64 = row.try_get("position")?;
+    let order =
+        u32::try_from(position).map_err(|_| Error::InvalidMetadataCastOrder { position })?;
+    Ok(MetadataCastMember {
+        order,
+        name: row.try_get("name")?,
+        character: row.try_get("character")?,
+        profile_path: row.try_get("profile_path")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
+
+    #[tokio::test]
+    async fn enriches_metadata_to_disk_and_cache()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let identity_id = movie_identity(550);
+        let media_item_id = insert_tmdb_media_item(&db, identity_id).await?;
+        let metadata_root = tempfile::tempdir()?;
+        let provider = CountingMetadataProvider::new(sample_metadata());
+        let service = MetadataService::new(db, metadata_root.path());
+
+        let cached = service
+            .enrich_tmdb_media_item(media_item_id, identity_id, &provider)
+            .await?;
+
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(cached.media_item_id, media_item_id);
+        assert_eq!(cached.canonical_identity_id, identity_id);
+        assert_eq!(cached.title, "Fight Club");
+        assert_eq!(
+            cached.description,
+            "An insomniac office worker changes course."
+        );
+        assert_eq!(cached.release_date.as_deref(), Some("1999-10-15"));
+        assert_eq!(cached.cast.len(), 2);
+        assert_eq!(cached.cast[0].name, "Edward Norton");
+        assert_eq!(cached.cast[1].name, "Brad Pitt");
+        assert_eq!(tokio::fs::read(&cached.poster_path).await?, b"poster-bytes");
+        assert_eq!(
+            tokio::fs::read(&cached.backdrop_path).await?,
+            b"backdrop-bytes"
+        );
+        let logo_path = match &cached.logo_path {
+            Some(path) => path,
+            None => panic!("logo should be cached"),
+        };
+        assert_eq!(tokio::fs::read(logo_path).await?, b"logo-bytes");
+
+        let sidecar = tokio::fs::read_to_string(&cached.metadata_path).await?;
+        assert!(sidecar.contains("\"title\": \"Fight Club\""));
+        assert!(sidecar.contains("\"name\": \"Edward Norton\""));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_reads_without_calling_provider()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let identity_id = movie_identity(27205);
+        let media_item_id = insert_tmdb_media_item(&db, identity_id).await?;
+        let metadata_root = tempfile::tempdir()?;
+        let provider = CountingMetadataProvider::new(sample_metadata());
+        let service = MetadataService::new(db, metadata_root.path());
+
+        service
+            .enrich_tmdb_media_item(media_item_id, identity_id, &provider)
+            .await?;
+        let cached = service
+            .enrich_tmdb_media_item(media_item_id, identity_id, &provider)
+            .await?;
+        let readback = service.cached_metadata(media_item_id).await?;
+
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(readback, Some(cached));
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn hard_links_movie_into_canonical_layout()
@@ -782,6 +1427,112 @@ mod tests {
         .await?;
 
         Ok(id)
+    }
+
+    async fn insert_tmdb_media_item(
+        db: &Db,
+        canonical_identity_id: CanonicalIdentityId,
+    ) -> std::result::Result<Id, sqlx::Error> {
+        let media_item_id = Id::new();
+        let now = Timestamp::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO canonical_identities (
+                id,
+                provider,
+                media_kind,
+                tmdb_id,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(canonical_identity_id)
+        .bind(canonical_identity_id.provider().as_str())
+        .bind(canonical_identity_id.kind().as_str())
+        .bind(i64::from(canonical_identity_id.tmdb_id().get()))
+        .bind(kino_core::CanonicalIdentitySource::Manual.as_str())
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(canonical_identity_id.kind().as_str())
+        .bind(canonical_identity_id)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(media_item_id)
+    }
+
+    fn movie_identity(value: u32) -> CanonicalIdentityId {
+        let Some(tmdb_id) = kino_core::TmdbId::new(value) else {
+            panic!("test tmdb id should be valid");
+        };
+        CanonicalIdentityId::tmdb_movie(tmdb_id)
+    }
+
+    fn sample_metadata() -> TmdbMetadata {
+        TmdbMetadata::new(
+            "Fight Club",
+            "An insomniac office worker changes course.",
+            Some("1999-10-15".to_owned()),
+            MetadataAsset::new("jpg", b"poster-bytes".to_vec()),
+            MetadataAsset::new(".jpg", b"backdrop-bytes".to_vec()),
+            Some(MetadataAsset::new("png", b"logo-bytes".to_vec())),
+            vec![
+                MetadataCastMember::new(1, "Brad Pitt", "Tyler Durden", None),
+                MetadataCastMember::new(0, "Edward Norton", "The Narrator", None),
+            ],
+        )
+    }
+
+    struct CountingMetadataProvider {
+        metadata: TmdbMetadata,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingMetadataProvider {
+        fn new(metadata: TmdbMetadata) -> Self {
+            Self {
+                metadata,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TmdbMetadataProvider for CountingMetadataProvider {
+        fn fetch_metadata<'a>(
+            &'a self,
+            _identity_id: CanonicalIdentityId,
+        ) -> MetadataFuture<'a, TmdbMetadata> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.metadata.clone())
+            })
+        }
     }
 
     #[tokio::test]

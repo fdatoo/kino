@@ -10,6 +10,8 @@ workspace = true
 [dependencies]
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
