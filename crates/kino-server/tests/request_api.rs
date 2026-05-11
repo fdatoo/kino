@@ -55,6 +55,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(body["info"]["version"], "0.1.0-phase-2");
     assert_eq!(body["servers"][0]["url"], "https://kino.example.test");
     assert!(body["paths"].get("/api/v1/library/items").is_some());
+    assert!(body["paths"].get("/api/v1/admin/config").is_some());
     assert!(
         body["paths"]
             .get("/api/v1/stream/sourcefile/{id}")
