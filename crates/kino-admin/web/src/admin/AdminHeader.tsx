@@ -1,4 +1,5 @@
-import { NavLink } from 'react-router-dom';
+import { FormEvent, useState } from 'react';
+import { NavLink, useNavigate } from 'react-router-dom';
 
 type AdminHeaderProps = {
     onSignOut: () => void;
@@ -6,6 +7,21 @@ type AdminHeaderProps = {
 };
 
 export function AdminHeader({ onSignOut, title }: AdminHeaderProps) {
+    const navigate = useNavigate();
+    const [itemId, setItemId] = useState('');
+
+    function handleOpenItem(event: FormEvent<HTMLFormElement>) {
+        event.preventDefault();
+
+        const trimmedItemId = itemId.trim();
+        if (trimmedItemId === '') {
+            return;
+        }
+
+        navigate(`/items/${encodeURIComponent(trimmedItemId)}`);
+        setItemId('');
+    }
+
     return (
         <header className="top-bar">
             <div>
@@ -13,6 +29,21 @@ export function AdminHeader({ onSignOut, title }: AdminHeaderProps) {
                 <h1>{title}</h1>
             </div>
             <div className="top-actions">
+                <form
+                    aria-label="Open catalog item"
+                    className="item-jump-form"
+                    onSubmit={handleOpenItem}
+                >
+                    <input
+                        aria-label="Catalog item id"
+                        onChange={(event) =>
+                            setItemId(event.currentTarget.value)
+                        }
+                        placeholder="Catalog item id"
+                        value={itemId}
+                    />
+                    <button type="submit">Open</button>
+                </form>
                 <nav className="primary-nav" aria-label="Primary">
                     <NavLink to="/tokens">Tokens</NavLink>
                     <NavLink to="/config">Config</NavLink>
