@@ -24,6 +24,7 @@ pnpm gen
 pnpm typecheck
 pnpm lint
 pnpm build
+pnpm test
 ```
 
 ## API client generation
@@ -46,18 +47,17 @@ For this sub-issue the SPA is standalone. A later sub-issue will embed
 `dist/` into the `kino-admin` binary, so `pnpm build` is the boundary the Rust
 side will consume.
 
-## Device token bootstrap
+## First boot
 
-Until admin authentication is wired in F-304, the local server exposes the token
-issuance endpoint without authentication:
+When Kino starts with an empty `device_tokens` table, the binary mints one admin
+device token labeled `bootstrap` and logs it at `info` level:
 
 ```sh
-curl -X POST http://127.0.0.1:3000/api/v1/admin/tokens \
-  -H 'content-type: application/json' \
-  -d '{"label":"admin workstation"}'
+bootstrap token issued token=<plaintext>
 ```
 
-The response includes the plaintext `token` exactly once. Kino stores only the
-SHA-256 hash; later reads from `GET /api/v1/admin/tokens` return token metadata
-such as `token_id`, `label`, `last_seen_at`, and `revoked_at`, never the
-plaintext token.
+Paste that plaintext token into `/admin/login`. The SPA stores the active token
+in `localStorage` as `kino_admin_token` and uses it for later admin API calls.
+Newly minted tokens are also shown in plaintext exactly once; later reads from
+`GET /api/v1/admin/tokens` return metadata such as `token_id`, `label`,
+`last_seen_at`, and `revoked_at`, never the plaintext token.
