@@ -7,6 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
+mod common;
+
 #[derive(Debug, Deserialize)]
 struct CreateTokenResponse {
     token: String,
@@ -32,6 +34,7 @@ struct TokenSummary {
 #[tokio::test]
 async fn token_api_mints_token_and_persists_only_hash() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db.clone());
 
     let response = app
@@ -39,6 +42,7 @@ async fn token_api_mints_token_and_persists_only_hash() -> Result<(), Box<dyn st
             HttpRequest::builder()
                 .method("POST")
                 .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, common::bearer(&auth))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"label":"Living room Apple TV"}"#))?,
         )
@@ -69,14 +73,16 @@ async fn token_api_mints_token_and_persists_only_hash() -> Result<(), Box<dyn st
 async fn token_api_lists_token_metadata_without_plaintext() -> Result<(), Box<dyn std::error::Error>>
 {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
-    let created = create_token(&app, "Office iPad").await?;
+    let created = create_token(&app, &auth, "Office iPad").await?;
 
     let response = app
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
                 .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, common::bearer(&auth))
                 .body(Body::empty())?,
         )
         .await?;
@@ -96,12 +102,15 @@ async fn token_api_lists_token_metadata_without_plaintext() -> Result<(), Box<dy
     );
 
     let listed: ListTokensResponse = serde_json::from_value(body)?;
-    assert_eq!(listed.tokens.len(), 1);
-    assert_eq!(listed.tokens[0].token_id, created.token_id);
-    assert_eq!(listed.tokens[0].label, "Office iPad");
-    assert_eq!(listed.tokens[0].last_seen_at, None);
-    assert_eq!(listed.tokens[0].revoked_at, None);
-    assert_eq!(listed.tokens[0].created_at, created.created_at);
+    let created_summary = listed
+        .tokens
+        .iter()
+        .find(|token| token.token_id == created.token_id)
+        .ok_or("created token not listed")?;
+    assert_eq!(created_summary.label, "Office iPad");
+    assert_eq!(created_summary.last_seen_at, None);
+    assert_eq!(created_summary.revoked_at, None);
+    assert_eq!(created_summary.created_at, created.created_at);
 
     Ok(())
 }
@@ -109,6 +118,7 @@ async fn token_api_lists_token_metadata_without_plaintext() -> Result<(), Box<dy
 #[tokio::test]
 async fn token_api_rejects_empty_label() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db);
 
     let response = app
@@ -116,6 +126,7 @@ async fn token_api_rejects_empty_label() -> Result<(), Box<dyn std::error::Error
             HttpRequest::builder()
                 .method("POST")
                 .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, common::bearer(&auth))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"label":""}"#))?,
         )
@@ -129,14 +140,16 @@ async fn token_api_rejects_empty_label() -> Result<(), Box<dyn std::error::Error
 #[tokio::test]
 async fn token_api_revokes_token() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
     let app = kino_server::router(db.clone());
-    let created = create_token(&app, "Kitchen display").await?;
+    let created = create_token(&app, &auth, "Kitchen display").await?;
 
     let response = app
         .oneshot(
             HttpRequest::builder()
                 .method("DELETE")
                 .uri(format!("/api/v1/admin/tokens/{}", created.token_id))
+                .header(header::AUTHORIZATION, common::bearer(&auth))
                 .body(Body::empty())?,
         )
         .await?;
@@ -153,8 +166,28 @@ async fn token_api_revokes_token() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[tokio::test]
+async fn token_api_rejects_unauthenticated_list() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/admin/tokens")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
 async fn create_token(
     app: &axum::Router,
+    auth_token: &str,
     label: &str,
 ) -> Result<CreateTokenResponse, Box<dyn std::error::Error>> {
     let response = app
@@ -163,6 +196,7 @@ async fn create_token(
             HttpRequest::builder()
                 .method("POST")
                 .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, common::bearer(auth_token))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(r#"{{"label":"{label}"}}"#)))?,
         )
