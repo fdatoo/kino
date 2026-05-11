@@ -1041,6 +1041,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "utoipa",
 ]
 

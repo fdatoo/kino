@@ -11,6 +11,7 @@ use utoipa::openapi::server::Server;
         crate::request::list_catalog_items,
         crate::stream::source_file,
         crate::request::get_catalog_item_image,
+        crate::request::reocr_subtitle_track,
         crate::token::create_token,
         crate::token::list_tokens,
         crate::token::revoke_token
