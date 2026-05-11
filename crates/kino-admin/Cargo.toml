@@ -6,3 +6,12 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+axum = "0.8"
+include_dir = "0.7"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
