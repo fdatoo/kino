@@ -66,6 +66,7 @@ mod tests {
         let config = Config {
             database_path: database_path.clone(),
             library_root: PathBuf::from("/srv/media"),
+            library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
             providers: Default::default(),
@@ -79,6 +80,7 @@ mod tests {
         let db = Db::open(&Config {
             database_path,
             library_root: PathBuf::from("/srv/media"),
+            library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
             providers: Default::default(),

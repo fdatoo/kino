@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kino_core::{Id, Timestamp};
+use kino_core::{CanonicalLayoutTransfer, Config, Id, Timestamp};
 use kino_db::Db;
 use sqlx::Row;
 
@@ -20,8 +20,8 @@ pub enum Error {
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
-    /// A filesystem operation failed for a subtitle sidecar path.
-    #[error("subtitle sidecar io failed for {path}: {source}")]
+    /// A filesystem operation failed for a library path.
+    #[error("library filesystem io failed for {path}: {source}")]
     Io {
         /// Path involved in the failed operation.
         path: PathBuf,
@@ -30,11 +30,39 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// A subtitle sidecar path could not be stored as database text.
-    #[error("subtitle sidecar path is not utf-8: {path}")]
+    /// A library path could not be stored or rendered as text.
+    #[error("library path is not utf-8: {path}")]
     NonUtf8Path {
         /// Non-UTF-8 path.
         path: PathBuf,
+    },
+
+    /// A source file does not have an extension to preserve.
+    #[error("source file has no extension: {path}")]
+    MissingExtension {
+        /// Source path without an extension.
+        path: PathBuf,
+    },
+
+    /// A source path exists but is not a regular file.
+    #[error("source path is not a file: {path}")]
+    SourceNotFile {
+        /// Source path that is not a regular file.
+        path: PathBuf,
+    },
+
+    /// A canonical path already exists.
+    #[error("canonical path already exists: {path}")]
+    DestinationExists {
+        /// Existing destination path.
+        path: PathBuf,
+    },
+
+    /// A canonical path segment became empty after normalization.
+    #[error("canonical path segment {field} is empty")]
+    EmptyPathSegment {
+        /// Field used to build the segment.
+        field: &'static str,
     },
 
     /// A probed subtitle track did not include a language.
@@ -72,6 +100,180 @@ pub enum Error {
 
 /// Crate-local `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Library media target for canonical layout placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalMediaTarget {
+    /// A movie identified by display title and release year.
+    Movie {
+        /// Movie title used in the canonical path.
+        title: String,
+        /// Release year used in the canonical path.
+        year: u16,
+    },
+
+    /// A TV episode identified by show title, season, and episode number.
+    TvEpisode {
+        /// Show title used in the canonical path.
+        show_title: String,
+        /// Season number used in `Season XX` and `SXXEYY`.
+        season_number: u32,
+        /// Episode number used in `SXXEYY`.
+        episode_number: u32,
+    },
+}
+
+impl CanonicalMediaTarget {
+    /// Construct a movie canonical target.
+    pub fn movie(title: impl Into<String>, year: u16) -> Self {
+        Self::Movie {
+            title: title.into(),
+            year,
+        }
+    }
+
+    /// Construct a TV episode canonical target.
+    pub fn tv_episode(
+        show_title: impl Into<String>,
+        season_number: u32,
+        episode_number: u32,
+    ) -> Self {
+        Self::TvEpisode {
+            show_title: show_title.into(),
+            season_number,
+            episode_number,
+        }
+    }
+}
+
+/// Input for canonical layout placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalLayoutInput {
+    /// Source file accepted by ingestion.
+    pub source_path: PathBuf,
+    /// Canonical media target that determines the library path.
+    pub target: CanonicalMediaTarget,
+}
+
+impl CanonicalLayoutInput {
+    /// Construct canonical layout input.
+    pub fn new(source_path: impl Into<PathBuf>, target: CanonicalMediaTarget) -> Self {
+        Self {
+            source_path: source_path.into(),
+            target,
+        }
+    }
+}
+
+/// Result of a canonical layout placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalLayoutResult {
+    /// Original source path provided to the writer.
+    pub source_path: PathBuf,
+    /// Canonical path that now points at the media file.
+    pub canonical_path: PathBuf,
+    /// Filesystem operation used for placement.
+    pub transfer: CanonicalLayoutTransfer,
+}
+
+/// Writer that places accepted source files into Kino's canonical layout.
+#[derive(Debug, Clone)]
+pub struct CanonicalLayoutWriter {
+    library_root: PathBuf,
+    transfer: CanonicalLayoutTransfer,
+}
+
+impl CanonicalLayoutWriter {
+    /// Construct a canonical layout writer.
+    pub fn new(library_root: impl Into<PathBuf>, transfer: CanonicalLayoutTransfer) -> Self {
+        Self {
+            library_root: library_root.into(),
+            transfer,
+        }
+    }
+
+    /// Construct a canonical layout writer from process configuration.
+    pub fn from_config(config: &Config) -> Self {
+        Self::new(
+            config.library_root.clone(),
+            config.library.canonical_transfer,
+        )
+    }
+
+    /// Return the canonical path for an input without touching the filesystem.
+    pub fn canonical_path(&self, input: &CanonicalLayoutInput) -> Result<PathBuf> {
+        let extension = source_extension(&input.source_path)?;
+        match &input.target {
+            CanonicalMediaTarget::Movie { title, year } => {
+                let title = normalize_path_segment(title);
+                let title = require_path_segment("title", title)?;
+                let title_year = format!("{title} ({year})");
+
+                Ok(self
+                    .library_root
+                    .join("Movies")
+                    .join(&title_year)
+                    .join(format!("{title_year}.{extension}")))
+            }
+            CanonicalMediaTarget::TvEpisode {
+                show_title,
+                season_number,
+                episode_number,
+            } => {
+                let show_title = normalize_path_segment(show_title);
+                let show_title = require_path_segment("show_title", show_title)?;
+                let season = format!("{season_number:02}");
+                let episode = format!("{episode_number:02}");
+
+                Ok(self
+                    .library_root
+                    .join("TV")
+                    .join(&show_title)
+                    .join(format!("Season {season}"))
+                    .join(format!("{show_title} - S{season}E{episode}.{extension}")))
+            }
+        }
+    }
+
+    /// Place a source file at its canonical path.
+    pub async fn place(&self, input: CanonicalLayoutInput) -> Result<CanonicalLayoutResult> {
+        let metadata = tokio::fs::metadata(&input.source_path)
+            .await
+            .map_err(|source| Error::Io {
+                path: input.source_path.clone(),
+                source,
+            })?;
+        if !metadata.is_file() {
+            return Err(Error::SourceNotFile {
+                path: input.source_path,
+            });
+        }
+
+        let canonical_path = self.canonical_path(&input)?;
+        let parent = canonical_path.parent().unwrap_or_else(|| Path::new(""));
+        create_dir_all(parent).await?;
+        if try_exists(&canonical_path).await? {
+            return Err(Error::DestinationExists {
+                path: canonical_path,
+            });
+        }
+
+        match self.transfer {
+            CanonicalLayoutTransfer::HardLink => {
+                hard_link(&input.source_path, &canonical_path).await?;
+            }
+            CanonicalLayoutTransfer::Move => {
+                rename(&input.source_path, &canonical_path).await?;
+            }
+        }
+
+        Ok(CanonicalLayoutResult {
+            source_path: input.source_path,
+            canonical_path,
+            transfer: self.transfer,
+        })
+    }
+}
 
 /// Subtitle formats discovered by the probe step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -342,6 +544,33 @@ async fn create_dir_all(path: &Path) -> Result<()> {
         })
 }
 
+async fn try_exists(path: &Path) -> Result<bool> {
+    tokio::fs::try_exists(path)
+        .await
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+async fn hard_link(source: &Path, destination: &Path) -> Result<()> {
+    tokio::fs::hard_link(source, destination)
+        .await
+        .map_err(|source| Error::Io {
+            path: destination.to_path_buf(),
+            source,
+        })
+}
+
+async fn rename(source: &Path, destination: &Path) -> Result<()> {
+    tokio::fs::rename(source, destination)
+        .await
+        .map_err(|source| Error::Io {
+            path: destination.to_path_buf(),
+            source,
+        })
+}
+
 async fn write_sidecar(path: &Path, text: &str) -> Result<()> {
     tokio::fs::write(path, text.as_bytes())
         .await
@@ -349,6 +578,49 @@ async fn write_sidecar(path: &Path, text: &str) -> Result<()> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn source_extension(path: &Path) -> Result<&str> {
+    let extension = path.extension().ok_or_else(|| Error::MissingExtension {
+        path: path.to_path_buf(),
+    })?;
+
+    extension.to_str().ok_or_else(|| Error::NonUtf8Path {
+        path: path.to_path_buf(),
+    })
+}
+
+fn normalize_path_segment(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut previous_was_space = false;
+
+    for ch in value.trim().chars() {
+        let replacement = if ch == '/' || ch == '\\' || ch.is_control() {
+            ' '
+        } else {
+            ch
+        };
+
+        if replacement.is_whitespace() {
+            if !previous_was_space {
+                normalized.push(' ');
+                previous_was_space = true;
+            }
+        } else {
+            normalized.push(replacement);
+            previous_was_space = false;
+        }
+    }
+
+    normalized.trim().to_owned()
+}
+
+fn require_path_segment(field: &'static str, value: String) -> Result<String> {
+    if value.is_empty() {
+        return Err(Error::EmptyPathSegment { field });
+    }
+
+    Ok(value)
 }
 
 fn normalize_language(language: &str, track_index: u32) -> Result<String> {
@@ -392,6 +664,100 @@ fn path_to_db_text(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hard_links_movie_into_canonical_layout()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let library_root = tempfile::tempdir()?;
+        let source = library_root.path().join("incoming.mkv");
+        tokio::fs::write(&source, b"movie bytes").await?;
+        let writer =
+            CanonicalLayoutWriter::new(library_root.path(), CanonicalLayoutTransfer::HardLink);
+
+        let result = writer
+            .place(CanonicalLayoutInput::new(
+                &source,
+                CanonicalMediaTarget::movie("The Matrix", 1999),
+            ))
+            .await?;
+        let expected = library_root
+            .path()
+            .join("Movies")
+            .join("The Matrix (1999)")
+            .join("The Matrix (1999).mkv");
+
+        assert_eq!(result.canonical_path, expected);
+        assert_eq!(result.transfer, CanonicalLayoutTransfer::HardLink);
+        assert!(source.exists());
+        assert_eq!(tokio::fs::read(&source).await?, b"movie bytes");
+        assert_eq!(
+            tokio::fs::read(&result.canonical_path).await?,
+            b"movie bytes"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn moves_tv_episode_into_canonical_layout()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let library_root = tempfile::tempdir()?;
+        let source = library_root.path().join("episode.mkv");
+        tokio::fs::write(&source, b"episode bytes").await?;
+        let writer = CanonicalLayoutWriter::new(library_root.path(), CanonicalLayoutTransfer::Move);
+
+        let result = writer
+            .place(CanonicalLayoutInput::new(
+                &source,
+                CanonicalMediaTarget::tv_episode("Twin/Peaks", 2, 3),
+            ))
+            .await?;
+        let expected = library_root
+            .path()
+            .join("TV")
+            .join("Twin Peaks")
+            .join("Season 02")
+            .join("Twin Peaks - S02E03.mkv");
+
+        assert_eq!(result.canonical_path, expected);
+        assert_eq!(result.transfer, CanonicalLayoutTransfer::Move);
+        assert!(!source.exists());
+        assert_eq!(
+            tokio::fs::read(&result.canonical_path).await?,
+            b"episode bytes"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_to_overwrite_existing_canonical_path()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let library_root = tempfile::tempdir()?;
+        let source = library_root.path().join("movie.mkv");
+        tokio::fs::write(&source, b"new bytes").await?;
+        let writer =
+            CanonicalLayoutWriter::new(library_root.path(), CanonicalLayoutTransfer::HardLink);
+        let input = CanonicalLayoutInput::new(&source, CanonicalMediaTarget::movie("Alien", 1979));
+        let destination = writer.canonical_path(&input)?;
+        let parent = match destination.parent() {
+            Some(parent) => parent,
+            None => panic!("destination should have a parent"),
+        };
+        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::write(&destination, b"existing").await?;
+
+        let result = writer.place(input).await;
+        let Err(err) = result else {
+            panic!("existing destination should fail");
+        };
+
+        assert!(matches!(err, Error::DestinationExists { .. }));
+        assert_eq!(tokio::fs::read(&source).await?, b"new bytes");
+        assert_eq!(tokio::fs::read(&destination).await?, b"existing");
+
+        Ok(())
+    }
 
     async fn insert_personal_media_item(db: &Db) -> std::result::Result<Id, sqlx::Error> {
         let id = Id::new();

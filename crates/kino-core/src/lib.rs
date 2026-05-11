@@ -11,7 +11,7 @@ pub mod request;
 pub mod time;
 pub mod tracing;
 
-pub use config::Config;
+pub use config::{CanonicalLayoutTransfer, Config, LibraryConfig};
 pub use id::Id;
 pub use identity::{
     CanonicalIdentity, CanonicalIdentityId, CanonicalIdentityKind, CanonicalIdentityProvider,

@@ -27,6 +27,11 @@ pub struct Config {
     /// Root directory of the on-disk media library. Required.
     pub library_root: PathBuf,
 
+    /// Library behavior settings. Optional; defaults documented on
+    /// [`LibraryConfig`].
+    #[serde(default)]
+    pub library: LibraryConfig,
+
     /// HTTP/gRPC server settings. Optional; defaults documented on
     /// [`ServerConfig`].
     #[serde(default)]
@@ -62,6 +67,28 @@ pub enum LogFormat {
 
     /// Newline-delimited JSON formatter for production.
     Json,
+}
+
+/// Library behavior settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryConfig {
+    /// Filesystem operation used when placing canonical media files. Defaults
+    /// to [`CanonicalLayoutTransfer::HardLink`].
+    #[serde(default)]
+    pub canonical_transfer: CanonicalLayoutTransfer,
+}
+
+/// Filesystem operation used by the canonical layout writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalLayoutTransfer {
+    /// Create a hard link at the canonical path and preserve the original.
+    #[default]
+    HardLink,
+
+    /// Move the source file into the canonical path.
+    Move,
 }
 
 /// HTTP/gRPC server settings.
@@ -478,6 +505,9 @@ mod tests {
                 library_root = "{}"
                 log_level = "debug"
 
+                [library]
+                canonical_transfer = "move"
+
                 [server]
                 listen = "0.0.0.0:9000"
 
@@ -513,6 +543,10 @@ mod tests {
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.database_path, fixture.database_path);
             assert_eq!(cfg.library_root, fixture.library_root);
+            assert_eq!(
+                cfg.library.canonical_transfer,
+                CanonicalLayoutTransfer::Move
+            );
             assert_eq!(cfg.log_level, "debug");
             assert_eq!(cfg.log_format, LogFormat::Pretty);
             assert_eq!(cfg.tmdb.api_key.as_deref(), Some("test-api-key"));
@@ -550,6 +584,10 @@ mod tests {
             );
             assert_eq!(cfg.tmdb.api_key, None);
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
+            assert_eq!(
+                cfg.library.canonical_transfer,
+                CanonicalLayoutTransfer::HardLink
+            );
             assert!(cfg.providers.disc_rip.is_none());
             assert!(cfg.providers.watch_folder.is_none());
             Ok(())
@@ -648,6 +686,22 @@ mod tests {
             jail.set_env("KINO_TMDB__API_KEY", "env-api-key");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.tmdb.api_key.as_deref(), Some("env-api-key"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_library_canonical_transfer() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_LIBRARY__CANONICAL_TRANSFER", "move");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(
+                cfg.library.canonical_transfer,
+                CanonicalLayoutTransfer::Move
+            );
             Ok(())
         });
     }

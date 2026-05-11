@@ -190,6 +190,7 @@ mod tests {
         Config {
             database_path: PathBuf::from("/db"),
             library_root: PathBuf::from("/lib"),
+            library: Default::default(),
             server: ServerConfig::default(),
             tmdb: TmdbConfig::default(),
             providers: Default::default(),

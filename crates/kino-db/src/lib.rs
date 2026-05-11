@@ -601,6 +601,7 @@ mod tests {
         Config {
             database_path,
             library_root: PathBuf::from("/srv/media"),
+            library: Default::default(),
             server: Default::default(),
             tmdb: Default::default(),
             providers: Default::default(),
