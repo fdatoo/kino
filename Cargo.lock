@@ -911,6 +911,14 @@ dependencies = [
 [[package]]
 name = "kino-library"
 version = "0.1.0"
+dependencies = [
+ "kino-core",
+ "kino-db",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "kino-server"

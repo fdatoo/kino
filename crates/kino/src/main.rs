@@ -103,6 +103,7 @@ mod tests {
                 (7, String::from("canonical identities")),
                 (8, String::from("request fulfillment plans")),
                 (9, String::from("minimal media items")),
+                (10, String::from("subtitle sidecars")),
             ]
         );
 
