@@ -12,6 +12,7 @@ use kino_db::Db;
 mod admin_config;
 pub mod auth;
 mod openapi;
+mod playback;
 mod request;
 pub mod session_reaper;
 mod token;
@@ -52,23 +53,13 @@ pub fn router_with_library_root_and_public_base_url(
     library_root: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Router {
-    let server = ServerConfig {
-        public_base_url: public_base_url.into(),
-        ..ServerConfig::default()
-    };
-    router_with_config(
+    let library_root = library_root.into();
+    let artwork_cache_dir = kino_core::config::default_artwork_cache_dir(&library_root);
+    router_with_library_root_artwork_cache_and_public_base_url(
         db,
-        Config {
-            database_path: PathBuf::from("kino.db"),
-            library_root: library_root.into(),
-            library: kino_core::LibraryConfig::default(),
-            server,
-            tmdb: kino_core::config::TmdbConfig::default(),
-            ocr: kino_core::OcrConfig::default(),
-            providers: kino_core::config::ProvidersConfig::default(),
-            log_level: "info".to_owned(),
-            log_format: LogFormat::Pretty,
-        },
+        library_root,
+        artwork_cache_dir,
+        public_base_url,
     )
 }
 
@@ -77,10 +68,12 @@ pub fn router_with_config(db: Db, config: Config) -> Router {
     let auth_state = auth::AuthState { db: db.clone() };
     let public_base_url = config.server.public_base_url.clone();
     let library_root = config.library_root.clone();
+    let artwork_cache_dir = config.artwork_cache_dir();
     let protected_api = Router::new()
-        .merge(request::router(db.clone(), library_root))
-        .merge(token::router(db))
+        .merge(request::router(db.clone(), library_root, artwork_cache_dir))
+        .merge(token::router(db.clone()))
         .merge(admin_config::router(config))
+        .merge(playback::router(db))
         .route_layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_auth,
@@ -128,13 +121,68 @@ pub async fn serve_with_library_root_and_public_base_url(
     library_root: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Result<()> {
+    let library_root = library_root.into();
+    let artwork_cache_dir = kino_core::config::default_artwork_cache_dir(&library_root);
+    serve_with_library_root_artwork_cache_and_public_base_url(
+        listen,
+        db,
+        library_root,
+        artwork_cache_dir,
+        public_base_url,
+    )
+    .await
+}
+
+/// Serve the Kino HTTP API with explicit library, artwork cache, and OpenAPI settings.
+pub async fn serve_with_library_root_artwork_cache_and_public_base_url(
+    listen: SocketAddr,
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    artwork_cache_dir: impl Into<PathBuf>,
+    public_base_url: impl Into<String>,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(listen = %local_addr, "server listening");
     axum::serve(
         listener,
-        router_with_library_root_and_public_base_url(db, library_root, public_base_url),
+        router_with_library_root_artwork_cache_and_public_base_url(
+            db,
+            library_root,
+            artwork_cache_dir,
+            public_base_url,
+        ),
     )
     .await?;
     Ok(())
+}
+
+/// Build the Kino HTTP router with explicit library, artwork cache, and OpenAPI settings.
+pub fn router_with_library_root_artwork_cache_and_public_base_url(
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    artwork_cache_dir: impl Into<PathBuf>,
+    public_base_url: impl Into<String>,
+) -> Router {
+    let server = ServerConfig {
+        public_base_url: public_base_url.into(),
+        ..ServerConfig::default()
+    };
+    router_with_config(
+        db,
+        Config {
+            database_path: PathBuf::from("kino.db"),
+            library_root: library_root.into(),
+            library: kino_core::LibraryConfig {
+                artwork_cache_dir: Some(artwork_cache_dir.into()),
+                ..kino_core::LibraryConfig::default()
+            },
+            server,
+            tmdb: kino_core::config::TmdbConfig::default(),
+            ocr: kino_core::OcrConfig::default(),
+            providers: kino_core::config::ProvidersConfig::default(),
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Pretty,
+        },
+    )
 }
