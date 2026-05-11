@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
 pub mod subtitle_image_extraction;
 pub mod subtitle_ocr;
 pub mod subtitle_reocr;
@@ -22,7 +24,7 @@ use kino_core::{
     Config, Id, MediaItemKind, Timestamp, TranscodeOutput, VariantCapabilities, VariantKind,
 };
 use kino_db::Db;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -279,6 +281,14 @@ pub enum Error {
         /// Maximum accepted offset.
         max: u64,
     },
+
+    /// A catalog cursor could not be decoded for the requested sort.
+    #[error("invalid catalog list cursor")]
+    InvalidCatalogListCursor,
+
+    /// A watched-state filter was requested without user context.
+    #[error("catalog watched filter requires a user id")]
+    CatalogWatchedFilterRequiresUser,
 
     /// A positive catalog number could not fit into the public type.
     #[error("invalid catalog {field} value: {value}")]
@@ -759,11 +769,32 @@ impl MetadataService {
     }
 }
 
+/// Sort order for catalog item listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSort {
+    /// Newest media items first.
+    #[default]
+    RecentlyAdded,
+    /// Title ascending, case-insensitive, with media-item id as a tie-breaker.
+    Title,
+    /// Release year descending, with media-item id as a tie-breaker.
+    Year,
+}
+
 /// Query filters and pagination for catalog item listing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogListQuery {
     /// Optional media kind filter.
-    pub media_kind: Option<MediaItemKind>,
+    pub kind: Option<MediaItemKind>,
+    /// Optional release-year filter.
+    pub year: Option<i32>,
+    /// Optional watched-state filter for `user_id`.
+    pub watched: Option<bool>,
+    /// User context for per-user catalog filters.
+    pub user_id: Option<Id>,
+    /// Explicit stable catalog sort order.
+    pub sort: Option<CatalogSort>,
     /// Optional full-text search across metadata title and cast names.
     pub search: Option<String>,
     /// Optional case-insensitive metadata title substring filter.
@@ -774,6 +805,8 @@ pub struct CatalogListQuery {
     pub limit: Option<u32>,
     /// Number of matching items to skip.
     pub offset: Option<u64>,
+    /// Opaque cursor returned by a previous list page.
+    pub cursor: Option<String>,
 }
 
 impl CatalogListQuery {
@@ -784,7 +817,26 @@ impl CatalogListQuery {
 
     /// Filter by media item kind.
     pub const fn with_media_kind(mut self, media_kind: MediaItemKind) -> Self {
-        self.media_kind = Some(media_kind);
+        self.kind = Some(media_kind);
+        self
+    }
+
+    /// Filter by release year.
+    pub const fn with_year(mut self, year: i32) -> Self {
+        self.year = Some(year);
+        self
+    }
+
+    /// Filter by watched state for the given user.
+    pub const fn with_watched_for_user(mut self, watched: bool, user_id: Id) -> Self {
+        self.watched = Some(watched);
+        self.user_id = Some(user_id);
+        self
+    }
+
+    /// Sort catalog items.
+    pub const fn with_sort(mut self, sort: CatalogSort) -> Self {
+        self.sort = Some(sort);
         self
     }
 
@@ -817,6 +869,12 @@ impl CatalogListQuery {
         self.offset = Some(offset);
         self
     }
+
+    /// Continue after a cursor returned by a previous page.
+    pub fn with_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.cursor = Some(cursor.into());
+        self
+    }
 }
 
 /// One page of catalog media items.
@@ -826,6 +884,8 @@ pub struct CatalogListPage {
     pub items: Vec<CatalogMediaItem>,
     /// Offset to request the next page, when more matches exist.
     pub next_offset: Option<u64>,
+    /// Cursor to request the next page, when more matches exist.
+    pub next_cursor: Option<String>,
 }
 
 /// Catalog projection for one media item.
@@ -998,20 +1058,38 @@ impl CatalogService {
         Ok(output)
     }
 
-    /// List media items using filters and offset pagination.
+    /// List media items using filters and offset or cursor pagination.
     pub async fn list(&self, query: CatalogListQuery) -> Result<CatalogListPage> {
         let limit = validated_catalog_limit(query.limit)?;
         let offset = validated_catalog_offset(query.offset)?;
+        if query.watched.is_some() && query.user_id.is_none() {
+            return Err(Error::CatalogWatchedFilterRequiresUser);
+        }
+        let sort = query.sort.unwrap_or_default();
+        let cursor = query
+            .cursor
+            .as_deref()
+            .map(|cursor| decode_catalog_cursor(cursor, sort))
+            .transpose()?;
         let fetch_limit = limit + 1;
-        let rows = self.fetch_media_items(&query, fetch_limit, offset).await?;
+        let mut rows = self
+            .fetch_media_items(&query, sort, cursor.as_ref(), fetch_limit, offset)
+            .await?;
+        let has_next = rows.len() > limit as usize;
+        if has_next {
+            rows.truncate(limit as usize);
+        }
+        let next_cursor = if has_next {
+            rows.last()
+                .map(|row| encode_catalog_cursor_from_row(row, sort))
+                .transpose()?
+        } else {
+            None
+        };
         let mut items = rows
             .iter()
             .map(catalog_media_item_from_row)
             .collect::<Result<Vec<_>>>()?;
-        let has_next = items.len() > limit as usize;
-        if has_next {
-            items.truncate(limit as usize);
-        }
         self.attach_source_files(&mut items).await?;
         self.attach_subtitle_tracks(&mut items).await?;
         self.attach_metadata_cast(&mut items).await?;
@@ -1022,7 +1100,11 @@ impl CatalogService {
             None
         };
 
-        Ok(CatalogListPage { items, next_offset })
+        Ok(CatalogListPage {
+            items,
+            next_offset,
+            next_cursor,
+        })
     }
 
     /// Get one media item by id.
@@ -1103,6 +1185,8 @@ impl CatalogService {
     async fn fetch_media_items(
         &self,
         query: &CatalogListQuery,
+        sort: CatalogSort,
+        cursor: Option<&CatalogCursorToken>,
         limit: u32,
         offset: u64,
     ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
@@ -1118,6 +1202,10 @@ impl CatalogService {
                 media_items.episode_number,
                 media_items.created_at,
                 media_items.updated_at,
+                CASE
+                    WHEN media_metadata_cache.release_date GLOB '[0-9][0-9][0-9][0-9]*'
+                        THEN CAST(substr(media_metadata_cache.release_date, 1, 4) AS INTEGER)
+                END AS release_year,
                 media_metadata_cache.title,
                 media_metadata_cache.description,
                 media_metadata_cache.release_date,
@@ -1148,9 +1236,60 @@ impl CatalogService {
             "#,
         );
 
-        if let Some(media_kind) = query.media_kind {
+        if let Some(media_kind) = query.kind {
             builder.push(" AND media_items.media_kind = ");
             builder.push_bind(media_kind.as_str());
+        }
+
+        if let Some(year) = query.year {
+            builder.push(
+                r#"
+                AND CASE
+                    WHEN media_metadata_cache.release_date GLOB '[0-9][0-9][0-9][0-9]*'
+                        THEN CAST(substr(media_metadata_cache.release_date, 1, 4) AS INTEGER)
+                END =
+                "#,
+            );
+            builder.push_bind(year);
+        }
+
+        if let Some(watched) = query.watched {
+            let user_id = query
+                .user_id
+                .ok_or(Error::CatalogWatchedFilterRequiresUser)?;
+            if watched {
+                builder.push(
+                    r#"
+                    AND EXISTS (
+                        SELECT 1
+                        FROM watched
+                        WHERE watched.user_id =
+                    "#,
+                );
+                builder.push_bind(user_id);
+                builder.push(
+                    r#"
+                            AND watched.media_item_id = media_items.id
+                    )
+                    "#,
+                );
+            } else {
+                builder.push(
+                    r#"
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM watched
+                        WHERE watched.user_id =
+                    "#,
+                );
+                builder.push_bind(user_id);
+                builder.push(
+                    r#"
+                            AND watched.media_item_id = media_items.id
+                    )
+                    "#,
+                );
+            }
         }
 
         if let Some(search) = search {
@@ -1193,11 +1332,12 @@ impl CatalogService {
             }
         }
 
-        if has_search {
-            builder.push(" ORDER BY bm25(media_items_fts, 8.0, 1.0), media_items.created_at, media_items.id LIMIT ");
-        } else {
-            builder.push(" ORDER BY media_items.created_at, media_items.id LIMIT ");
+        if let Some(cursor) = cursor {
+            push_catalog_cursor_filter(&mut builder, sort, cursor)?;
         }
+
+        push_catalog_order(&mut builder, sort);
+        builder.push(" LIMIT ");
         builder.push_bind(i64::from(limit));
         builder.push(" OFFSET ");
         builder.push_bind(
@@ -3015,6 +3155,163 @@ fn validated_catalog_offset(offset: Option<u64>) -> Result<u64> {
     Ok(offset)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "sort", rename_all = "snake_case")]
+enum CatalogCursorToken {
+    RecentlyAdded { created_at: Timestamp, id: Id },
+    Title { title: String, id: Id },
+    Year { year: Option<i32>, id: Id },
+}
+
+fn decode_catalog_cursor(cursor: &str, sort: CatalogSort) -> Result<CatalogCursorToken> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| Error::InvalidCatalogListCursor)?;
+    let token: CatalogCursorToken =
+        serde_json::from_slice(&bytes).map_err(|_| Error::InvalidCatalogListCursor)?;
+    if cursor_sort(&token) != sort {
+        return Err(Error::InvalidCatalogListCursor);
+    }
+
+    Ok(token)
+}
+
+fn encode_catalog_cursor_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    sort: CatalogSort,
+) -> Result<String> {
+    let token = match sort {
+        CatalogSort::RecentlyAdded => CatalogCursorToken::RecentlyAdded {
+            created_at: row.try_get("created_at")?,
+            id: row.try_get("id")?,
+        },
+        CatalogSort::Title => {
+            let title: Option<String> = row.try_get("title")?;
+            CatalogCursorToken::Title {
+                title: normalized_catalog_title_key(title.as_deref()),
+                id: row.try_get("id")?,
+            }
+        }
+        CatalogSort::Year => CatalogCursorToken::Year {
+            year: row.try_get("release_year")?,
+            id: row.try_get("id")?,
+        },
+    };
+    let bytes = serde_json::to_vec(&token)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn cursor_sort(cursor: &CatalogCursorToken) -> CatalogSort {
+    match cursor {
+        CatalogCursorToken::RecentlyAdded { .. } => CatalogSort::RecentlyAdded,
+        CatalogCursorToken::Title { .. } => CatalogSort::Title,
+        CatalogCursorToken::Year { .. } => CatalogSort::Year,
+    }
+}
+
+fn push_catalog_cursor_filter(
+    builder: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>,
+    sort: CatalogSort,
+    cursor: &CatalogCursorToken,
+) -> Result<()> {
+    match (sort, cursor) {
+        (CatalogSort::RecentlyAdded, CatalogCursorToken::RecentlyAdded { created_at, id }) => {
+            builder.push(" AND (media_items.created_at < ");
+            builder.push_bind(*created_at);
+            builder.push(" OR (media_items.created_at = ");
+            builder.push_bind(*created_at);
+            builder.push(" AND media_items.id < ");
+            builder.push_bind(*id);
+            builder.push(")) ");
+        }
+        (CatalogSort::Title, CatalogCursorToken::Title { title, id }) => {
+            builder.push(" AND (lower(COALESCE(media_metadata_cache.title, '')) > ");
+            builder.push_bind(title.clone());
+            builder.push(" OR (lower(COALESCE(media_metadata_cache.title, '')) = ");
+            builder.push_bind(title.clone());
+            builder.push(" AND media_items.id > ");
+            builder.push_bind(*id);
+            builder.push(")) ");
+        }
+        (
+            CatalogSort::Year,
+            CatalogCursorToken::Year {
+                year: Some(year),
+                id,
+            },
+        ) => {
+            builder.push(
+                r#"
+                AND (
+                    CASE
+                        WHEN media_metadata_cache.release_date GLOB '[0-9][0-9][0-9][0-9]*'
+                            THEN CAST(substr(media_metadata_cache.release_date, 1, 4) AS INTEGER)
+                    END <
+                "#,
+            );
+            builder.push_bind(*year);
+            builder.push(
+                r#"
+                    OR CASE
+                        WHEN media_metadata_cache.release_date GLOB '[0-9][0-9][0-9][0-9]*'
+                            THEN CAST(substr(media_metadata_cache.release_date, 1, 4) AS INTEGER)
+                    END IS NULL
+                    OR (
+                        CASE
+                            WHEN media_metadata_cache.release_date GLOB '[0-9][0-9][0-9][0-9]*'
+                                THEN CAST(substr(media_metadata_cache.release_date, 1, 4) AS INTEGER)
+                        END =
+                "#,
+            );
+            builder.push_bind(*year);
+            builder.push(" AND media_items.id < ");
+            builder.push_bind(*id);
+            builder.push(")) ");
+        }
+        (CatalogSort::Year, CatalogCursorToken::Year { year: None, id }) => {
+            builder.push(
+                r#"
+                AND CASE
+                    WHEN media_metadata_cache.release_date GLOB '[0-9][0-9][0-9][0-9]*'
+                        THEN CAST(substr(media_metadata_cache.release_date, 1, 4) AS INTEGER)
+                END IS NULL
+                AND media_items.id <
+                "#,
+            );
+            builder.push_bind(*id);
+        }
+        _ => return Err(Error::InvalidCatalogListCursor),
+    }
+
+    Ok(())
+}
+
+fn push_catalog_order(builder: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, sort: CatalogSort) {
+    match sort {
+        CatalogSort::RecentlyAdded => {
+            builder.push(" ORDER BY media_items.created_at DESC, media_items.id DESC");
+        }
+        CatalogSort::Title => {
+            builder
+                .push(" ORDER BY lower(COALESCE(media_metadata_cache.title, '')), media_items.id");
+        }
+        CatalogSort::Year => {
+            builder.push(
+                r#"
+                ORDER BY CASE
+                    WHEN media_metadata_cache.release_date GLOB '[0-9][0-9][0-9][0-9]*'
+                        THEN CAST(substr(media_metadata_cache.release_date, 1, 4) AS INTEGER)
+                END DESC, media_items.id DESC
+                "#,
+            );
+        }
+    }
+}
+
+fn normalized_catalog_title_key(title: Option<&str>) -> String {
+    title.unwrap_or_default().to_lowercase()
+}
+
 fn like_contains_pattern(value: &str) -> String {
     let mut pattern = String::with_capacity(value.len() + 2);
     pattern.push('%');
@@ -3816,7 +4113,7 @@ mod tests {
             .await?;
         assert_eq!(
             movies.items.iter().map(|item| item.id).collect::<Vec<_>>(),
-            vec![fight_club, matrix]
+            vec![matrix, fight_club]
         );
 
         let title_match = service
@@ -3884,6 +4181,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_filters_sorts_and_cursor_paginates()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let dune_identity = movie_identity(438631);
+        let matrix_identity = movie_identity(603);
+        let show_identity = tv_identity(1396);
+        let dune = insert_tmdb_media_item(&db, dune_identity).await?;
+        let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
+        let show = insert_tmdb_media_item(&db, show_identity).await?;
+        insert_catalog_title_with_release_date(
+            &db,
+            dune,
+            dune_identity,
+            "Dune",
+            Some("2021-10-22"),
+        )
+        .await?;
+        insert_catalog_title_with_release_date(
+            &db,
+            matrix,
+            matrix_identity,
+            "The Matrix",
+            Some("1999-03-31"),
+        )
+        .await?;
+        insert_catalog_title_with_release_date(
+            &db,
+            show,
+            show_identity,
+            "Breaking Bad",
+            Some("2020-01-01"),
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO watched (user_id, media_item_id, watched_at, source)
+            VALUES (?1, ?2, ?3, 'manual')
+            "#,
+        )
+        .bind(kino_core::user::SEEDED_USER_ID)
+        .bind(matrix)
+        .bind(Timestamp::now())
+        .execute(db.write_pool())
+        .await?;
+        let service = CatalogService::new(db);
+
+        let movies = service
+            .list(CatalogListQuery::new().with_media_kind(MediaItemKind::Movie))
+            .await?;
+        assert!(
+            movies
+                .items
+                .iter()
+                .all(|item| item.media_kind == MediaItemKind::Movie)
+        );
+
+        let released_in_2020 = service
+            .list(CatalogListQuery::new().with_year(2020))
+            .await?;
+        assert_eq!(
+            released_in_2020
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![show]
+        );
+
+        let watched = service
+            .list(
+                CatalogListQuery::new()
+                    .with_watched_for_user(true, kino_core::user::SEEDED_USER_ID),
+            )
+            .await?;
+        assert_eq!(
+            watched.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![matrix]
+        );
+
+        let first_page = service
+            .list(
+                CatalogListQuery::new()
+                    .with_sort(CatalogSort::Title)
+                    .with_limit(2),
+            )
+            .await?;
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![show, dune]
+        );
+        let cursor = first_page
+            .next_cursor
+            .as_deref()
+            .ok_or("title page should include next cursor")?;
+
+        let second_page = service
+            .list(
+                CatalogListQuery::new()
+                    .with_sort(CatalogSort::Title)
+                    .with_limit(2)
+                    .with_cursor(cursor),
+            )
+            .await?;
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![matrix]
+        );
+        assert_eq!(second_page.next_cursor, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn catalog_get_returns_internal_artwork_url()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
@@ -3933,7 +4351,7 @@ mod tests {
             .list(CatalogListQuery::new().with_search("matr"))
             .await?;
         assert_eq!(partial_title.items.len(), 2);
-        assert_eq!(partial_title.items[0].id, matrix);
+        assert!(partial_title.items.iter().any(|item| item.id == matrix));
 
         let folded = service
             .list(CatalogListQuery::new().with_search("cafe"))
@@ -4109,6 +4527,23 @@ mod tests {
         canonical_identity_id: CanonicalIdentityId,
         title: &str,
     ) -> std::result::Result<(), sqlx::Error> {
+        insert_catalog_title_with_release_date(
+            db,
+            media_item_id,
+            canonical_identity_id,
+            title,
+            None,
+        )
+        .await
+    }
+
+    async fn insert_catalog_title_with_release_date(
+        db: &Db,
+        media_item_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
+        title: &str,
+        release_date: Option<&str>,
+    ) -> std::result::Result<(), sqlx::Error> {
         let now = Timestamp::now();
 
         sqlx::query(
@@ -4128,15 +4563,16 @@ mod tests {
                 logo_local_path,
                 metadata_path,
                 created_at,
-                updated_at
-            )
-            VALUES (?1, ?2, ?3, ?4, 'description', NULL, '', 'poster.jpg', '', 'backdrop.jpg', NULL, NULL, 'metadata.json', ?5, ?6)
+            updated_at
+        )
+            VALUES (?1, ?2, ?3, ?4, 'description', ?5, '', 'poster.jpg', '', 'backdrop.jpg', NULL, NULL, 'metadata.json', ?6, ?7)
             "#,
         )
         .bind(media_item_id)
         .bind(canonical_identity_id)
         .bind(canonical_identity_id.provider().as_str())
         .bind(title)
+        .bind(release_date)
         .bind(now)
         .bind(now)
         .execute(db.write_pool())

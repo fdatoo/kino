@@ -5,7 +5,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::QueryRejection},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,9 +20,11 @@ use kino_fulfillment::{
 };
 use kino_library::{
     CatalogArtworkKind, CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService,
-    LibraryScanReport, LibraryScanService, ReocrJob, SubtitleReocrService,
+    CatalogSort, LibraryScanReport, LibraryScanService, ReocrJob, SubtitleReocrService,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::auth::AuthenticatedUser;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -58,9 +60,17 @@ pub(crate) struct ListRequestsQuery {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListCatalogItemsQuery {
     /// Media item kind to include.
+    pub(crate) kind: Option<String>,
+    /// Legacy media item kind query parameter.
     #[serde(rename = "type")]
     #[param(rename = "type")]
     pub(crate) media_type: Option<String>,
+    /// Release year to include.
+    pub(crate) year: Option<i32>,
+    /// Watched-state filter for the current user.
+    pub(crate) watched: Option<bool>,
+    /// Stable sort order: recently_added, title, or year.
+    pub(crate) sort: Option<String>,
     /// Full-text search across title and cast names.
     pub(crate) search: Option<String>,
     /// Case-insensitive title substring.
@@ -71,6 +81,8 @@ pub(crate) struct ListCatalogItemsQuery {
     pub(crate) limit: Option<u32>,
     /// Number of matching items to skip.
     pub(crate) offset: Option<u64>,
+    /// Opaque cursor returned by the previous page.
+    pub(crate) cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -406,11 +418,24 @@ pub(crate) async fn reocr_subtitle_track(
 )]
 pub(crate) async fn list_catalog_items(
     State(state): State<AppState>,
-    Query(query): Query<ListCatalogItemsQuery>,
+    AuthenticatedUser { user, .. }: AuthenticatedUser,
+    query: Result<Query<ListCatalogItemsQuery>, QueryRejection>,
 ) -> ApiResult<Json<CatalogListPage>> {
+    let Query(query) = query.map_err(invalid_catalog_query)?;
     let mut catalog_query = CatalogListQuery::new();
-    if let Some(media_type) = query.media_type {
-        catalog_query = catalog_query.with_media_kind(parse_media_item_kind(&media_type)?);
+    if let Some(media_kind) =
+        parse_catalog_kind(query.kind.as_deref(), query.media_type.as_deref())?
+    {
+        catalog_query = catalog_query.with_media_kind(media_kind);
+    }
+    if let Some(year) = query.year {
+        catalog_query = catalog_query.with_year(year);
+    }
+    if let Some(watched) = query.watched {
+        catalog_query = catalog_query.with_watched_for_user(watched, user.id);
+    }
+    if let Some(sort) = query.sort {
+        catalog_query = catalog_query.with_sort(parse_catalog_sort(&sort)?);
     }
     if let Some(search) = query.search {
         catalog_query = catalog_query.with_search(search);
@@ -426,6 +451,9 @@ pub(crate) async fn list_catalog_items(
     }
     if let Some(offset) = query.offset {
         catalog_query = catalog_query.with_offset(offset);
+    }
+    if let Some(cursor) = query.cursor {
+        catalog_query = catalog_query.with_cursor(cursor);
     }
 
     let page = state.catalog.list(catalog_query).await?;
@@ -516,6 +544,12 @@ pub(crate) enum ApiError {
     #[error("invalid media item type: {value}")]
     InvalidMediaItemType { value: String },
 
+    #[error("invalid catalog sort: {value}")]
+    InvalidCatalogSort { value: String },
+
+    #[error("invalid catalog query: {reason}")]
+    InvalidCatalogQuery { reason: String },
+
     #[error("artwork image not found")]
     ArtworkNotFound,
 
@@ -582,7 +616,13 @@ impl IntoResponse for ApiError {
             Self::Library(kino_library::Error::InvalidCatalogListOffset { .. }) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::Library(kino_library::Error::InvalidCatalogListCursor) => StatusCode::BAD_REQUEST,
+            Self::Library(kino_library::Error::CatalogWatchedFilterRequiresUser) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::InvalidMediaItemType { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidCatalogSort { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidCatalogQuery { .. } => StatusCode::BAD_REQUEST,
             Self::ArtworkNotFound => StatusCode::NOT_FOUND,
             Self::ArtworkRead { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
                 StatusCode::NOT_FOUND
@@ -620,11 +660,50 @@ fn parse_id(value: String) -> ApiResult<Id> {
 fn parse_media_item_kind(value: &str) -> ApiResult<MediaItemKind> {
     match value {
         "movie" => Ok(MediaItemKind::Movie),
-        "tv" | "tv_episode" | "tv_series" => Ok(MediaItemKind::TvEpisode),
+        "show" | "tv" | "tv_episode" | "tv_series" => Ok(MediaItemKind::TvEpisode),
         "personal" => Ok(MediaItemKind::Personal),
         _ => Err(ApiError::InvalidMediaItemType {
             value: value.to_owned(),
         }),
+    }
+}
+
+fn parse_catalog_kind(
+    kind: Option<&str>,
+    media_type: Option<&str>,
+) -> ApiResult<Option<MediaItemKind>> {
+    match (kind, media_type) {
+        (Some(kind), Some(media_type)) => {
+            let kind = parse_media_item_kind(kind)?;
+            let media_type = parse_media_item_kind(media_type)?;
+            if kind == media_type {
+                Ok(Some(kind))
+            } else {
+                Err(ApiError::InvalidCatalogQuery {
+                    reason: String::from("kind and type must match when both are present"),
+                })
+            }
+        }
+        (Some(kind), None) => parse_media_item_kind(kind).map(Some),
+        (None, Some(media_type)) => parse_media_item_kind(media_type).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_catalog_sort(value: &str) -> ApiResult<CatalogSort> {
+    match value {
+        "recently_added" => Ok(CatalogSort::RecentlyAdded),
+        "title" => Ok(CatalogSort::Title),
+        "year" => Ok(CatalogSort::Year),
+        _ => Err(ApiError::InvalidCatalogSort {
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn invalid_catalog_query(rejection: QueryRejection) -> ApiError {
+    ApiError::InvalidCatalogQuery {
+        reason: rejection.body_text(),
     }
 }
 
