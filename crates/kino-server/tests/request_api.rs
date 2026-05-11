@@ -105,6 +105,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
             .is_some()
     );
     assert!(body["paths"].get("/api/v1/admin/tokens").is_some());
+    assert!(body["paths"].get("/api/v1/admin/sessions").is_some());
     assert!(body["paths"].get("/api/v1/playback/progress").is_some());
     assert!(
         body["paths"]["/api/v1/admin/tokens/{token_id}"]

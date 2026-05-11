@@ -10,6 +10,7 @@ use utoipa::openapi::server::Server;
         crate::playback::record_progress,
         crate::request::list_catalog_items,
         crate::request::get_catalog_item,
+        crate::session_admin::list_sessions,
         crate::stream::source_file,
         crate::stream::transcode_output,
         crate::request::get_catalog_item_image,
