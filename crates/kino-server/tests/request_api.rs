@@ -711,6 +711,26 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     let matrix_path =
         std::path::PathBuf::from("/library/Movies/The Matrix (1999)/The Matrix (1999).mkv");
     insert_source_file(&db, matrix, &matrix_path).await?;
+    insert_subtitle_sidecar(
+        &db,
+        matrix,
+        "eng",
+        "srt",
+        "text",
+        2,
+        "/subtitles/matrix.eng.srt",
+    )
+    .await?;
+    insert_subtitle_sidecar(
+        &db,
+        matrix,
+        "jpn",
+        "json",
+        "ocr",
+        4,
+        "/subtitles/matrix.jpn.json",
+    )
+    .await?;
     let app = kino_server::router(db);
 
     let list_response = app
@@ -780,6 +800,14 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
         matrix_identity.to_string()
     );
     assert_eq!(fetched["source_files"].as_array().map(Vec::len), Some(1));
+    assert_eq!(fetched["subtitle_tracks"][0]["language"], "eng");
+    assert_eq!(fetched["subtitle_tracks"][0]["label"], "ENG");
+    assert_eq!(fetched["subtitle_tracks"][0]["format"], "srt");
+    assert_eq!(fetched["subtitle_tracks"][0]["provenance"], "text");
+    assert_eq!(fetched["subtitle_tracks"][1]["language"], "jpn");
+    assert_eq!(fetched["subtitle_tracks"][1]["label"], "JPN (OCR)");
+    assert_eq!(fetched["subtitle_tracks"][1]["format"], "json");
+    assert_eq!(fetched["subtitle_tracks"][1]["provenance"], "ocr");
 
     Ok(())
 }
@@ -1016,6 +1044,49 @@ async fn insert_source_file(
     )
     .bind(id)
     .bind(media_item_id)
+    .bind(path)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
+}
+
+async fn insert_subtitle_sidecar(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    language: &str,
+    format: &str,
+    provenance: &str,
+    track_index: u32,
+    path: &str,
+) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO subtitle_sidecars (
+            id,
+            media_item_id,
+            language,
+            format,
+            provenance,
+            track_index,
+            path,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(id)
+    .bind(media_item_id)
+    .bind(language)
+    .bind(format)
+    .bind(provenance)
+    .bind(i64::from(track_index))
     .bind(path)
     .bind(now)
     .bind(now)
