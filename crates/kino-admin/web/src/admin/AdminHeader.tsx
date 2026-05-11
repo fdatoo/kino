@@ -45,6 +45,7 @@ export function AdminHeader({ onSignOut, title }: AdminHeaderProps) {
                     <button type="submit">Open</button>
                 </form>
                 <nav className="primary-nav" aria-label="Primary">
+                    <NavLink to="/requests">Requests</NavLink>
                     <NavLink to="/tokens">Tokens</NavLink>
                     <NavLink to="/config">Config</NavLink>
                     <NavLink to="/sessions">Sessions</NavLink>
