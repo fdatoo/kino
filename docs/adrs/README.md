@@ -42,3 +42,4 @@ monotonic, and the slug describes the decision in a few words.
 - [ADR-0001 — SQLite access via sqlx with offline mode](0001-sqlite-access-via-sqlx.md)
 - [ADR-0002 — Request UX semantics: visible-on-demand fulfillment](0002-request-ux-semantics.md)
 - [ADR-0003 — Metadata provider strategy: TMDB-only with overrides](0003-metadata-provider-strategy.md)
+- [ADR-0004 — API versioning policy](0004-api-versioning-policy.md)
