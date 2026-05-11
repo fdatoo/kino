@@ -12,6 +12,7 @@ use kino_core::{
     config::{LogFormat, ServerConfig},
 };
 use kino_db::Db;
+use kino_fulfillment::tmdb::TmdbClient;
 use kino_library::SubtitleReocrService;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -84,6 +85,16 @@ fn router_with_config_and_reocr(
     config: Config,
     subtitle_reocr: SubtitleReocrService,
 ) -> Router {
+    let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
+    router_with_config_reocr_and_tmdb(db, config, subtitle_reocr, tmdb_client)
+}
+
+fn router_with_config_reocr_and_tmdb(
+    db: Db,
+    config: Config,
+    subtitle_reocr: SubtitleReocrService,
+    tmdb_client: Option<TmdbClient>,
+) -> Router {
     let auth_state = auth::AuthState { db: db.clone() };
     let public_base_url = config.server.public_base_url.clone();
     let library_root = config.library_root.clone();
@@ -95,6 +106,7 @@ fn router_with_config_and_reocr(
             library_root,
             artwork_cache_dir,
             subtitle_reocr,
+            tmdb_client,
         ))
         .merge(stream::router(db.clone()))
         .merge(token::router(db.clone()))
@@ -111,6 +123,28 @@ fn router_with_config_and_reocr(
         .merge(protected_api)
         .merge(kino_admin::router())
         .layer(cors)
+}
+
+/// Build the Kino HTTP router with an explicit TMDB client.
+pub fn router_with_tmdb_client(db: Db, tmdb_client: TmdbClient) -> Router {
+    let library_root = PathBuf::from(".");
+    let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &library_root);
+    router_with_config_reocr_and_tmdb(
+        db,
+        Config {
+            database_path: PathBuf::from("kino.db"),
+            library_root,
+            library: kino_core::LibraryConfig::default(),
+            server: ServerConfig::default(),
+            tmdb: kino_core::config::TmdbConfig::default(),
+            ocr: kino_core::OcrConfig::default(),
+            providers: kino_core::config::ProvidersConfig::default(),
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Pretty,
+        },
+        subtitle_reocr,
+        Some(tmdb_client),
+    )
 }
 
 /// Serve the Kino HTTP API until the listener exits.

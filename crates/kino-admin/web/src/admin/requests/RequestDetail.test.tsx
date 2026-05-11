@@ -105,6 +105,63 @@ test('surfaces a missing manual import path inline', async () => {
     expect(mockClient.POST).not.toHaveBeenCalled();
 });
 
+test('resolves a request and renders ranked candidates', async () => {
+    mockClient.GET.mockResolvedValueOnce({
+        data: requestDetail('pending'),
+        response: new Response(null, { status: 200 }),
+    });
+    mockClient.GET.mockResolvedValueOnce({
+        data: requestDetail('resolved'),
+        response: new Response(null, { status: 200 }),
+    });
+    mockClient.POST.mockResolvedValueOnce({
+        data: {
+            candidates: [
+                {
+                    canonical_identity_id: 'tmdb:movie:603',
+                    popularity: 91.2,
+                    rank: 1,
+                    score: 0.997,
+                    title: 'The Matrix',
+                    year: 1999,
+                },
+                {
+                    canonical_identity_id: 'tmdb:movie:604',
+                    popularity: 62.5,
+                    rank: 2,
+                    score: 0.724,
+                    title: 'The Matrix Reloaded',
+                    year: 2003,
+                },
+            ],
+        },
+        response: new Response(null, { status: 200 }),
+    });
+
+    render(
+        <MemoryRouter initialEntries={[`/requests/${requestId}`]}>
+            <Routes>
+                <Route path="/requests/:id" element={<RequestDetail />} />
+            </Routes>
+        </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('The Matrix')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve' }));
+
+    expect(await screen.findByText('Resolve completed.')).toBeTruthy();
+    expect(screen.getByText('tmdb:movie:603')).toBeTruthy();
+    expect(screen.getByText('0.997')).toBeTruthy();
+    await waitFor(() => {
+        expect(mockClient.POST).toHaveBeenCalledWith(
+            '/api/v1/requests/{id}/resolve',
+            {
+                params: { path: { id: requestId } },
+            },
+        );
+    });
+});
+
 function requestDetail(state: RequestState): RequestDetailResponse {
     return {
         candidates: [],

@@ -10,13 +10,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use kino_core::{CanonicalIdentityId, Id, MediaItemKind, id::ParseIdError};
+use kino_core::{CanonicalIdentityId, Id, MediaItemKind, TmdbId, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
     FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
     FulfillmentProviderError, ManualImportProvider, NewFulfillmentPlan, NewRequest, RequestDetail,
-    RequestEventActor, RequestListPage, RequestListQuery, RequestMatchCandidateInput,
-    RequestService, RequestState, RequestTransition,
+    RequestEventActor, RequestListPage, RequestListQuery, RequestMatchCandidate,
+    RequestMatchCandidateInput, RequestService, RequestState, RequestTransition,
+    movie::parse_movie_request,
+    rank_match_candidates,
+    tmdb::{self, TmdbClient},
+    tv::parse_tv_request,
 };
 use kino_library::{
     CatalogArtworkKind, CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService,
@@ -33,6 +37,7 @@ pub(crate) struct AppState {
     catalog: CatalogService,
     library_scans: LibraryScanService,
     subtitle_reocr: SubtitleReocrService,
+    tmdb: Option<TmdbClient>,
     artwork_cache_dir: PathBuf,
 }
 
@@ -89,15 +94,6 @@ pub(crate) struct ListCatalogItemsQuery {
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ScoreMatchesRequest {
-    /// Candidate identities to score for this request.
-    candidates: Vec<RequestMatchCandidateInput>,
-    /// Optional status-event message.
-    message: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ReResolveRequest {
     /// Canonical identity selected by the resolver or operator.
     canonical_identity_id: CanonicalIdentityId,
@@ -139,6 +135,12 @@ pub(crate) struct ReocrTrackResponse {
     job_id: Id,
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ResolveRequestResponse {
+    /// Ranked resolver candidates returned by TMDB-backed scoring.
+    candidates: Vec<RequestMatchCandidate>,
+}
+
 impl From<ReocrJob> for ReocrTrackResponse {
     fn from(job: ReocrJob) -> Self {
         Self { job_id: job.job_id }
@@ -150,6 +152,7 @@ pub(crate) fn router(
     library_root: PathBuf,
     artwork_cache_dir: PathBuf,
     subtitle_reocr: SubtitleReocrService,
+    tmdb: Option<TmdbClient>,
 ) -> Router {
     let state = AppState {
         requests: RequestService::new(db.clone()),
@@ -157,6 +160,7 @@ pub(crate) fn router(
         catalog: CatalogService::new(db.clone()),
         library_scans: LibraryScanService::new(db.clone(), library_root),
         subtitle_reocr,
+        tmdb,
         artwork_cache_dir,
     };
 
@@ -166,7 +170,7 @@ pub(crate) fn router(
             "/api/v1/requests/{id}",
             get(get_request).delete(cancel_request),
         )
-        .route("/api/v1/requests/{id}/matches", post(score_matches))
+        .route("/api/v1/requests/{id}/resolve", post(resolve_request))
         .route("/api/v1/requests/{id}/plans", post(record_plan))
         .route("/api/v1/requests/{id}/re-resolution", post(re_resolve))
         .route(
@@ -295,36 +299,66 @@ pub(crate) async fn cancel_request(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/requests/{id}/matches",
+    path = "/api/v1/requests/{id}/resolve",
     tag = "requests",
     params(
         ("id" = Id, Path, description = "Request id")
     ),
-    request_body = ScoreMatchesRequest,
     responses(
-        (status = 200, description = "Request match candidates scored", body = RequestDetail),
-        (status = 400, description = "Invalid request id or match candidates", body = ErrorResponse),
+        (status = 200, description = "Ranked resolver candidates", body = ResolveRequestResponse),
+        (status = 400, description = "Invalid request id or request state", body = ErrorResponse),
         (status = 404, description = "Request not found", body = ErrorResponse),
-        (status = 409, description = "Request cannot resolve matches from its current state", body = ErrorResponse),
-        (status = 500, description = "Match scoring failed", body = ErrorResponse)
+        (status = 502, description = "TMDB request failed", body = ErrorResponse),
+        (status = 503, description = "TMDB client is not configured", body = ErrorResponse)
     )
 )]
-pub(crate) async fn score_matches(
+pub(crate) async fn resolve_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(payload): Json<ScoreMatchesRequest>,
-) -> ApiResult<Json<RequestDetail>> {
+) -> ApiResult<Json<ResolveRequestResponse>> {
     let id = parse_id(id)?;
-    let detail = state
+    let detail = state.requests.get(id).await?;
+
+    if let Some(canonical_identity_id) = detail.request.target.canonical_identity_id {
+        return Ok(Json(ResolveRequestResponse {
+            candidates: vec![RequestMatchCandidate {
+                rank: 1,
+                canonical_identity_id,
+                title: detail.request.target.raw_query,
+                year: None,
+                popularity: 0.0,
+                score: 1.0,
+            }],
+        }));
+    }
+    if !matches!(
+        detail.request.state,
+        RequestState::Pending | RequestState::NeedsDisambiguation
+    ) {
+        return Err(ApiError::Fulfillment(
+            kino_fulfillment::Error::InvalidMatchResolutionState {
+                from: detail.request.state,
+            },
+        ));
+    }
+
+    let tmdb = state.tmdb.as_ref().ok_or(ApiError::TmdbNotConfigured)?;
+    let candidates = fetch_tmdb_candidates(tmdb, detail.request.target.raw_query.as_str()).await?;
+    let ranked =
+        rank_match_candidates(detail.request.target.raw_query.as_str(), candidates.clone())?
+            .into_iter()
+            .take(kino_fulfillment::REQUEST_MATCH_CANDIDATE_LIMIT)
+            .collect();
+    state
         .requests
         .resolve_matches(
             id,
-            payload.candidates,
+            candidates,
             Some(RequestEventActor::System),
-            payload.message.as_deref(),
+            Some("resolved candidates from TMDB"),
         )
         .await?;
-    Ok(Json(detail))
+    Ok(Json(ResolveRequestResponse { candidates: ranked }))
 }
 
 #[utoipa::path(
@@ -625,6 +659,15 @@ pub(crate) enum ApiError {
     #[error(transparent)]
     Fulfillment(#[from] kino_fulfillment::Error),
 
+    #[error("tmdb client is not configured")]
+    TmdbNotConfigured,
+
+    #[error(transparent)]
+    Tmdb(#[from] tmdb::Error),
+
+    #[error("tmdb candidate id {value} is invalid")]
+    InvalidTmdbCandidate { value: u32 },
+
     #[error("manual import from {from} is invalid")]
     InvalidManualImportState { from: RequestState },
 
@@ -670,7 +713,7 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT
             }
             Self::Fulfillment(kino_fulfillment::Error::InvalidMatchResolutionState { .. }) => {
-                StatusCode::CONFLICT
+                StatusCode::BAD_REQUEST
             }
             Self::Fulfillment(kino_fulfillment::Error::InvalidFulfillmentPlanState { .. }) => {
                 StatusCode::CONFLICT
@@ -695,6 +738,21 @@ impl IntoResponse for ApiError {
             }
             Self::Fulfillment(kino_fulfillment::Error::EmptyFulfillmentPlanSummary) => {
                 StatusCode::BAD_REQUEST
+            }
+            Self::TmdbNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Tmdb(tmdb::Error::EmptyQuery | tmdb::Error::InvalidYear { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Tmdb(tmdb::Error::MissingApiKey | tmdb::Error::EmptyApiKey) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::InvalidTmdbCandidate { .. } => {
+                tracing::error!(error = %self, "request resolve api failed");
+                StatusCode::BAD_GATEWAY
+            }
+            Self::Tmdb(_) => {
+                tracing::error!(error = %self, "request resolve api failed");
+                StatusCode::BAD_GATEWAY
             }
             Self::InvalidManualImportState { .. } => StatusCode::CONFLICT,
             Self::ManualImport(error) if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
@@ -748,6 +806,51 @@ fn parse_id(value: String) -> ApiResult<Id> {
     value
         .parse()
         .map_err(|source| ApiError::InvalidId { value, source })
+}
+
+async fn fetch_tmdb_candidates(
+    tmdb: &TmdbClient,
+    raw_query: &str,
+) -> ApiResult<Vec<RequestMatchCandidateInput>> {
+    let mut candidates = Vec::new();
+
+    if let Ok(movie_request) = parse_movie_request(raw_query) {
+        let movies = tmdb
+            .search_movies(&movie_request.title, movie_request.release_year)
+            .await?;
+        for movie in movies {
+            candidates.push(RequestMatchCandidateInput {
+                canonical_identity_id: CanonicalIdentityId::tmdb_movie(to_core_tmdb_id(
+                    movie.movie_id.get(),
+                )?),
+                title: movie.title,
+                year: movie.release_year,
+                popularity: movie.popularity,
+            });
+        }
+    }
+
+    if let Ok(tv_request) = parse_tv_request(raw_query) {
+        let series = tmdb
+            .search_tv(&tv_request.title, tv_request.first_air_year)
+            .await?;
+        for series in series {
+            candidates.push(RequestMatchCandidateInput {
+                canonical_identity_id: CanonicalIdentityId::tmdb_tv_series(to_core_tmdb_id(
+                    series.series_id.get(),
+                )?),
+                title: series.name,
+                year: series.first_air_year,
+                popularity: series.popularity,
+            });
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn to_core_tmdb_id(value: u32) -> ApiResult<TmdbId> {
+    TmdbId::new(value).ok_or(ApiError::InvalidTmdbCandidate { value })
 }
 
 fn parse_media_item_kind(value: &str) -> ApiResult<MediaItemKind> {

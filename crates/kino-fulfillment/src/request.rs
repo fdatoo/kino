@@ -1448,6 +1448,15 @@ fn validate_provider_error_provider_id(provider_id: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+/// Rank resolver candidates for a request without mutating request state.
+pub fn rank_match_candidates(
+    raw_query: &str,
+    candidates: Vec<RequestMatchCandidateInput>,
+) -> Result<Vec<RequestMatchCandidate>> {
+    validate_match_candidates(&candidates)?;
+    Ok(score_match_candidates(raw_query, candidates))
+}
+
 fn score_match_candidates(
     raw_query: &str,
     candidates: Vec<RequestMatchCandidateInput>,

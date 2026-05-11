@@ -10,6 +10,7 @@ import { apiErrorMessage, formatState, formatTimestamp } from './request-utils';
 
 type RequestDetailResponse = components['schemas']['RequestDetail'];
 type ManualImportResponse = components['schemas']['ManualImportResponse'];
+type RequestMatchCandidate = components['schemas']['RequestMatchCandidate'];
 
 export function RequestDetail() {
     const { id } = useParams<{ id: string }>();
@@ -20,8 +21,12 @@ export function RequestDetail() {
     const [error, setError] = useState<string | null>(null);
     const [importResult, setImportResult] =
         useState<ManualImportResponse | null>(null);
+    const [resolveCandidates, setResolveCandidates] = useState<
+        RequestMatchCandidate[]
+    >([]);
     const [isLoading, setIsLoading] = useState(true);
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [isResolving, setIsResolving] = useState(false);
 
     const loadRequest = useCallback(async () => {
         if (id === undefined) {
@@ -125,6 +130,50 @@ export function RequestDetail() {
         }
     }
 
+    async function handleResolve() {
+        if (id === undefined) {
+            setError('Request id is missing.');
+            return;
+        }
+
+        setIsResolving(true);
+        setError(null);
+        setStatus(null);
+        setResolveCandidates([]);
+
+        try {
+            const {
+                data,
+                error: apiError,
+                response,
+            } = await apiClient.POST('/api/v1/requests/{id}/resolve', {
+                params: { path: { id } },
+            });
+
+            if (response.status === 401) {
+                clearToken();
+                return;
+            }
+
+            if (data === undefined) {
+                setError(apiErrorMessage(apiError, 'Resolve failed.'));
+                return;
+            }
+
+            setResolveCandidates(data.candidates);
+            setStatus('Resolve completed.');
+            await loadRequest();
+        } catch (err) {
+            setError(
+                err instanceof Error
+                    ? `Resolve failed: ${err.message}`
+                    : 'Resolve failed.',
+            );
+        } finally {
+            setIsResolving(false);
+        }
+    }
+
     return (
         <main className="admin-shell">
             <AdminHeader onSignOut={clearToken} title="Request detail" />
@@ -183,6 +232,69 @@ export function RequestDetail() {
                                 }
                             />
                         </dl>
+                    </section>
+
+                    <section
+                        className="section-block"
+                        aria-labelledby="resolve-title"
+                    >
+                        <div className="section-heading">
+                            <h2 id="resolve-title">Resolve</h2>
+                            <button
+                                disabled={isResolving}
+                                onClick={() => {
+                                    void handleResolve();
+                                }}
+                                type="button"
+                            >
+                                {isResolving ? 'Resolving...' : 'Resolve'}
+                            </button>
+                        </div>
+
+                        {resolveCandidates.length > 0 ? (
+                            <div className="table-wrap">
+                                <table>
+                                    <thead>
+                                        <tr>
+                                            <th>Rank</th>
+                                            <th>Title</th>
+                                            <th>Year</th>
+                                            <th>Identity</th>
+                                            <th>Score</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {resolveCandidates.map((candidate) => (
+                                            <tr
+                                                key={
+                                                    candidate.canonical_identity_id
+                                                }
+                                            >
+                                                <td>{candidate.rank}</td>
+                                                <td>{candidate.title}</td>
+                                                <td>
+                                                    {candidate.year ?? '--'}
+                                                </td>
+                                                <td>
+                                                    <code className="inline-code">
+                                                        {
+                                                            candidate.canonical_identity_id
+                                                        }
+                                                    </code>
+                                                </td>
+                                                <td>
+                                                    {formatScore(
+                                                        candidate.score,
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        ) : (
+                            <p className="muted">No resolve candidates.</p>
+                        )}
                     </section>
 
                     <section
@@ -285,6 +397,10 @@ export function RequestDetail() {
             ) : null}
         </main>
     );
+}
+
+function formatScore(score: number) {
+    return score.toFixed(3);
 }
 
 function SummaryRow({ label, value }: { label: string; value: string }) {
