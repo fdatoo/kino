@@ -4,7 +4,11 @@ use utoipa::openapi::server::Server;
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(crate::request::list_catalog_items),
+    paths(
+        crate::request::list_catalog_items,
+        crate::token::create_token,
+        crate::token::list_tokens
+    ),
     info(title = "Kino API", version = "0.1.0-phase-2"),
     tags(
         (name = "requests", description = "Request lifecycle operations"),
