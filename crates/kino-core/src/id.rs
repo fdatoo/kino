@@ -54,6 +54,20 @@ impl fmt::Debug for Id {
     }
 }
 
+impl utoipa::PartialSchema for Id {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .format(Some(utoipa::openapi::schema::SchemaFormat::KnownFormat(
+                utoipa::openapi::schema::KnownFormat::Uuid,
+            )))
+            .build()
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for Id {}
+
 impl FromStr for Id {
     type Err = ParseIdError;
 

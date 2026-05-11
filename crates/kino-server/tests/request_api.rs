@@ -12,6 +12,46 @@ use serde_json::Value;
 use tower::util::ServiceExt;
 
 #[tokio::test]
+async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router_with_public_base_url(db, "https://kino.example.test");
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/openapi.json")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .ok_or("content-type header missing")?
+        .to_str()?;
+    assert!(
+        content_type.starts_with("application/json"),
+        "got: {content_type}"
+    );
+
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["openapi"], "3.1.0");
+    assert_eq!(body["info"]["title"], "Kino API");
+    assert_eq!(body["info"]["version"], "0.1.0-phase-2");
+    assert_eq!(body["servers"][0]["url"], "https://kino.example.test");
+    assert!(body["paths"].get("/api/v1/library/items").is_some());
+
+    let json = std::str::from_utf8(&bytes)?;
+    let spec = oas3::from_json(json)?;
+    spec.validate_version()?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let app = kino_server::router(db);
