@@ -1050,6 +1050,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "figment",
  "kino-admin",
  "kino-core",
  "kino-db",

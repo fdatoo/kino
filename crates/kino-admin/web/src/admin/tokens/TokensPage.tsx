@@ -3,6 +3,7 @@ import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { apiClient } from '../../api/client';
 import type { components } from '../../api/schema';
 import { useToken } from '../../auth/use-token';
+import { AdminHeader } from '../AdminHeader';
 
 type TokenSummary = components['schemas']['TokenSummary'];
 type MintedToken = components['schemas']['CreateTokenResponse'];
@@ -160,15 +161,7 @@ export function TokensPage() {
 
     return (
         <main className="admin-shell">
-            <header className="top-bar">
-                <div>
-                    <p className="eyebrow">Kino Admin</p>
-                    <h1>Device tokens</h1>
-                </div>
-                <button type="button" onClick={clearToken}>
-                    Sign out
-                </button>
-            </header>
+            <AdminHeader onSignOut={clearToken} title="Device tokens" />
 
             <section className="section-block" aria-labelledby="mint-title">
                 <h2 id="mint-title">Mint new token</h2>

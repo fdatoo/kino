@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 axum = "0.8"
 base64 = "0.22"
+figment = { workspace = true }
 kino-admin = { path = "../kino-admin" }
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
