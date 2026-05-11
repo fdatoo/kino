@@ -1,16 +1,15 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{delete, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kino_core::{Id, Timestamp, device_token::DeviceToken, user::SEEDED_USER_ID};
 use kino_db::Db;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 #[derive(Clone)]
@@ -61,6 +60,7 @@ pub(crate) fn router(db: Db) -> Router {
     Router::new()
         // TODO(F-304): require an existing valid admin device token before issuing or listing tokens.
         .route("/api/v1/admin/tokens", post(create_token).get(list_tokens))
+        .route("/api/v1/admin/tokens/{token_id}", delete(revoke_token))
         .with_state(TokenState { db })
 }
 
@@ -84,7 +84,7 @@ pub(crate) async fn create_token(
     }
 
     let plaintext = generate_plaintext_token()?;
-    let hash = hash_token(&plaintext);
+    let hash = crate::auth::hash_token(&plaintext);
     let token = DeviceToken::new(
         Id::new(),
         SEEDED_USER_ID,
@@ -165,12 +165,53 @@ pub(crate) async fn list_tokens(
     Ok(Json(ListTokensResponse { tokens }))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/tokens/{token_id}",
+    tag = "admin",
+    params(
+        ("token_id" = Id, Path, description = "Persisted device token id")
+    ),
+    responses(
+        (status = 204, description = "Device token revoked"),
+        (status = 404, description = "Device token not found", body = TokenErrorResponse),
+        (status = 500, description = "Token revocation failed", body = TokenErrorResponse)
+    )
+)]
+pub(crate) async fn revoke_token(
+    State(state): State<TokenState>,
+    Path(token_id): Path<Id>,
+) -> TokenResult<StatusCode> {
+    let revoked_at = Timestamp::now();
+    let result = sqlx::query(
+        r#"
+        UPDATE device_tokens
+        SET revoked_at = ?1
+        WHERE id = ?2 AND user_id = ?3
+        "#,
+    )
+    .bind(revoked_at)
+    .bind(token_id)
+    .bind(SEEDED_USER_ID)
+    .execute(state.db.write_pool())
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(TokenApiError::NotFound);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub(crate) type TokenResult<T> = std::result::Result<T, TokenApiError>;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TokenApiError {
     #[error("token label must not be empty")]
     EmptyLabel,
+
+    #[error("device token not found")]
+    NotFound,
 
     #[error("secure random token generation failed: {0}")]
     Random(#[from] rand::Error),
@@ -188,6 +229,7 @@ impl IntoResponse for TokenApiError {
     fn into_response(self) -> Response {
         let status = match &self {
             Self::EmptyLabel => StatusCode::BAD_REQUEST,
+            Self::NotFound => StatusCode::NOT_FOUND,
             Self::Random(_) | Self::Sqlx(_) => {
                 tracing::error!(error = %self, "token api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -220,10 +262,6 @@ fn generate_plaintext_token() -> TokenResult<String> {
     let mut bytes = [0_u8; 32];
     OsRng.try_fill_bytes(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn hash_token(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 fn token_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> TokenResult<TokenSummary> {
