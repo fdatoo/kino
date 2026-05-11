@@ -16,7 +16,10 @@ pub mod time;
 pub mod tracing;
 pub mod user;
 
-pub use catalog::{MediaItem, MediaItemKind, SourceFile, TranscodeOutput};
+pub use catalog::{
+    CatalogStreamVariant, MediaItem, MediaItemKind, SourceFile, TranscodeOutput,
+    VariantCapabilities, VariantKind,
+};
 pub use config::{CanonicalLayoutTransfer, Config, LibraryConfig, OcrConfig, SessionReaperConfig};
 pub use device_token::DeviceToken;
 pub use id::Id;

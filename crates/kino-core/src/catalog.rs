@@ -18,6 +18,42 @@ pub enum MediaItemKind {
     Personal,
 }
 
+/// Streamable catalog variant kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VariantKind {
+    /// Original source file stream.
+    Source,
+    /// Derived transcode output stream.
+    Transcoded,
+}
+
+/// Capability hints clients can use when choosing a stream variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct VariantCapabilities {
+    /// Video codec label, or `unknown` when not yet probed.
+    pub codec: String,
+    /// Container format label, or `unknown` when not yet known.
+    pub container: String,
+    /// Resolution label such as `1080p`, when known.
+    pub resolution: Option<String>,
+    /// HDR format label, when known.
+    pub hdr: Option<String>,
+}
+
+/// Streamable variant exposed on catalog item responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CatalogStreamVariant {
+    /// Stable variant id within the catalog.
+    pub variant_id: String,
+    /// Variant source kind.
+    pub kind: VariantKind,
+    /// Best available capability hints for client selection.
+    pub capabilities: VariantCapabilities,
+    /// Relative API URL used to stream this variant.
+    pub stream_url: String,
+}
+
 impl MediaItemKind {
     /// The persisted string representation.
     pub const fn as_str(self) -> &'static str {
@@ -171,6 +207,7 @@ impl TranscodeOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn media_item_kind_round_trips_storage_value() {
@@ -186,5 +223,67 @@ mod tests {
         assert_eq!(MediaItemKind::Movie.as_str(), "movie");
         assert_eq!(MediaItemKind::TvEpisode.to_string(), "tv_episode");
         assert_eq!(MediaItemKind::parse("tv_series"), None);
+    }
+
+    #[test]
+    fn stream_variants_serialize_source_and_transcoded_kinds() -> Result<(), serde_json::Error> {
+        let variants = vec![
+            CatalogStreamVariant {
+                variant_id: "source-file-id".to_owned(),
+                kind: VariantKind::Source,
+                capabilities: VariantCapabilities {
+                    codec: "unknown".to_owned(),
+                    container: "mkv".to_owned(),
+                    resolution: Some("2160p".to_owned()),
+                    hdr: Some("hdr10".to_owned()),
+                },
+                stream_url: "/api/v1/stream/sourcefile/source-file-id".to_owned(),
+            },
+            CatalogStreamVariant {
+                variant_id: "transcode-output-id".to_owned(),
+                kind: VariantKind::Transcoded,
+                capabilities: VariantCapabilities {
+                    codec: "h264".to_owned(),
+                    container: "mp4".to_owned(),
+                    resolution: Some("1080p".to_owned()),
+                    hdr: None,
+                },
+                stream_url: "/api/v1/stream/transcode/transcode-output-id".to_owned(),
+            },
+        ];
+
+        let value = serde_json::to_value(&variants)?;
+
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "variant_id": "source-file-id",
+                    "kind": "source",
+                    "capabilities": {
+                        "codec": "unknown",
+                        "container": "mkv",
+                        "resolution": "2160p",
+                        "hdr": "hdr10",
+                    },
+                    "stream_url": "/api/v1/stream/sourcefile/source-file-id",
+                },
+                {
+                    "variant_id": "transcode-output-id",
+                    "kind": "transcoded",
+                    "capabilities": {
+                        "codec": "h264",
+                        "container": "mp4",
+                        "resolution": "1080p",
+                        "hdr": null,
+                    },
+                    "stream_url": "/api/v1/stream/transcode/transcode-output-id",
+                },
+            ])
+        );
+        let decoded: Vec<CatalogStreamVariant> = serde_json::from_value(value)?;
+        assert_eq!(decoded, variants);
+
+        Ok(())
     }
 }

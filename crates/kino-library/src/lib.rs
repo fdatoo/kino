@@ -18,8 +18,8 @@ pub mod subtitle_ocr;
 pub mod subtitle_reocr;
 
 use kino_core::{
-    CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, Config, Id,
-    MediaItemKind, Timestamp, TranscodeOutput,
+    CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, CatalogStreamVariant,
+    Config, Id, MediaItemKind, Timestamp, TranscodeOutput, VariantCapabilities, VariantKind,
 };
 use kino_db::Db;
 use serde::Serialize;
@@ -838,6 +838,8 @@ pub struct CatalogMediaItem {
     pub title: Option<String>,
     /// Cached artwork URLs for this item.
     pub artwork: CatalogArtwork,
+    /// Streamable source and transcode variants for this item.
+    pub variants: Vec<CatalogStreamVariant>,
     /// Source files attached to this media item.
     pub source_files: Vec<LibrarySourceFile>,
     /// Subtitle tracks attached to this media item.
@@ -1219,6 +1221,7 @@ impl CatalogService {
 
         for item in items {
             item.source_files = by_media_item.remove(&item.id).unwrap_or_default();
+            item.variants = catalog_stream_variants(&item.source_files);
         }
 
         Ok(())
@@ -2815,6 +2818,7 @@ fn catalog_media_item_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogM
         episode_number: optional_u32_from_row(row, "episode_number")?,
         title: row.try_get("title")?,
         artwork: catalog_artwork_from_row(row, id)?,
+        variants: Vec::new(),
         source_files: Vec::new(),
         subtitle_tracks: Vec::new(),
         created_at: row.try_get("created_at")?,
@@ -2897,6 +2901,52 @@ fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Library
         path: PathBuf::from(path),
         transcode_outputs: Vec::new(),
     })
+}
+
+fn catalog_stream_variants(source_files: &[LibrarySourceFile]) -> Vec<CatalogStreamVariant> {
+    source_files
+        .iter()
+        .flat_map(|source_file| {
+            std::iter::once(source_file_stream_variant(source_file)).chain(
+                source_file
+                    .transcode_outputs
+                    .iter()
+                    .map(transcode_output_stream_variant),
+            )
+        })
+        .collect()
+}
+
+fn source_file_stream_variant(source_file: &LibrarySourceFile) -> CatalogStreamVariant {
+    CatalogStreamVariant {
+        variant_id: source_file.id.to_string(),
+        kind: VariantKind::Source,
+        capabilities: variant_capabilities_from_path(&source_file.path),
+        stream_url: format!("/api/v1/stream/sourcefile/{}", source_file.id),
+    }
+}
+
+fn transcode_output_stream_variant(output: &TranscodeOutput) -> CatalogStreamVariant {
+    CatalogStreamVariant {
+        variant_id: output.id.to_string(),
+        kind: VariantKind::Transcoded,
+        capabilities: variant_capabilities_from_path(&output.path),
+        stream_url: format!("/api/v1/stream/transcode/{}", output.id),
+    }
+}
+
+fn variant_capabilities_from_path(path: &Path) -> VariantCapabilities {
+    VariantCapabilities {
+        codec: "unknown".to_owned(),
+        container: path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .filter(|extension| !extension.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        resolution: None,
+        hdr: None,
+    }
 }
 
 fn catalog_subtitle_track_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogSubtitleTrack> {
@@ -3446,6 +3496,20 @@ mod tests {
         assert_eq!(fetched.id, matrix);
         assert_eq!(fetched.title.as_deref(), Some("The Matrix"));
         assert_eq!(fetched.source_files.len(), 1);
+        assert_eq!(fetched.variants.len(), 1);
+        assert_eq!(
+            fetched.variants[0].variant_id,
+            fetched.source_files[0].id.to_string()
+        );
+        assert_eq!(fetched.variants[0].kind, VariantKind::Source);
+        assert_eq!(fetched.variants[0].capabilities.codec, "unknown");
+        assert_eq!(fetched.variants[0].capabilities.container, "mkv");
+        assert_eq!(fetched.variants[0].capabilities.resolution, None);
+        assert_eq!(fetched.variants[0].capabilities.hdr, None);
+        assert_eq!(
+            fetched.variants[0].stream_url,
+            format!("/api/v1/stream/sourcefile/{}", fetched.source_files[0].id)
+        );
         assert_eq!(
             fetched.subtitle_tracks,
             vec![
@@ -3603,12 +3667,21 @@ mod tests {
                 "/tmp/fake.mp4",
             )
             .await?;
+        let output_id = output.id;
         let item = service.get(media_item_id).await?;
 
         assert_eq!(output.source_file_id, source_file_id);
         assert_eq!(output.path, PathBuf::from("/tmp/fake.mp4"));
         assert_eq!(item.source_files.len(), 1);
         assert_eq!(item.source_files[0].transcode_outputs, vec![output]);
+        assert_eq!(item.variants.len(), 2);
+        assert_eq!(item.variants[0].kind, VariantKind::Source);
+        assert_eq!(item.variants[1].kind, VariantKind::Transcoded);
+        assert_eq!(item.variants[1].variant_id, output_id.to_string());
+        assert_eq!(
+            item.variants[1].stream_url,
+            format!("/api/v1/stream/transcode/{output_id}")
+        );
 
         Ok(())
     }

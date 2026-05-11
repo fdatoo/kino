@@ -382,7 +382,20 @@ pub(crate) async fn list_catalog_items(
     Ok(Json(page))
 }
 
-async fn get_catalog_item(
+#[utoipa::path(
+    get,
+    path = "/api/v1/library/items/{id}",
+    tag = "library",
+    params(
+        ("id" = Id, Path, description = "Media item id")
+    ),
+    responses(
+        (status = 200, description = "Catalog media item", body = CatalogMediaItem),
+        (status = 400, description = "Invalid media item id", body = ErrorResponse),
+        (status = 404, description = "Catalog media item not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_catalog_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<CatalogMediaItem>> {
