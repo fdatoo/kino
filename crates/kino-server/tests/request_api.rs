@@ -1,15 +1,20 @@
 use axum::{
     body::{Body, to_bytes},
-    http::{Request as HttpRequest, StatusCode, header},
+    http::{HeaderValue, Request as HttpRequest, StatusCode, header},
 };
 use kino_core::{CanonicalIdentityId, Id, Timestamp, TmdbId};
 use kino_fulfillment::{
     FulfillmentPlanDecision, NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage,
     RequestService, RequestState, RequestTransition,
 };
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use tower::util::ServiceExt;
+
+#[derive(Debug, Deserialize)]
+struct CreateTokenResponse {
+    token: String,
+}
 
 #[tokio::test]
 async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,6 +48,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(body["info"]["version"], "0.1.0-phase-2");
     assert_eq!(body["servers"][0]["url"], "https://kino.example.test");
     assert!(body["paths"].get("/api/v1/library/items").is_some());
+    assert!(
+        body["paths"]
+            .get("/api/v1/library/items/{id}/images/{kind}")
+            .is_some()
+    );
     assert!(body["paths"].get("/api/v1/admin/tokens").is_some());
     assert!(
         body["paths"]["/api/v1/admin/tokens/{token_id}"]
@@ -730,6 +740,71 @@ async fn catalog_api_reports_invalid_filters_and_missing_items()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_image_api_serves_cached_artwork() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let library_root = tempfile::tempdir()?;
+    let artwork_cache = tempfile::tempdir()?;
+    let identity_id = identity(550);
+    let media_item_id = insert_tmdb_media_item(&db, identity_id).await?;
+    let local_path = std::path::PathBuf::from("aa/bb/poster.jpg");
+    insert_catalog_artwork(&db, media_item_id, identity_id, &local_path).await?;
+    let cached_file = artwork_cache.path().join(&local_path);
+    let cached_parent = cached_file
+        .parent()
+        .ok_or("cached file should have parent")?;
+    tokio::fs::create_dir_all(cached_parent).await?;
+    tokio::fs::write(&cached_file, b"poster-bytes").await?;
+    let app = kino_server::router_with_library_root_artwork_cache_and_public_base_url(
+        db,
+        library_root.path(),
+        artwork_cache.path(),
+        "https://kino.example.test",
+    );
+    let token = create_token(&app).await?.token;
+
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/library/items/{media_item_id}/images/poster"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("image/jpeg"))
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "public, max-age=31536000, immutable",
+        ))
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(bytes.as_ref(), b"poster-bytes");
+
+    let missing_auth = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/library/items/{media_item_id}/images/poster"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(missing_auth.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
 async fn create_request(
     app: &axum::Router,
     message: &str,
@@ -744,6 +819,24 @@ async fn create_request(
                 .body(Body::from(format!(
                     r#"{{"target":"{message}","message":"{message}"}}"#
                 )))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response_json(response).await
+}
+
+async fn create_token(
+    app: &axum::Router,
+) -> Result<CreateTokenResponse, Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/admin/tokens")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"label":"artwork test"}"#))?,
         )
         .await?;
 
@@ -927,19 +1020,65 @@ async fn insert_catalog_title(
             description,
             release_date,
             poster_path,
+            poster_local_path,
             backdrop_path,
+            backdrop_local_path,
             logo_path,
+            logo_local_path,
             metadata_path,
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, 'description', NULL, 'poster.jpg', 'backdrop.jpg', NULL, 'metadata.json', ?5, ?6)
+        VALUES (?1, ?2, ?3, ?4, 'description', NULL, '', 'poster.jpg', '', 'backdrop.jpg', NULL, NULL, 'metadata.json', ?5, ?6)
         "#,
     )
     .bind(media_item_id)
     .bind(canonical_identity_id)
     .bind(canonical_identity_id.provider().as_str())
     .bind(title)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_catalog_artwork(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    canonical_identity_id: CanonicalIdentityId,
+    poster_local_path: &std::path::Path,
+) -> Result<(), sqlx::Error> {
+    let now = Timestamp::now();
+    let poster_local_path = poster_local_path.to_string_lossy().into_owned();
+
+    sqlx::query(
+        r#"
+        INSERT INTO media_metadata_cache (
+            media_item_id,
+            canonical_identity_id,
+            provider,
+            title,
+            description,
+            release_date,
+            poster_path,
+            poster_local_path,
+            backdrop_path,
+            backdrop_local_path,
+            logo_path,
+            logo_local_path,
+            metadata_path,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, 'Fight Club', 'description', NULL, 'https://image.tmdb.org/poster.jpg', ?4, '', NULL, '', NULL, 'metadata.json', ?5, ?6)
+        "#,
+    )
+    .bind(media_item_id)
+    .bind(canonical_identity_id)
+    .bind(canonical_identity_id.provider().as_str())
+    .bind(poster_local_path)
     .bind(now)
     .bind(now)
     .execute(db.write_pool())

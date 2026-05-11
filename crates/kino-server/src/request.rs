@@ -1,9 +1,13 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Component, Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -16,8 +20,8 @@ use kino_fulfillment::{
     RequestService, RequestState, RequestTransition,
 };
 use kino_library::{
-    CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService, LibraryScanReport,
-    LibraryScanService,
+    CatalogArtworkKind, CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService,
+    LibraryScanReport, LibraryScanService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +31,7 @@ pub(crate) struct AppState {
     manual_imports: Arc<ManualImportProvider>,
     catalog: CatalogService,
     library_scans: LibraryScanService,
+    artwork_cache_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,12 +103,13 @@ struct ManualImportResponse {
     path: PathBuf,
 }
 
-pub(crate) fn router(db: Db, library_root: PathBuf) -> Router {
+pub(crate) fn router(db: Db, library_root: PathBuf, artwork_cache_dir: PathBuf) -> Router {
     let state = AppState {
         requests: RequestService::new(db.clone()),
         manual_imports: Arc::new(ManualImportProvider::new()),
         catalog: CatalogService::new(db.clone()),
-        library_scans: LibraryScanService::new(db, library_root),
+        library_scans: LibraryScanService::new(db.clone(), library_root),
+        artwork_cache_dir,
     };
 
     Router::new()
@@ -121,6 +127,13 @@ pub(crate) fn router(db: Db, library_root: PathBuf) -> Router {
         )
         .route("/api/v1/library/items", get(list_catalog_items))
         .route("/api/v1/library/items/{id}", get(get_catalog_item))
+        .route(
+            "/api/v1/library/items/{id}/images/{kind}",
+            get(get_catalog_item_image).route_layer(middleware::from_fn_with_state(
+                crate::auth::AuthState { db },
+                crate::auth::require_auth,
+            )),
+        )
         .route("/api/v1/admin/library/scan", get(scan_library))
         .with_state(state)
 }
@@ -330,6 +343,46 @@ async fn get_catalog_item(
     Ok(Json(item))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/library/items/{id}/images/{kind}",
+    tag = "library",
+    params(
+        ("id" = Id, Path, description = "Media item id"),
+        ("kind" = String, Path, description = "Artwork kind: poster, backdrop, or logo")
+    ),
+    responses(
+        (status = 200, description = "Cached artwork image"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Cached artwork image not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_catalog_item_image(
+    State(state): State<AppState>,
+    Path((id, kind)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let id = parse_id(id)?;
+    let kind = CatalogArtworkKind::parse(&kind).ok_or(ApiError::ArtworkNotFound)?;
+    let Some(local_path) = state.catalog.artwork_local_path(id, kind).await? else {
+        return Err(ApiError::ArtworkNotFound);
+    };
+    let path = artwork_cache_path(&state.artwork_cache_dir, &local_path)
+        .ok_or(ApiError::ArtworkNotFound)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|source| artwork_read_error(path, source))?;
+    let content_type = artwork_content_type(&local_path).ok_or(ApiError::ArtworkNotFound)?;
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -351,6 +404,16 @@ pub(crate) enum ApiError {
 
     #[error("invalid media item type: {value}")]
     InvalidMediaItemType { value: String },
+
+    #[error("artwork image not found")]
+    ArtworkNotFound,
+
+    #[error("reading artwork image {path}: {source}")]
+    ArtworkRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -406,6 +469,14 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST
             }
             Self::InvalidMediaItemType { .. } => StatusCode::BAD_REQUEST,
+            Self::ArtworkNotFound => StatusCode::NOT_FOUND,
+            Self::ArtworkRead { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+                StatusCode::NOT_FOUND
+            }
+            Self::ArtworkRead { .. } => {
+                tracing::error!(error = %self, "library artwork api failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Library(_) => {
                 tracing::error!(error = %self, "library admin api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -449,4 +520,33 @@ fn manual_import_message(message: Option<&str>, path: &std::path::Path, job_id: 
         Some(message) => format!("{message}; {import_message}"),
         None => import_message,
     }
+}
+
+fn artwork_cache_path(cache_dir: &FsPath, local_path: &FsPath) -> Option<PathBuf> {
+    if local_path.is_absolute() {
+        return None;
+    }
+
+    for component in local_path.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return None;
+        }
+    }
+
+    Some(cache_dir.join(local_path))
+}
+
+fn artwork_content_type(path: &FsPath) -> Option<&'static str> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("avif") => Some("image/avif"),
+        Some("gif") => Some("image/gif"),
+        Some("jpeg" | "jpg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn artwork_read_error(path: PathBuf, source: std::io::Error) -> ApiError {
+    ApiError::ArtworkRead { path, source }
 }

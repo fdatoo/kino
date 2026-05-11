@@ -20,6 +20,11 @@ log_format = "pretty"
 # Runtime override: KINO_LIBRARY__CANONICAL_TRANSFER.
 canonical_transfer = "hard_link"
 
+# Directory used for content-addressed artwork caching. Optional. Defaults to
+# <library_root>/.kino/artwork.
+# Runtime override: KINO_LIBRARY__ARTWORK_CACHE_DIR.
+# artwork_cache_dir = "/srv/media/.kino/artwork"
+
 # Directory used for image-subtitle OCR staging. Optional. Defaults to
 # <library_root>/.kino/subtitles.
 # Runtime override: KINO_LIBRARY__SUBTITLE_STAGING_DIR.
