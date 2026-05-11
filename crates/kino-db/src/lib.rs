@@ -378,7 +378,7 @@ mod tests {
     use std::borrow::Cow;
     use std::path::PathBuf;
 
-    use kino_core::Config;
+    use kino_core::{CanonicalIdentityId, Config, Id, Timestamp, TmdbId};
     use sqlx::migrate::{Migration, MigrationType, Migrator};
 
     #[tokio::test]
@@ -458,6 +458,7 @@ mod tests {
                 (10, String::from("subtitle sidecars")),
                 (11, String::from("metadata cache")),
                 (12, String::from("source files")),
+                (13, String::from("core catalog schemas")),
             ]
         );
 
@@ -498,7 +499,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            13,
+            14,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -511,7 +512,7 @@ mod tests {
         .fetch_one(db.write_pool())
         .await?;
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 13")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 14")
                 .fetch_one(db.write_pool())
                 .await?;
 
@@ -528,22 +529,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(13, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(14, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 13")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 14")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 13, .. }
+            super::Error::MigrationFailed { version: 14, .. }
         ));
-        assert!(err.to_string().contains("database migration 13 failed"));
+        assert!(err.to_string().contains("database migration 14 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -575,6 +576,7 @@ mod tests {
                 (10, String::from("subtitle sidecars")),
                 (11, String::from("metadata cache")),
                 (12, String::from("source files")),
+                (13, String::from("core catalog schemas")),
             ]
         );
 
@@ -601,6 +603,141 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn catalog_schema_enforces_source_and_transcode_foreign_keys()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let identity = movie_identity(603);
+        let media_item_id = Id::new();
+        let source_file_id = Id::new();
+        let transcode_output_id = Id::new();
+        let now = Timestamp::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO canonical_identities (
+                id,
+                provider,
+                media_kind,
+                tmdb_id,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6)
+            "#,
+        )
+        .bind(identity)
+        .bind(identity.provider().as_str())
+        .bind(identity.kind().as_str())
+        .bind(i64::from(identity.tmdb_id().get()))
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, 'movie', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(identity)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO source_files (
+                id,
+                media_item_id,
+                path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, '/srv/media/Movies/The Matrix (1999)/The Matrix (1999).mkv', ?3, ?4)
+            "#,
+        )
+        .bind(source_file_id)
+        .bind(media_item_id)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO transcode_outputs (
+                id,
+                source_file_id,
+                path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, '/srv/media/Movies/The Matrix (1999)/Streams/main.m3u8', ?3, ?4)
+            "#,
+        )
+        .bind(transcode_output_id)
+        .bind(source_file_id)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        let missing_media_item = sqlx::query(
+            r#"
+            INSERT INTO source_files (
+                id,
+                media_item_id,
+                path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, '/srv/media/orphan.mkv', ?3, ?4)
+            "#,
+        )
+        .bind(Id::new())
+        .bind(Id::new())
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await;
+
+        let missing_source_file = sqlx::query(
+            r#"
+            INSERT INTO transcode_outputs (
+                id,
+                source_file_id,
+                path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, '/srv/media/orphan.m3u8', ?3, ?4)
+            "#,
+        )
+        .bind(Id::new())
+        .bind(Id::new())
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await;
+
+        assert!(missing_media_item.is_err());
+        assert!(missing_source_file.is_err());
+
+        db.close().await;
+        Ok(())
+    }
+
     fn config(database_path: PathBuf) -> Config {
         Config {
             database_path,
@@ -611,6 +748,13 @@ mod tests {
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
+        }
+    }
+
+    fn movie_identity(tmdb_id: u32) -> CanonicalIdentityId {
+        match TmdbId::new(tmdb_id) {
+            Some(tmdb_id) => CanonicalIdentityId::tmdb_movie(tmdb_id),
+            None => panic!("test tmdb id should be valid"),
         }
     }
 

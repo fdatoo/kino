@@ -4,6 +4,7 @@
 //! and [`Config`] types and the per-crate `thiserror` error convention
 //! documented in `AGENTS.md`.
 
+pub mod catalog;
 pub mod config;
 pub mod id;
 pub mod identity;
@@ -11,6 +12,7 @@ pub mod request;
 pub mod time;
 pub mod tracing;
 
+pub use catalog::{MediaItem, MediaItemKind, SourceFile, TranscodeOutput};
 pub use config::{CanonicalLayoutTransfer, Config, LibraryConfig};
 pub use id::Id;
 pub use identity::{

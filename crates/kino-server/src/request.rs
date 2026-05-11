@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use kino_core::{CanonicalIdentityId, Id, id::ParseIdError};
+use kino_core::{CanonicalIdentityId, Id, MediaItemKind, id::ParseIdError};
 use kino_db::Db;
 use kino_fulfillment::{
     FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
@@ -17,7 +17,7 @@ use kino_fulfillment::{
 };
 use kino_library::{
     CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService, LibraryScanReport,
-    LibraryScanService, MediaItemKind,
+    LibraryScanService,
 };
 use serde::{Deserialize, Serialize};
 
@@ -418,7 +418,7 @@ fn parse_id(value: String) -> ApiResult<Id> {
 fn parse_media_item_kind(value: &str) -> ApiResult<MediaItemKind> {
     match value {
         "movie" => Ok(MediaItemKind::Movie),
-        "tv" | "tv_series" => Ok(MediaItemKind::TvSeries),
+        "tv" | "tv_episode" | "tv_series" => Ok(MediaItemKind::TvEpisode),
         "personal" => Ok(MediaItemKind::Personal),
         _ => Err(ApiError::InvalidMediaItemType {
             value: value.to_owned(),
