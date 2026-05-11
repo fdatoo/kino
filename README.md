@@ -39,7 +39,11 @@ binary:
 
 ## Build
 
-    cargo build --workspace
+    just build
+
+Regenerate the committed OpenAPI spec after API changes:
+
+    just openapi
 
 ## Run
 
