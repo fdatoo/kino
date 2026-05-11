@@ -126,6 +126,53 @@ async fn token_api_rejects_empty_label() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+#[tokio::test]
+async fn token_api_revokes_token() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db.clone());
+    let created = create_token(&app, "Kitchen iPad").await?;
+
+    let response = delete_token(&app, created.token_id).await?;
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let revoked_at = token_revoked_at(&db, created.token_id).await?;
+    assert!(revoked_at.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_api_returns_not_found_for_missing_revoke() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let response = delete_token(&app, Id::new()).await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_api_double_revoke_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db.clone());
+    let created = create_token(&app, "Bedroom Apple TV").await?;
+
+    let first_response = delete_token(&app, created.token_id).await?;
+    let first_revoked_at = token_revoked_at(&db, created.token_id).await?;
+    let second_response = delete_token(&app, created.token_id).await?;
+    let second_revoked_at = token_revoked_at(&db, created.token_id).await?;
+
+    assert_eq!(first_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(second_response.status(), StatusCode::NO_CONTENT);
+    assert!(first_revoked_at.is_some());
+    assert_eq!(second_revoked_at, first_revoked_at);
+
+    Ok(())
+}
+
 async fn create_token(
     app: &axum::Router,
     label: &str,
@@ -143,6 +190,37 @@ async fn create_token(
 
     assert_eq!(response.status(), StatusCode::CREATED);
     response_json(response).await
+}
+
+async fn delete_token(
+    app: &axum::Router,
+    token_id: Id,
+) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/admin/tokens/{token_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    Ok(response)
+}
+
+async fn token_revoked_at(
+    db: &kino_db::Db,
+    token_id: Id,
+) -> Result<Option<Timestamp>, Box<dyn std::error::Error>> {
+    let revoked_at = sqlx::query_scalar::<_, Option<Timestamp>>(
+        "SELECT revoked_at FROM device_tokens WHERE id = ?1",
+    )
+    .bind(token_id)
+    .fetch_one(db.read_pool())
+    .await?;
+
+    Ok(revoked_at)
 }
 
 async fn response_json<T: serde::de::DeserializeOwned>(

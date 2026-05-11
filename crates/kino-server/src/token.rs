@@ -1,12 +1,12 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{delete, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use kino_core::{Id, Timestamp, device_token::DeviceToken, user::SEEDED_USER_ID};
+use kino_core::{Id, Timestamp, device_token::DeviceToken, id::ParseIdError, user::SEEDED_USER_ID};
 use kino_db::Db;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,7 @@ pub(crate) fn router(db: Db) -> Router {
     Router::new()
         // TODO(F-304): require an existing valid admin device token before issuing or listing tokens.
         .route("/api/v1/admin/tokens", post(create_token).get(list_tokens))
+        .route("/api/v1/admin/tokens/{token_id}", delete(delete_token))
         .with_state(TokenState { db })
 }
 
@@ -165,6 +166,46 @@ pub(crate) async fn list_tokens(
     Ok(Json(ListTokensResponse { tokens }))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/tokens/{token_id}",
+    tag = "admin",
+    params(
+        ("token_id" = Id, Path, description = "Device token id")
+    ),
+    responses(
+        (status = 204, description = "Device token revoked"),
+        (status = 400, description = "Invalid token id", body = TokenErrorResponse),
+        (status = 404, description = "Device token not found", body = TokenErrorResponse),
+        (status = 500, description = "Token revocation failed", body = TokenErrorResponse)
+    )
+)]
+pub(crate) async fn delete_token(
+    State(state): State<TokenState>,
+    Path(token_id): Path<String>,
+) -> TokenResult<StatusCode> {
+    let token_id = parse_id(token_id)?;
+    let revoked_at = Timestamp::now();
+    let result = sqlx::query(
+        r#"
+        UPDATE device_tokens
+        SET revoked_at = ?1
+        WHERE id = ?2
+          AND revoked_at IS NULL
+        "#,
+    )
+    .bind(revoked_at)
+    .bind(token_id)
+    .execute(state.db.write_pool())
+    .await?;
+
+    if result.rows_affected() > 0 || token_exists(&state.db, token_id).await? {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    Err(TokenApiError::TokenNotFound { token_id })
+}
+
 pub(crate) type TokenResult<T> = std::result::Result<T, TokenApiError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -174,6 +215,12 @@ pub(crate) enum TokenApiError {
 
     #[error("secure random token generation failed: {0}")]
     Random(#[from] rand::Error),
+
+    #[error("invalid token id {value}: {source}")]
+    InvalidId { value: String, source: ParseIdError },
+
+    #[error("device token not found: {token_id}")]
+    TokenNotFound { token_id: Id },
 
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
@@ -188,6 +235,8 @@ impl IntoResponse for TokenApiError {
     fn into_response(self) -> Response {
         let status = match &self {
             Self::EmptyLabel => StatusCode::BAD_REQUEST,
+            Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
+            Self::TokenNotFound { .. } => StatusCode::NOT_FOUND,
             Self::Random(_) | Self::Sqlx(_) => {
                 tracing::error!(error = %self, "token api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -234,4 +283,19 @@ fn token_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> TokenResult<TokenSum
         revoked_at: row.try_get("revoked_at")?,
         created_at: row.try_get("created_at")?,
     })
+}
+
+async fn token_exists(db: &Db, token_id: Id) -> TokenResult<bool> {
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM device_tokens WHERE id = ?1")
+        .bind(token_id)
+        .fetch_optional(db.read_pool())
+        .await?;
+
+    Ok(exists.is_some())
+}
+
+fn parse_id(value: String) -> TokenResult<Id> {
+    value
+        .parse()
+        .map_err(|source| TokenApiError::InvalidId { value, source })
 }

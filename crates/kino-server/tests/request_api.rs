@@ -44,6 +44,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(body["servers"][0]["url"], "https://kino.example.test");
     assert!(body["paths"].get("/api/v1/library/items").is_some());
     assert!(body["paths"].get("/api/v1/admin/tokens").is_some());
+    assert!(
+        body["paths"]
+            .get("/api/v1/admin/tokens/{token_id}")
+            .is_some()
+    );
 
     let json = std::str::from_utf8(&bytes)?;
     let spec = oas3::from_json(json)?;
