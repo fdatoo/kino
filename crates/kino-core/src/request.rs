@@ -67,7 +67,8 @@ impl RequestState {
         match self {
             Self::Pending => matches!(
                 next,
-                Self::NeedsDisambiguation
+                Self::Pending
+                    | Self::NeedsDisambiguation
                     | Self::Resolved
                     | Self::Satisfied
                     | Self::Failed
@@ -102,7 +103,8 @@ impl RequestState {
                     Self::Resolved | Self::Satisfied | Self::Failed | Self::Cancelled
                 )
             }
-            Self::Satisfied | Self::Failed | Self::Cancelled => false,
+            Self::Failed | Self::Cancelled => matches!(next, Self::Pending),
+            Self::Satisfied => false,
         }
     }
 

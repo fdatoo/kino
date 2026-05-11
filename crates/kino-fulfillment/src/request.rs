@@ -258,6 +258,8 @@ pub enum RequestTransition {
     Fail(RequestFailureReason),
     /// Move from any active state to cancelled.
     Cancel,
+    /// Move a resettable request back to pending.
+    Reset,
 }
 
 impl RequestTransition {
@@ -271,6 +273,7 @@ impl RequestTransition {
             Self::Satisfy => RequestState::Satisfied,
             Self::Fail(_) => RequestState::Failed,
             Self::Cancel => RequestState::Cancelled,
+            Self::Reset => RequestState::Pending,
         }
     }
 
@@ -290,6 +293,10 @@ impl RequestTransition {
             Self::StartIngesting => matches!(from, RequestState::Fulfilling),
             Self::Satisfy => matches!(from, RequestState::Planning | RequestState::Ingesting),
             Self::Fail(_) | Self::Cancel => from.is_active(),
+            Self::Reset => matches!(
+                from,
+                RequestState::Pending | RequestState::Failed | RequestState::Cancelled
+            ),
         }
     }
 
@@ -302,7 +309,8 @@ impl RequestTransition {
             | Self::StartFulfilling
             | Self::StartIngesting
             | Self::Satisfy
-            | Self::Cancel => None,
+            | Self::Cancel
+            | Self::Reset => None,
         }
     }
 }
@@ -318,6 +326,7 @@ impl fmt::Display for RequestTransition {
             Self::Satisfy => f.write_str("satisfy"),
             Self::Fail(reason) => write!(f, "fail ({reason})"),
             Self::Cancel => f.write_str("cancel"),
+            Self::Reset => f.write_str("reset"),
         }
     }
 }
@@ -1448,9 +1457,22 @@ impl RequestService {
         }
 
         let now = Timestamp::now();
-        self.store
-            .update_state(&mut tx, request_id, next, now, transition.failure_reason())
-            .await?;
+        if transition == RequestTransition::Reset {
+            self.store
+                .delete_match_candidates(&mut tx, request_id)
+                .await?;
+            self.store.reset(&mut tx, request_id, now).await?;
+        } else {
+            self.store
+                .update_state(&mut tx, request_id, next, now, transition.failure_reason())
+                .await?;
+        }
+
+        let (actor, message) = if transition == RequestTransition::Reset {
+            (Some(RequestEventActor::System), Some("reset by operator"))
+        } else {
+            (actor, message)
+        };
 
         self.store
             .insert_status_event(
@@ -2779,6 +2801,78 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reset_moves_failed_request_to_pending_without_deleting_history()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = RequestService::new(db);
+        let created = service
+            .create(NewRequest::anonymous("Inception (2010)"))
+            .await?;
+        service
+            .resolve_identity(
+                created.request.id,
+                identity(550),
+                RequestIdentityProvenance::Manual,
+                Some(RequestEventActor::System),
+                None,
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::StartPlanning,
+                Some(RequestEventActor::System),
+                None,
+            )
+            .await?;
+        service
+            .record_plan(
+                created.request.id,
+                NewFulfillmentPlan::new(
+                    FulfillmentPlanDecision::NeedsProvider,
+                    "provider must acquire source",
+                )
+                .with_actor(RequestEventActor::System),
+            )
+            .await?;
+        service
+            .transition(
+                created.request.id,
+                RequestTransition::Fail(RequestFailureReason::IngestFailed),
+                Some(RequestEventActor::System),
+                Some("probe failed"),
+            )
+            .await?;
+
+        let detail = service
+            .transition(
+                created.request.id,
+                RequestTransition::Reset,
+                Some(RequestEventActor::User(Id::new())),
+                Some("ignored"),
+            )
+            .await?;
+
+        assert_eq!(detail.request.state, RequestState::Pending);
+        assert_eq!(detail.request.failure_reason, None);
+        assert_eq!(detail.request.target.canonical_identity_id, None);
+        assert_eq!(detail.request.plan_id, None);
+        assert_eq!(detail.current_plan, None);
+        assert_eq!(detail.identity_versions.len(), 1);
+        assert_eq!(detail.plan_history.len(), 1);
+        let event = detail
+            .status_events
+            .last()
+            .ok_or("reset should write a status event")?;
+        assert_eq!(event.from_state, Some(RequestState::Failed));
+        assert_eq!(event.to_state, RequestState::Pending);
+        assert_eq!(event.actor, Some(RequestEventActor::System));
+        assert_eq!(event.message.as_deref(), Some("reset by operator"));
+
+        Ok(())
+    }
+
     #[test]
     fn transition_matrix_enumerates_legal_and_illegal_transitions() {
         let states = [
@@ -2801,8 +2895,10 @@ mod tests {
             RequestTransition::Satisfy,
             RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
             RequestTransition::Cancel,
+            RequestTransition::Reset,
         ];
         let legal = [
+            (RequestState::Pending, RequestTransition::Reset),
             (RequestState::Pending, RequestTransition::Resolve),
             (
                 RequestState::Pending,
@@ -2846,6 +2942,8 @@ mod tests {
                 RequestTransition::Fail(RequestFailureReason::NoProviderAccepted),
             ),
             (RequestState::Ingesting, RequestTransition::Cancel),
+            (RequestState::Failed, RequestTransition::Reset),
+            (RequestState::Cancelled, RequestTransition::Reset),
         ];
 
         for state in states {

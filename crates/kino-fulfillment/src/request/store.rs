@@ -528,6 +528,32 @@ impl RequestStore {
         Ok(())
     }
 
+    pub(super) async fn reset(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        request_id: Id,
+        updated_at: Timestamp,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE requests
+            SET canonical_identity_id = NULL,
+                state = ?2,
+                updated_at = ?3,
+                plan_id = NULL,
+                failure_reason = NULL
+            WHERE id = ?1
+            "#,
+        )
+        .bind(request_id)
+        .bind(RequestState::Pending.as_str())
+        .bind(updated_at)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
     pub(super) async fn insert_status_event(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
