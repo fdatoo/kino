@@ -147,13 +147,14 @@ pub async fn reocr_track(
             language,
             format,
             provenance,
+            forced,
             track_index,
             path,
             archived_at,
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)
         "#,
     )
     .bind(job.job_id)
@@ -161,6 +162,7 @@ pub async fn reocr_track(
     .bind(&current.language)
     .bind(SubtitleFormat::Json.as_str())
     .bind(SubtitleProvenance::Ocr.as_str())
+    .bind(if current.forced { 1_i64 } else { 0_i64 })
     .bind(i64::from(track_index))
     .bind(path_text)
     .bind(job.started_at)
@@ -192,6 +194,7 @@ async fn current_ocr_sidecar(
             language,
             format,
             provenance,
+            forced,
             track_index,
             path,
             archived_at,

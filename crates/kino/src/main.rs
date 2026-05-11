@@ -229,6 +229,7 @@ mod tests {
                 (19, String::from("catalog fts")),
                 (20, String::from("metadata artwork")),
                 (21, String::from("subtitle archive")),
+                (22, String::from("source file probe data")),
             ]
         );
 

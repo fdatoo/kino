@@ -309,6 +309,13 @@ pub enum Error {
         /// Persisted track index.
         value: i64,
     },
+
+    /// A source-file probe track index could not fit into the public type.
+    #[error("invalid source-file track index: {value}")]
+    InvalidSourceFileTrackIndex {
+        /// Persisted track index.
+        value: i64,
+    },
 }
 
 /// Crate-local `Result` alias.
@@ -359,7 +366,7 @@ impl MetadataAsset {
 }
 
 /// Ordered cast member returned by the TMDB metadata provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct MetadataCastMember {
     /// Cast order from TMDB.
     pub order: u32,
@@ -836,6 +843,14 @@ pub struct CatalogMediaItem {
     pub episode_number: Option<u32>,
     /// Cached display title, when metadata has been enriched.
     pub title: Option<String>,
+    /// Cached overview or description, when metadata has been enriched.
+    pub description: Option<String>,
+    /// Cached release or first-air date, when metadata has been enriched.
+    pub release_date: Option<String>,
+    /// Release or first-air year derived from metadata, when known.
+    pub year: Option<u16>,
+    /// Ordered cast members, when metadata has been enriched.
+    pub cast: Vec<MetadataCastMember>,
     /// Cached artwork URLs for this item.
     pub artwork: CatalogArtwork,
     /// Streamable source and transcode variants for this item.
@@ -863,6 +878,8 @@ pub struct CatalogSubtitleTrack {
     pub format: SubtitleFormat,
     /// How the subtitle text was derived.
     pub provenance: SubtitleProvenance,
+    /// Whether the subtitle track is marked forced.
+    pub forced: bool,
     /// Probed subtitle stream index in the source file.
     pub track_index: u32,
 }
@@ -997,6 +1014,7 @@ impl CatalogService {
         }
         self.attach_source_files(&mut items).await?;
         self.attach_subtitle_tracks(&mut items).await?;
+        self.attach_metadata_cast(&mut items).await?;
 
         let next_offset = if has_next {
             Some(offset + u64::from(limit))
@@ -1020,6 +1038,8 @@ impl CatalogService {
                 media_items.created_at,
                 media_items.updated_at,
                 media_metadata_cache.title,
+                media_metadata_cache.description,
+                media_metadata_cache.release_date,
                 media_metadata_cache.poster_path AS poster_source_url,
                 media_metadata_cache.poster_local_path,
                 media_metadata_cache.backdrop_path AS backdrop_source_url,
@@ -1044,6 +1064,8 @@ impl CatalogService {
         self.attach_source_files(std::slice::from_mut(&mut item))
             .await?;
         self.attach_subtitle_tracks(std::slice::from_mut(&mut item))
+            .await?;
+        self.attach_metadata_cast(std::slice::from_mut(&mut item))
             .await?;
         Ok(item)
     }
@@ -1097,6 +1119,8 @@ impl CatalogService {
                 media_items.created_at,
                 media_items.updated_at,
                 media_metadata_cache.title,
+                media_metadata_cache.description,
+                media_metadata_cache.release_date,
                 media_metadata_cache.poster_path AS poster_source_url,
                 media_metadata_cache.poster_local_path,
                 media_metadata_cache.backdrop_path AS backdrop_source_url,
@@ -1209,6 +1233,11 @@ impl CatalogService {
             .iter()
             .map(library_source_file_from_row)
             .collect::<Result<Vec<_>>>()?;
+        self.attach_source_file_probes(&mut source_files).await?;
+        self.attach_source_file_audio_tracks(&mut source_files)
+            .await?;
+        self.attach_source_file_subtitle_tracks(&mut source_files)
+            .await?;
         self.attach_transcode_outputs(&mut source_files).await?;
 
         let mut by_media_item = HashMap::<Id, Vec<LibrarySourceFile>>::new();
@@ -1240,6 +1269,7 @@ impl CatalogService {
                 language,
                 format,
                 provenance,
+                forced,
                 track_index
             FROM subtitle_sidecars
             WHERE media_item_id IN (
@@ -1264,6 +1294,159 @@ impl CatalogService {
 
         for item in items {
             item.subtitle_tracks = by_media_item.remove(&item.id).unwrap_or_default();
+        }
+
+        Ok(())
+    }
+
+    async fn attach_metadata_cast(&self, items: &mut [CatalogMediaItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT media_item_id, position, name, character, profile_path
+            FROM media_metadata_cast_members
+            WHERE media_item_id IN (
+            "#,
+        );
+        let mut separated = builder.separated(", ");
+        for item in items.iter() {
+            separated.push_bind(item.id);
+        }
+        separated.push_unseparated(") ORDER BY media_item_id, position");
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut by_media_item = HashMap::<Id, Vec<MetadataCastMember>>::new();
+        for row in &rows {
+            let media_item_id = row.try_get("media_item_id")?;
+            by_media_item
+                .entry(media_item_id)
+                .or_default()
+                .push(cast_member_from_row(row)?);
+        }
+
+        for item in items {
+            item.cast = by_media_item.remove(&item.id).unwrap_or_default();
+        }
+
+        Ok(())
+    }
+
+    async fn attach_source_file_probes(
+        &self,
+        source_files: &mut [LibrarySourceFile],
+    ) -> Result<()> {
+        if source_files.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT
+                source_file_id,
+                container,
+                video_codec,
+                video_width,
+                video_height,
+                video_hdr
+            FROM source_file_probes
+            WHERE source_file_id IN (
+            "#,
+        );
+        let mut separated = builder.separated(", ");
+        for source_file in source_files.iter() {
+            separated.push_bind(source_file.id);
+        }
+        separated.push_unseparated(") ORDER BY source_file_id");
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut by_source_file = HashMap::<Id, SourceFileProbe>::new();
+        for row in &rows {
+            let source_file_id = row.try_get("source_file_id")?;
+            by_source_file.insert(source_file_id, source_file_probe_from_row(row)?);
+        }
+
+        for source_file in source_files {
+            source_file.probe = by_source_file.remove(&source_file.id);
+        }
+
+        Ok(())
+    }
+
+    async fn attach_source_file_audio_tracks(
+        &self,
+        source_files: &mut [LibrarySourceFile],
+    ) -> Result<()> {
+        if source_files.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT source_file_id, track_index, codec, language, channels
+            FROM source_file_audio_tracks
+            WHERE source_file_id IN (
+            "#,
+        );
+        let mut separated = builder.separated(", ");
+        for source_file in source_files.iter() {
+            separated.push_bind(source_file.id);
+        }
+        separated.push_unseparated(") ORDER BY source_file_id, track_index");
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut by_source_file = HashMap::<Id, Vec<SourceFileAudioTrack>>::new();
+        for row in &rows {
+            let source_file_id = row.try_get("source_file_id")?;
+            by_source_file
+                .entry(source_file_id)
+                .or_default()
+                .push(source_file_audio_track_from_row(row)?);
+        }
+
+        for source_file in source_files {
+            source_file.audio_tracks = by_source_file.remove(&source_file.id).unwrap_or_default();
+        }
+
+        Ok(())
+    }
+
+    async fn attach_source_file_subtitle_tracks(
+        &self,
+        source_files: &mut [LibrarySourceFile],
+    ) -> Result<()> {
+        if source_files.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT source_file_id, track_index, format, provenance, language, forced
+            FROM source_file_subtitle_tracks
+            WHERE source_file_id IN (
+            "#,
+        );
+        let mut separated = builder.separated(", ");
+        for source_file in source_files.iter() {
+            separated.push_bind(source_file.id);
+        }
+        separated.push_unseparated(") ORDER BY source_file_id, track_index, provenance, language");
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut by_source_file = HashMap::<Id, Vec<SourceFileSubtitleTrack>>::new();
+        for row in &rows {
+            let source_file_id = row.try_get("source_file_id")?;
+            by_source_file
+                .entry(source_file_id)
+                .or_default()
+                .push(source_file_subtitle_track_from_row(row)?);
+        }
+
+        for source_file in source_files {
+            source_file.subtitle_tracks =
+                by_source_file.remove(&source_file.id).unwrap_or_default();
         }
 
         Ok(())
@@ -1904,8 +2087,62 @@ pub struct LibrarySourceFile {
     /// Canonical source path stored in the catalog.
     #[schema(value_type = String)]
     pub path: PathBuf,
+    /// Probe metadata captured from the source file, when available.
+    pub probe: Option<SourceFileProbe>,
+    /// Audio tracks discovered in the source file.
+    pub audio_tracks: Vec<SourceFileAudioTrack>,
+    /// Subtitle tracks discovered in the source file.
+    pub subtitle_tracks: Vec<SourceFileSubtitleTrack>,
     /// Transcode outputs derived from this source file.
     pub transcode_outputs: Vec<TranscodeOutput>,
+}
+
+/// Source-file probe facts used by item-detail clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct SourceFileProbe {
+    /// Container format label, when known.
+    pub container: Option<String>,
+    /// Video stream facts, when the source has a probed video stream.
+    pub video: Option<SourceFileVideoProbe>,
+}
+
+/// Video stream facts for a probed source file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct SourceFileVideoProbe {
+    /// Video codec label, when known.
+    pub codec: Option<String>,
+    /// Resolution label such as `1080p`, when known.
+    pub resolution: Option<String>,
+    /// HDR format label, when known.
+    pub hdr: Option<String>,
+}
+
+/// Audio track facts for a probed source file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct SourceFileAudioTrack {
+    /// Probed stream index in the source file.
+    pub track_index: u32,
+    /// Audio codec label, when known.
+    pub codec: Option<String>,
+    /// Language tag reported for the stream.
+    pub language: Option<String>,
+    /// Audio channel count, when known.
+    pub channels: Option<u32>,
+}
+
+/// Subtitle track facts for a probed source file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct SourceFileSubtitleTrack {
+    /// Probed stream index in the source file.
+    pub track_index: u32,
+    /// Subtitle sidecar format exposed to clients.
+    pub format: SubtitleFormat,
+    /// Whether the track is text or OCR-derived.
+    pub provenance: SubtitleProvenance,
+    /// Normalized subtitle language.
+    pub language: String,
+    /// Whether the subtitle stream is marked forced.
+    pub forced: bool,
 }
 
 /// Subtitle formats discovered by the probe step.
@@ -2133,6 +2370,8 @@ pub struct SubtitleSidecar {
     pub format: SubtitleFormat,
     /// How the subtitle text was derived.
     pub provenance: SubtitleProvenance,
+    /// Whether the subtitle track is marked forced.
+    pub forced: bool,
     /// Probed subtitle stream index in the source file.
     pub track_index: u32,
     /// Filesystem path to the sidecar file.
@@ -2212,6 +2451,7 @@ impl SubtitleService {
                 language,
                 format,
                 provenance: SubtitleProvenance::Text,
+                forced: false,
                 track_index: track.track_index,
                 path,
                 archived_at: None,
@@ -2296,6 +2536,7 @@ impl SubtitleService {
                 language,
                 format,
                 provenance: SubtitleProvenance::Ocr,
+                forced: false,
                 track_index: track.track_index,
                 path,
                 archived_at: None,
@@ -2373,6 +2614,7 @@ impl SubtitleService {
                 language,
                 format,
                 provenance,
+                forced,
                 track_index,
                 path,
                 archived_at,
@@ -2817,6 +3059,10 @@ fn catalog_media_item_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogM
         season_number: optional_u32_from_row(row, "season_number")?,
         episode_number: optional_u32_from_row(row, "episode_number")?,
         title: row.try_get("title")?,
+        description: row.try_get("description")?,
+        release_date: row.try_get("release_date")?,
+        year: release_year_from_row(row)?,
+        cast: Vec::new(),
         artwork: catalog_artwork_from_row(row, id)?,
         variants: Vec::new(),
         source_files: Vec::new(),
@@ -2888,9 +3134,34 @@ fn optional_u32_from_row(
         .transpose()
 }
 
+fn bool_from_row(row: &sqlx::sqlite::SqliteRow, field: &'static str) -> Result<bool> {
+    let value: i64 = row.try_get(field)?;
+    Ok(value != 0)
+}
+
+fn release_year_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Option<u16>> {
+    let release_date: Option<String> = row.try_get("release_date")?;
+    let Some(release_date) = release_date else {
+        return Ok(None);
+    };
+    let Some(year) = release_date.get(..4) else {
+        return Ok(None);
+    };
+    if !year.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+
+    Ok(year.parse::<u16>().ok())
+}
+
 fn subtitle_track_index_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<u32> {
     let value: i64 = row.try_get("track_index")?;
     u32::try_from(value).map_err(|_| Error::InvalidSubtitleTrackIndex { value })
+}
+
+fn source_file_track_index_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<u32> {
+    let value: i64 = row.try_get("track_index")?;
+    u32::try_from(value).map_err(|_| Error::InvalidSourceFileTrackIndex { value })
 }
 
 fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<LibrarySourceFile> {
@@ -2899,7 +3170,60 @@ fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Library
         id: row.try_get("id")?,
         media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
+        probe: None,
+        audio_tracks: Vec::new(),
+        subtitle_tracks: Vec::new(),
         transcode_outputs: Vec::new(),
+    })
+}
+
+fn source_file_probe_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SourceFileProbe> {
+    let width = optional_u32_from_row(row, "video_width")?;
+    let height = optional_u32_from_row(row, "video_height")?;
+    let codec: Option<String> = row.try_get("video_codec")?;
+    let hdr: Option<String> = row.try_get("video_hdr")?;
+    let video = if codec.is_none() && width.is_none() && height.is_none() && hdr.is_none() {
+        None
+    } else {
+        Some(SourceFileVideoProbe {
+            codec,
+            resolution: video_resolution(width, height),
+            hdr,
+        })
+    };
+
+    Ok(SourceFileProbe {
+        container: row.try_get("container")?,
+        video,
+    })
+}
+
+fn video_resolution(width: Option<u32>, height: Option<u32>) -> Option<String> {
+    match (width, height) {
+        (_, Some(height)) => Some(format!("{height}p")),
+        (Some(width), None) => Some(format!("{width}w")),
+        (None, None) => None,
+    }
+}
+
+fn source_file_audio_track_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SourceFileAudioTrack> {
+    Ok(SourceFileAudioTrack {
+        track_index: source_file_track_index_from_row(row)?,
+        codec: row.try_get("codec")?,
+        language: row.try_get("language")?,
+        channels: optional_u32_from_row(row, "channels")?,
+    })
+}
+
+fn source_file_subtitle_track_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<SourceFileSubtitleTrack> {
+    Ok(SourceFileSubtitleTrack {
+        track_index: source_file_track_index_from_row(row)?,
+        format: subtitle_format_from_row(row)?,
+        provenance: subtitle_provenance_from_row(row)?,
+        language: row.try_get("language")?,
+        forced: bool_from_row(row, "forced")?,
     })
 }
 
@@ -2921,9 +3245,26 @@ fn source_file_stream_variant(source_file: &LibrarySourceFile) -> CatalogStreamV
     CatalogStreamVariant {
         variant_id: source_file.id.to_string(),
         kind: VariantKind::Source,
-        capabilities: variant_capabilities_from_path(&source_file.path),
+        capabilities: source_file_variant_capabilities(source_file),
         stream_url: format!("/api/v1/stream/sourcefile/{}", source_file.id),
     }
+}
+
+fn source_file_variant_capabilities(source_file: &LibrarySourceFile) -> VariantCapabilities {
+    let mut capabilities = variant_capabilities_from_path(&source_file.path);
+    if let Some(probe) = &source_file.probe {
+        if let Some(container) = probe.container.as_ref().filter(|value| !value.is_empty()) {
+            capabilities.container = container.clone();
+        }
+        if let Some(video) = &probe.video {
+            if let Some(codec) = video.codec.as_ref().filter(|value| !value.is_empty()) {
+                capabilities.codec = codec.clone();
+            }
+            capabilities.resolution = video.resolution.clone();
+            capabilities.hdr = video.hdr.clone();
+        }
+    }
+    capabilities
 }
 
 fn transcode_output_stream_variant(output: &TranscodeOutput) -> CatalogStreamVariant {
@@ -2960,6 +3301,7 @@ fn catalog_subtitle_track_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Cata
         label: subtitle_track_label(&language, provenance),
         format,
         provenance,
+        forced: bool_from_row(row, "forced")?,
         track_index: subtitle_track_index_from_row(row)?,
     })
 }
@@ -2973,6 +3315,7 @@ pub(crate) fn subtitle_sidecar_from_row(row: &sqlx::sqlite::SqliteRow) -> Result
         language: row.try_get("language")?,
         format: subtitle_format_from_row(row)?,
         provenance: subtitle_provenance_from_row(row)?,
+        forced: bool_from_row(row, "forced")?,
         track_index: subtitle_track_index_from_row(row)?,
         path: PathBuf::from(path),
         archived_at: row.try_get("archived_at")?,
@@ -3402,6 +3745,9 @@ mod tests {
                     id: missing_source_id,
                     media_item_id,
                     path: missing,
+                    probe: None,
+                    audio_tracks: Vec::new(),
+                    subtitle_tracks: Vec::new(),
                     transcode_outputs: Vec::new(),
                 },
             }]
@@ -3519,6 +3865,7 @@ mod tests {
                     label: String::from("ENG"),
                     format: SubtitleFormat::Srt,
                     provenance: SubtitleProvenance::Text,
+                    forced: false,
                     track_index: 2,
                 },
                 CatalogSubtitleTrack {
@@ -3527,6 +3874,7 @@ mod tests {
                     label: String::from("JPN (OCR)"),
                     format: SubtitleFormat::Json,
                     provenance: SubtitleProvenance::Ocr,
+                    forced: false,
                     track_index: 4,
                 },
             ]
