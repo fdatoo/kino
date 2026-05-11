@@ -48,6 +48,15 @@ public_base_url = "http://127.0.0.1:8080"
 # Runtime override: KINO_TMDB__MAX_REQUESTS_PER_SECOND.
 max_requests_per_second = 20
 
+[ocr]
+# Tesseract binary path. Optional. Defaults to resolving "tesseract" on PATH.
+# Runtime override: KINO_OCR__TESSERACT_PATH.
+tesseract_path = "tesseract"
+
+# Tesseract language code. Optional. Defaults to "eng".
+# Runtime override: KINO_OCR__LANGUAGE.
+language = "eng"
+
 [providers.disc_rip]
 # Directory scanned for MakeMKV-style output files. Required when this provider
 # section is present, and validated at startup.

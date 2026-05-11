@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use axum::Router;
+use axum::{Router, middleware};
 use kino_core::Config;
 use kino_db::Db;
 
@@ -49,11 +49,12 @@ pub fn router_with_library_root_and_public_base_url(
 ) -> Router {
     let library_root = library_root.into();
     let artwork_cache_dir = kino_core::config::default_artwork_cache_dir(&library_root);
-    Router::new()
-        .merge(openapi::router(public_base_url))
-        .merge(request::router(db.clone(), library_root, artwork_cache_dir))
-        .merge(token::router(db))
-        .merge(kino_admin::router())
+    router_with_library_root_artwork_cache_and_public_base_url(
+        db,
+        library_root,
+        artwork_cache_dir,
+        public_base_url,
+    )
 }
 
 /// Serve the Kino HTTP API until the listener exits.
@@ -138,13 +139,21 @@ pub fn router_with_library_root_artwork_cache_and_public_base_url(
     artwork_cache_dir: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Router {
-    Router::new()
-        .merge(openapi::router(public_base_url))
+    let auth_state = auth::AuthState { db: db.clone() };
+    let protected_api = Router::new()
         .merge(request::router(
             db.clone(),
             library_root.into(),
             artwork_cache_dir.into(),
         ))
         .merge(token::router(db))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ));
+
+    Router::new()
+        .merge(openapi::router(public_base_url))
+        .merge(protected_api)
         .merge(kino_admin::router())
 }

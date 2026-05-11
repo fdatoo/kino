@@ -193,6 +193,7 @@ mod tests {
             library: Default::default(),
             server: ServerConfig::default(),
             tmdb: TmdbConfig::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: log_level.into(),
             log_format,

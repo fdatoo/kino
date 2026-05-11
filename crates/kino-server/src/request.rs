@@ -7,7 +7,6 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{StatusCode, header},
-    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -129,10 +128,7 @@ pub(crate) fn router(db: Db, library_root: PathBuf, artwork_cache_dir: PathBuf) 
         .route("/api/v1/library/items/{id}", get(get_catalog_item))
         .route(
             "/api/v1/library/items/{id}/images/{kind}",
-            get(get_catalog_item_image).route_layer(middleware::from_fn_with_state(
-                crate::auth::AuthState { db },
-                crate::auth::require_auth,
-            )),
+            get(get_catalog_item_image),
         )
         .route("/api/v1/admin/library/scan", get(scan_library))
         .with_state(state)

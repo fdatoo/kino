@@ -379,8 +379,8 @@ mod tests {
     use std::path::PathBuf;
 
     use kino_core::{
-        CanonicalIdentityId, Config, DeviceToken, Id, PlaybackProgress, SEEDED_USER_ID, Timestamp,
-        TmdbId, Watched, WatchedSource,
+        CanonicalIdentityId, Config, DeviceToken, Id, PlaybackProgress, PlaybackSession,
+        PlaybackSessionStatus, SEEDED_USER_ID, Timestamp, TmdbId, Watched, WatchedSource,
     };
     use sqlx::migrate::{Migration, MigrationType, Migrator};
 
@@ -465,6 +465,8 @@ mod tests {
                 (14, String::from("users")),
                 (15, String::from("device tokens")),
                 (16, String::from("playback state")),
+                (17, String::from("playback sessions")),
+                (18, String::from("subtitle provenance")),
                 (20, String::from("metadata artwork")),
             ]
         );
@@ -595,6 +597,194 @@ mod tests {
 
         assert_eq!(revoked_lookup.0, token.hash);
         assert_eq!(revoked_lookup.1, Some(revoked_at));
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_sessions_support_heartbeat_and_status_transitions()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let identity = movie_identity(604);
+        let media_item_id = Id::new();
+        let token = DeviceToken::new(
+            Id::new(),
+            SEEDED_USER_ID,
+            "Bedroom iPad",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "2026-05-11T00:55:00Z".parse()?,
+        );
+        let started_at: Timestamp = "2026-05-11T01:00:00Z".parse()?;
+        let heartbeat_at: Timestamp = "2026-05-11T01:05:00Z".parse()?;
+        let idle_at: Timestamp = "2026-05-11T01:10:00Z".parse()?;
+        let ended_at: Timestamp = "2026-05-11T01:12:00Z".parse()?;
+        let session = PlaybackSession::active(
+            Id::new(),
+            SEEDED_USER_ID,
+            token.id,
+            media_item_id,
+            Id::new().to_string(),
+            started_at,
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO canonical_identities (
+                id,
+                provider,
+                media_kind,
+                tmdb_id,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6)
+            "#,
+        )
+        .bind(identity)
+        .bind(identity.provider().as_str())
+        .bind(identity.kind().as_str())
+        .bind(i64::from(identity.tmdb_id().get()))
+        .bind(started_at)
+        .bind(started_at)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, 'movie', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(identity)
+        .bind(started_at)
+        .bind(started_at)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO device_tokens (
+                id,
+                user_id,
+                label,
+                hash,
+                last_seen_at,
+                revoked_at,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(token.id)
+        .bind(token.user_id)
+        .bind(&token.label)
+        .bind(&token.hash)
+        .bind(token.last_seen_at)
+        .bind(token.revoked_at)
+        .bind(token.created_at)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO playback_sessions (
+                id,
+                user_id,
+                token_id,
+                media_item_id,
+                variant_id,
+                started_at,
+                last_seen_at,
+                ended_at,
+                status
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(session.id)
+        .bind(session.user_id)
+        .bind(session.token_id)
+        .bind(session.media_item_id)
+        .bind(&session.variant_id)
+        .bind(session.started_at)
+        .bind(session.last_seen_at)
+        .bind(session.ended_at)
+        .bind(session.status.as_str())
+        .execute(db.write_pool())
+        .await?;
+
+        let inserted: (String, Timestamp, Option<Timestamp>) = sqlx::query_as(
+            "SELECT status, last_seen_at, ended_at FROM playback_sessions WHERE id = ?1",
+        )
+        .bind(session.id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(
+            PlaybackSessionStatus::parse(&inserted.0),
+            Some(PlaybackSessionStatus::Active)
+        );
+        assert_eq!(inserted.1, started_at);
+        assert_eq!(inserted.2, None);
+
+        sqlx::query("UPDATE playback_sessions SET last_seen_at = ?1 WHERE id = ?2")
+            .bind(heartbeat_at)
+            .bind(session.id)
+            .execute(db.write_pool())
+            .await?;
+
+        let heartbeated: Timestamp =
+            sqlx::query_scalar("SELECT last_seen_at FROM playback_sessions WHERE id = ?1")
+                .bind(session.id)
+                .fetch_one(db.read_pool())
+                .await?;
+        assert_eq!(heartbeated, heartbeat_at);
+
+        sqlx::query("UPDATE playback_sessions SET status = ?1, last_seen_at = ?2 WHERE id = ?3")
+            .bind(PlaybackSessionStatus::Idle.as_str())
+            .bind(idle_at)
+            .bind(session.id)
+            .execute(db.write_pool())
+            .await?;
+
+        let idled: (String, Timestamp, Option<Timestamp>) = sqlx::query_as(
+            "SELECT status, last_seen_at, ended_at FROM playback_sessions WHERE id = ?1",
+        )
+        .bind(session.id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(
+            PlaybackSessionStatus::parse(&idled.0),
+            Some(PlaybackSessionStatus::Idle)
+        );
+        assert_eq!(idled.1, idle_at);
+        assert_eq!(idled.2, None);
+
+        sqlx::query("UPDATE playback_sessions SET status = ?1, ended_at = ?2 WHERE id = ?3")
+            .bind(PlaybackSessionStatus::Ended.as_str())
+            .bind(ended_at)
+            .bind(session.id)
+            .execute(db.write_pool())
+            .await?;
+
+        let ended: (String, Option<Timestamp>) =
+            sqlx::query_as("SELECT status, ended_at FROM playback_sessions WHERE id = ?1")
+                .bind(session.id)
+                .fetch_one(db.read_pool())
+                .await?;
+        assert_eq!(
+            PlaybackSessionStatus::parse(&ended.0),
+            Some(PlaybackSessionStatus::Ended)
+        );
+        assert_eq!(ended.1, Some(ended_at));
 
         db.close().await;
         Ok(())
@@ -868,6 +1058,8 @@ mod tests {
                 (14, String::from("users")),
                 (15, String::from("device tokens")),
                 (16, String::from("playback state")),
+                (17, String::from("playback sessions")),
+                (18, String::from("subtitle provenance")),
                 (20, String::from("metadata artwork")),
             ]
         );
@@ -1121,6 +1313,7 @@ mod tests {
             library: Default::default(),
             server: Default::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
