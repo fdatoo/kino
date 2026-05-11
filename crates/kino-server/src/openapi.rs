@@ -22,6 +22,7 @@ use utoipa::openapi::server::Server;
         crate::request::scan_library,
         crate::request::score_matches,
         crate::session_admin::list_sessions,
+        crate::stream::media_playlist,
         crate::stream::master_playlist,
         crate::stream::source_file,
         crate::stream::subtitle_track,

@@ -7,7 +7,7 @@ use kino_library::{
     OcrSubtitleExtractionInput, OcrSubtitleTrack, ProbedSubtitleFormat, ProbedSubtitleTrack,
     SubtitleExtractionInput, SubtitleService, subtitle_ocr,
 };
-use m3u8_rs::AlternativeMediaType;
+use m3u8_rs::{AlternativeMediaType, MediaPlaylistType, Playlist};
 use std::time::Duration;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
@@ -23,6 +23,87 @@ impl AuthRequestBuilder for axum::http::request::Builder {
     fn bearer(self, token: &str) -> Self {
         self.header(header::AUTHORIZATION, common::bearer(token))
     }
+}
+
+#[tokio::test]
+async fn media_playlist_uses_source_file_byte_ranges() -> Result<(), Box<dyn std::error::Error>> {
+    let file_size = 60 * 1024 * 1024;
+    let fixture = media_playlist_fixture(60, file_size).await?;
+
+    let response = fixture
+        .app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/items/{}/{}/media.m3u8",
+                    fixture.media_item_id, fixture.source_file_id
+                ))
+                .bearer(&fixture.auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static(
+            "application/vnd.apple.mpegurl"
+        ))
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let playlist_text = std::str::from_utf8(&body)?;
+    assert!(playlist_text.contains("#EXT-X-ENDLIST"));
+    assert!(!playlist_text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+
+    let playlist = parse_media_playlist(playlist_text)?;
+    assert_eq!(playlist.target_duration, 6);
+    assert_eq!(playlist.playlist_type, Some(MediaPlaylistType::Vod));
+    assert!(playlist.end_list);
+    assert_eq!(playlist.segments.len(), 10);
+
+    let mut offset = 0;
+    let mut total_length = 0;
+    for segment in &playlist.segments {
+        assert_eq!(segment.duration, 6.0);
+        assert_eq!(
+            segment.uri,
+            format!("/api/v1/stream/sourcefile/{}", fixture.source_file_id)
+        );
+        let Some(byte_range) = &segment.byte_range else {
+            return Err("segment missing byte range".into());
+        };
+        assert_eq!(byte_range.offset, Some(offset));
+        offset += byte_range.length;
+        total_length += byte_range.length;
+    }
+    assert_eq!(total_length, file_size);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_playlist_requires_auth() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/items/{}/{}/media.m3u8",
+                    Id::new(),
+                    Id::new()
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -595,6 +676,14 @@ struct HlsFixture {
     source_file_id: Id,
 }
 
+struct MediaPlaylistFixture {
+    app: axum::Router,
+    auth: String,
+    media_item_id: Id,
+    source_file_id: Id,
+    _temp_dir: TempDir,
+}
+
 async fn hls_fixture(forced_subtitle: bool) -> Result<HlsFixture, Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
@@ -611,6 +700,42 @@ async fn hls_fixture(forced_subtitle: bool) -> Result<HlsFixture, Box<dyn std::e
         media_item_id,
         source_file_id,
     })
+}
+
+async fn media_playlist_fixture(
+    duration_seconds: i64,
+    file_size: u64,
+) -> Result<MediaPlaylistFixture, Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let source_path = temp_dir.path().join("source.mkv");
+    let source_file = std::fs::File::create(&source_path)?;
+    source_file.set_len(file_size)?;
+
+    let db = kino_db::test_db().await?;
+    let (auth, _) = common::issued_token_with_id(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let source_file_id =
+        insert_source_file_with_duration(&db, media_item_id, &source_path, Some(duration_seconds))
+            .await?;
+    let app = kino_server::router(db);
+
+    Ok(MediaPlaylistFixture {
+        app,
+        auth,
+        media_item_id,
+        source_file_id,
+        _temp_dir: temp_dir,
+    })
+}
+
+fn parse_media_playlist(
+    playlist_text: &str,
+) -> Result<m3u8_rs::MediaPlaylist, Box<dyn std::error::Error>> {
+    match m3u8_rs::parse_playlist_res(playlist_text.as_bytes()) {
+        Ok(Playlist::MediaPlaylist(playlist)) => Ok(playlist),
+        Ok(Playlist::MasterPlaylist(_)) => Err("expected media playlist, got master".into()),
+        Err(error) => Err(format!("playlist parse failed: {error:?}").into()),
+    }
 }
 
 async fn stream_fixture() -> Result<StreamFixture, Box<dyn std::error::Error>> {
@@ -828,6 +953,15 @@ async fn insert_source_file(
     media_item_id: Id,
     path: &std::path::Path,
 ) -> Result<Id, sqlx::Error> {
+    insert_source_file_with_duration(db, media_item_id, path, None).await
+}
+
+async fn insert_source_file_with_duration(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    path: &std::path::Path,
+    probe_duration_seconds: Option<i64>,
+) -> Result<Id, sqlx::Error> {
     let id = Id::new();
     let now = Timestamp::now();
     let path = path.to_string_lossy().into_owned();
@@ -838,15 +972,17 @@ async fn insert_source_file(
             id,
             media_item_id,
             path,
+            probe_duration_seconds,
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
     )
     .bind(id)
     .bind(media_item_id)
     .bind(path)
+    .bind(probe_duration_seconds)
     .bind(now)
     .bind(now)
     .execute(db.write_pool())
