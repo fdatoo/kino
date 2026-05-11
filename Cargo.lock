@@ -991,14 +991,17 @@ name = "kino-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "kino-admin",
  "kino-core",
  "kino-db",
  "kino-fulfillment",
  "kino-library",
  "oas3",
+ "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror",

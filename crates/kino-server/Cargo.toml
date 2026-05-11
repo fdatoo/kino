@@ -9,12 +9,16 @@ workspace = true
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
 kino-admin = { path = "../kino-admin" }
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
 kino-fulfillment = { path = "../kino-fulfillment" }
 kino-library = { path = "../kino-library" }
+rand = "0.8"
 serde = { workspace = true, features = ["derive"] }
+sha2 = "0.10"
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -24,6 +28,5 @@ utoipa = { workspace = true, features = ["axum_extras"] }
 oas3 = "0.22.0"
 kino-db = { path = "../kino-db", features = ["test-helpers"] }
 serde_json = { workspace = true }
-sqlx = { workspace = true }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
