@@ -19,6 +19,7 @@ use utoipa::openapi::server::Server;
         crate::request::manual_import,
         crate::request::record_plan,
         crate::request::re_resolve,
+        crate::request::reset_request,
         crate::request::resolve_request,
         crate::request::scan_library,
         crate::session_admin::list_sessions,

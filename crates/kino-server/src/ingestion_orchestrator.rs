@@ -7,8 +7,9 @@ use kino_core::{
     CanonicalIdentityId, CanonicalIdentityKind, CanonicalLayoutTransfer, Id, RequestFailureReason,
 };
 use kino_fulfillment::{
-    ExpectedProbedFile, FfprobeFileProbe, ProbeResult, ProbeSubtitleKind, RequestDetail,
-    RequestEventActor, RequestTransition, movie::TmdbMovieId, tmdb::TmdbClient,
+    ExpectedProbedFile, FfprobeFileProbe, ProbeResult, ProbeSubtitleKind,
+    ProbedFileVerificationResult, RequestDetail, RequestEventActor, RequestTransition,
+    movie::TmdbMovieId, tmdb::TmdbClient,
 };
 use kino_library::{
     CanonicalLayoutInput, CanonicalLayoutResult, CanonicalMediaTarget,
@@ -85,7 +86,7 @@ async fn ingest_request_inner(
     let probe = FfprobeFileProbe::new().probe(source_path).await?;
     let tmdb = state.tmdb.as_ref().ok_or(IngestError::TmdbNotConfigured)?;
     let expected = expected_probed_file(tmdb, canonical_identity_id).await?;
-    state
+    let verification = state
         .requests
         .verify_probed_file(
             request_id,
@@ -94,6 +95,10 @@ async fn ingest_request_inner(
             Some(RequestEventActor::System),
         )
         .await?;
+    match verification {
+        ProbedFileVerificationResult::Matched { .. } => {}
+        ProbedFileVerificationResult::Mismatched { detail, .. } => return Ok(*detail),
+    }
 
     let item = state
         .catalog

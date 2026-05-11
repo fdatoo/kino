@@ -182,6 +182,7 @@ pub(crate) fn router_with_canonical_transfer(
             get(get_request).delete(cancel_request),
         )
         .route("/api/v1/requests/{id}/resolve", post(resolve_request))
+        .route("/api/v1/requests/{id}/reset", post(reset_request))
         .route("/api/v1/requests/{id}/plans", post(record_plan))
         .route("/api/v1/requests/{id}/re-resolution", post(re_resolve))
         .route(
@@ -304,6 +305,33 @@ pub(crate) async fn cancel_request(
     let detail = state
         .requests
         .transition(id, RequestTransition::Cancel, None, None)
+        .await?;
+    Ok(Json(detail))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/requests/{id}/reset",
+    tag = "requests",
+    params(
+        ("id" = Id, Path, description = "Request id")
+    ),
+    responses(
+        (status = 200, description = "Request reset to pending", body = RequestDetail),
+        (status = 400, description = "Invalid request id", body = ErrorResponse),
+        (status = 404, description = "Request not found", body = ErrorResponse),
+        (status = 409, description = "Request cannot be reset from its current state", body = ErrorResponse),
+        (status = 500, description = "Request reset failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn reset_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RequestDetail>> {
+    let id = parse_id(id)?;
+    let detail = state
+        .requests
+        .transition(id, RequestTransition::Reset, None, None)
         .await?;
     Ok(Json(detail))
 }

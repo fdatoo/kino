@@ -4,7 +4,9 @@ use axum::{
     body::{Body, to_bytes},
     http::{HeaderValue, Request as HttpRequest, StatusCode, header},
 };
-use kino_core::{CanonicalIdentityId, Id, Timestamp, TmdbId, user::SEEDED_USER_ID};
+use kino_core::{
+    CanonicalIdentityId, Id, RequestFailureReason, Timestamp, TmdbId, user::SEEDED_USER_ID,
+};
 use kino_fulfillment::{
     FulfillmentPlanDecision, NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage,
     RequestService, RequestState, RequestTransition,
@@ -889,6 +891,96 @@ async fn manual_import_api_fails_when_probe_rejects_source()
 }
 
 #[tokio::test]
+async fn manual_import_api_returns_failed_detail_when_probe_mismatches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let library_root = tempfile::tempdir()?;
+    let artwork_cache = tempfile::tempdir()?;
+    let tmdb = TmdbTestServer::new(vec![
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","popularity":83.1}]}"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, r#"{"results":[]}"#),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{
+                "id":27205,
+                "title":"Inception",
+                "release_date":"2010-07-15",
+                "runtime":10,
+                "popularity":83.1
+            }"#,
+        ),
+    ])
+    .await?;
+    let app = kino_server::router_with_library_root_and_tmdb_client(
+        db.clone(),
+        library_root.path(),
+        artwork_cache.path(),
+        tmdb.client()?,
+    );
+    let created = create_request(&app, &auth, "Inception (2010)").await?;
+
+    let resolve_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/resolve", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(resolve_response.status(), StatusCode::OK);
+
+    let incoming = tempfile::tempdir()?;
+    let path = incoming.path().join("short-inception.mkv");
+    write_sample_video(&path).await?;
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/requests/{}/manual-import",
+                    created.request.id
+                ))
+                .bearer(&auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["request"]["request"]["state"], "failed");
+    assert_eq!(
+        body["request"]["request"]["failure_reason"],
+        "ingest_failed"
+    );
+    let detail: RequestDetail = serde_json::from_value(body["request"].clone())?;
+    assert_eq!(detail.request.state, RequestState::Failed);
+    assert_eq!(
+        detail.request.failure_reason,
+        Some(RequestFailureReason::IngestFailed)
+    );
+    assert!(
+        detail
+            .status_events
+            .last()
+            .and_then(|event| event.message.as_deref())
+            .is_some_and(|message| message.contains("duration mismatch")),
+        "got: {detail:?}"
+    );
+    assert_eq!(media_item_count(&db).await?, 0);
+    assert!(tokio::fs::try_exists(&path).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
@@ -938,6 +1030,249 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
     let detail: RequestDetail = response_json(get_response).await?;
     assert_eq!(detail.request.state, RequestState::Failed);
     assert_eq!(media_item_count(&db).await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_reset_allows_failed_manual_import_retry() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let library_root = tempfile::tempdir()?;
+    let artwork_cache = tempfile::tempdir()?;
+    let tmdb = TmdbTestServer::new(vec![
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","popularity":83.1}]}"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, r#"{"results":[]}"#),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","popularity":83.1}]}"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, r#"{"results":[]}"#),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{
+                "id":27205,
+                "title":"Inception",
+                "release_date":"2010-07-15",
+                "runtime":1,
+                "popularity":83.1
+            }"#,
+        ),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{
+                "id":27205,
+                "title":"Inception",
+                "release_date":"2010-07-15",
+                "overview":"A thief enters dreams.",
+                "runtime":1,
+                "poster_path":"/poster.jpg",
+                "backdrop_path":"/backdrop.jpg",
+                "popularity":83.1,
+                "credits":{"cast":[{"order":0,"name":"Leonardo DiCaprio","character":"Cobb","profile_path":null}]},
+                "images":{"logos":[]}
+            }"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, "poster-bytes"),
+        TmdbTestResponse::json(StatusCode::OK, "backdrop-bytes"),
+    ])
+    .await?;
+    let app = kino_server::router_with_library_root_and_tmdb_client(
+        db.clone(),
+        library_root.path(),
+        artwork_cache.path(),
+        tmdb.client()?,
+    );
+    let created = create_request(&app, &auth, "Inception (2010)").await?;
+
+    let resolve_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/resolve", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(resolve_response.status(), StatusCode::OK);
+
+    let missing_path = std::env::temp_dir().join(format!(
+        "kino-manual-import-reset-missing-{}.mkv",
+        created.request.id
+    ));
+    let failed_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/requests/{}/manual-import",
+                    created.request.id
+                ))
+                .bearer(&auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"path":"{}","message":"bad source path"}}"#,
+                    missing_path.display()
+                )))?,
+        )
+        .await?;
+    assert_eq!(failed_response.status(), StatusCode::OK);
+    let failed_body: Value = response_json(failed_response).await?;
+    assert_eq!(failed_body["request"]["request"]["state"], "failed");
+    assert_eq!(
+        failed_body["request"]["request"]["failure_reason"],
+        "ingest_failed"
+    );
+
+    let reset_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/reset", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(reset_response.status(), StatusCode::OK);
+    let reset: RequestDetail = response_json(reset_response).await?;
+    assert_eq!(reset.request.state, RequestState::Pending);
+    assert_eq!(reset.request.failure_reason, None);
+    assert_eq!(reset.request.target.canonical_identity_id, None);
+    assert_eq!(reset.request.plan_id, None);
+    assert_eq!(reset.current_plan, None);
+    assert_eq!(reset.identity_versions.len(), 1);
+    assert!(!reset.status_events.is_empty());
+    let reset_event = reset
+        .status_events
+        .last()
+        .ok_or("reset should write a status event")?;
+    assert_eq!(reset_event.from_state, Some(RequestState::Failed));
+    assert_eq!(reset_event.to_state, RequestState::Pending);
+    assert_eq!(reset_event.message.as_deref(), Some("reset by operator"));
+
+    let second_resolve_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/resolve", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(second_resolve_response.status(), StatusCode::OK);
+    let resolved_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/v1/requests/{}", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    let resolved: RequestDetail = response_json(resolved_response).await?;
+    assert_eq!(resolved.request.state, RequestState::Resolved);
+
+    let incoming = tempfile::tempdir()?;
+    let path = incoming.path().join("inception.mkv");
+    write_sample_video(&path).await?;
+    let satisfied_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/requests/{}/manual-import",
+                    created.request.id
+                ))
+                .bearer(&auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"path":"{}","message":"retry with valid source"}}"#,
+                    path.display()
+                )))?,
+        )
+        .await?;
+    assert_eq!(satisfied_response.status(), StatusCode::OK);
+    let satisfied_body: Value = response_json(satisfied_response).await?;
+    let satisfied: RequestDetail = serde_json::from_value(satisfied_body["request"].clone())?;
+    assert_eq!(satisfied.request.state, RequestState::Satisfied);
+    assert_eq!(satisfied.request.failure_reason, None);
+    assert_eq!(satisfied.identity_versions.len(), 2);
+    assert_eq!(media_item_count(&db).await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_reset_rejects_satisfied_request() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let service = RequestService::new(db.clone());
+    let app = kino_server::router(db.clone());
+    let created = service
+        .create(NewRequest::anonymous("Inception (2010)"))
+        .await?;
+    service
+        .resolve_identity(
+            created.request.id,
+            identity(550),
+            RequestIdentityProvenance::Manual,
+            None,
+            None,
+        )
+        .await?;
+    service
+        .transition(
+            created.request.id,
+            RequestTransition::StartPlanning,
+            None,
+            None,
+        )
+        .await?;
+    service
+        .transition(created.request.id, RequestTransition::Satisfy, None, None)
+        .await?;
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/reset", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_reset_returns_not_found_for_unknown_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let app = kino_server::router(db.clone());
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/reset", Id::new()))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     Ok(())
 }
