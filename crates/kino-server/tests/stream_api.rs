@@ -90,6 +90,36 @@ async fn stream_source_file_serves_single_range() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
+async fn stream_transcode_output_serves_full_file() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = stream_fixture().await?;
+
+    let response = fixture
+        .app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/transcode/{}",
+                    fixture.transcode_output_id
+                ))
+                .bearer(&fixture.auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static("video/mp4"))
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(body.as_ref(), fixture.transcode_bytes.as_slice());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn stream_source_file_serves_suffix_range() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = stream_fixture().await?;
 
@@ -172,27 +202,35 @@ struct StreamFixture {
     app: axum::Router,
     auth: String,
     source_file_id: Id,
+    transcode_output_id: Id,
     bytes: Vec<u8>,
+    transcode_bytes: Vec<u8>,
     _temp_dir: TempDir,
 }
 
 async fn stream_fixture() -> Result<StreamFixture, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let source_path = temp_dir.path().join("source.mkv");
+    let transcode_path = temp_dir.path().join("stream.mp4");
     let bytes = source_bytes();
+    let transcode_bytes = b"transcoded bytes".to_vec();
     std::fs::write(&source_path, &bytes)?;
+    std::fs::write(&transcode_path, &transcode_bytes)?;
 
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
     let media_item_id = insert_personal_media_item(&db).await?;
     let source_file_id = insert_source_file(&db, media_item_id, &source_path).await?;
+    let transcode_output_id = insert_transcode_output(&db, source_file_id, &transcode_path).await?;
     let app = kino_server::router(db);
 
     Ok(StreamFixture {
         app,
         auth,
         source_file_id,
+        transcode_output_id,
         bytes,
+        transcode_bytes,
         _temp_dir: temp_dir,
     })
 }
@@ -249,6 +287,38 @@ async fn insert_source_file(
     )
     .bind(id)
     .bind(media_item_id)
+    .bind(path)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
+}
+
+async fn insert_transcode_output(
+    db: &kino_db::Db,
+    source_file_id: Id,
+    path: &std::path::Path,
+) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+    let path = path.to_string_lossy().into_owned();
+
+    sqlx::query(
+        r#"
+        INSERT INTO transcode_outputs (
+            id,
+            source_file_id,
+            path,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(id)
+    .bind(source_file_id)
     .bind(path)
     .bind(now)
     .bind(now)

@@ -30,6 +30,7 @@ pub(crate) struct StreamState {
 pub(crate) fn router(db: Db) -> Router {
     Router::new()
         .route("/api/v1/stream/sourcefile/{id}", get(source_file))
+        .route("/api/v1/stream/transcode/{id}", get(transcode_output))
         .with_state(StreamState { db })
 }
 
@@ -59,7 +60,37 @@ pub(crate) async fn source_file(
     headers: HeaderMap,
 ) -> StreamResult<Response> {
     let source_file = lookup_source_file(&state.db, id).await?;
-    let mut file = tokio::fs::File::open(&source_file.path).await?;
+    stream_file(source_file.path, headers).await
+}
+
+/// Serve a transcode output with single-range support.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/transcode/{id}",
+    tag = "stream",
+    params(
+        ("id" = Id, Path, description = "Transcode-output id"),
+        ("Range" = Option<String>, Header, description = "Single HTTP byte range")
+    ),
+    responses(
+        (status = 200, description = "Full transcode output"),
+        (status = 206, description = "Requested byte range"),
+        (status = 404, description = "Transcode output not found", body = StreamErrorResponse),
+        (status = 416, description = "Requested range is not satisfiable", body = StreamErrorResponse),
+        (status = 500, description = "Transcode output stream failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn transcode_output(
+    State(state): State<StreamState>,
+    AxumPath(id): AxumPath<Id>,
+    headers: HeaderMap,
+) -> StreamResult<Response> {
+    let transcode_output = lookup_transcode_output(&state.db, id).await?;
+    stream_file(transcode_output.path, headers).await
+}
+
+async fn stream_file(path: PathBuf, headers: HeaderMap) -> StreamResult<Response> {
+    let mut file = tokio::fs::File::open(&path).await?;
     let metadata = file.metadata().await?;
     let file_size = metadata.len();
     let range = resolve_range(&headers, file_size)?;
@@ -72,11 +103,8 @@ pub(crate) async fn source_file(
         .status(range.status())
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, range.length.to_string())
-        .header(CONTENT_TYPE, content_type(&source_file.path))
-        .header(
-            ETAG,
-            etag(&source_file.path, file_size, metadata.modified()?),
-        );
+        .header(CONTENT_TYPE, content_type(&path))
+        .header(ETAG, etag(&path, file_size, metadata.modified()?));
 
     if range.partial {
         builder = builder.header(
@@ -201,6 +229,27 @@ async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
         r#"
         SELECT path
         FROM source_files
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(db.read_pool())
+    .await?
+    else {
+        return Err(StreamError::NotFound);
+    };
+
+    let path: String = row.try_get("path")?;
+    Ok(SourceFileRow {
+        path: PathBuf::from(path),
+    })
+}
+
+async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT path
+        FROM transcode_outputs
         WHERE id = ?1
         "#,
     )
