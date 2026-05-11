@@ -92,7 +92,7 @@ impl FulfillmentProvider for ManualImportProvider {
                     cleanup: FulfillmentProviderCleanup::NothingToCleanUp,
                 }),
                 Some(job) => Ok(FulfillmentProviderJobStatus::Completed {
-                    source_path: job.source_path.clone(),
+                    source_paths: vec![job.source_path.clone()],
                 }),
                 None => Err(unknown_job()),
             }
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(
             provider.status(&handle).await?,
             FulfillmentProviderJobStatus::Completed {
-                source_path: path.clone()
+                source_paths: vec![path.clone()]
             }
         );
 

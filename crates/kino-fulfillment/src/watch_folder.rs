@@ -143,7 +143,9 @@ impl FulfillmentProvider for WatchFolderProvider {
                     Ok(status)
                 }
                 Some(WatchFolderJobState::Completed { source_path, .. }) => {
-                    Ok(FulfillmentProviderJobStatus::Completed { source_path })
+                    Ok(FulfillmentProviderJobStatus::Completed {
+                        source_paths: vec![source_path],
+                    })
                 }
                 Some(WatchFolderJobState::Cancelled { cleanup }) => {
                     Ok(FulfillmentProviderJobStatus::Cancelled { cleanup })
@@ -274,7 +276,9 @@ fn next_watch_status(
                 canonical_identity_id,
                 source_path: source_path.clone(),
             },
-            FulfillmentProviderJobStatus::Completed { source_path },
+            FulfillmentProviderJobStatus::Completed {
+                source_paths: vec![source_path],
+            },
         );
     }
 
@@ -413,7 +417,7 @@ mod tests {
         assert_eq!(
             provider.status(&handle).await?,
             FulfillmentProviderJobStatus::Completed {
-                source_path: path.clone(),
+                source_paths: vec![path.clone()],
             }
         );
 
@@ -461,7 +465,7 @@ mod tests {
         assert_eq!(
             provider.status(&handle).await?,
             FulfillmentProviderJobStatus::Completed {
-                source_path: path.clone(),
+                source_paths: vec![path.clone()],
             }
         );
 

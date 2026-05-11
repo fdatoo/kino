@@ -15,27 +15,32 @@ Add a top-level `providers` section to `kino.toml` with one typed subsection per
 known provider. The initial model includes:
 
 ```toml
+[providers.disc_rip]
+path = "/srv/kino/rips"
+preference = 0
+
 [providers.watch_folder]
 path = "/srv/kino/incoming"
 preference = 0
 stability_seconds = 5
 ```
 
-`ProvidersConfig` owns optional provider sections. `WatchFolderProviderConfig`
-is a serde-derived typed config struct with provider-specific fields, the
-selection preference used by fulfillment ranking, and the file-stability window
-used before handing a file to ingestion.
+`ProvidersConfig` owns optional provider sections. `DiscRipProviderConfig` and
+`WatchFolderProviderConfig` are serde-derived typed config structs with
+provider-specific fields and the selection preference used by fulfillment
+ranking. The watch-folder config also owns the file-stability window used before
+handing a file to ingestion.
 
 Missing provider sections are valid and mean no provider of that type is
 configured. Present provider sections are validated during `Config::load`.
 
 ## Validation
 
-`providers.watch_folder.path` is required when the section is present. Startup
+Provider `path` fields are required when their sections are present. Startup
 rejects an empty path, a missing path, or a path that does not point to a
-directory. `stability_seconds` defaults to five and must be positive. This keeps
-provider misconfiguration in the same fail-fast path as database, library, and
-TMDB settings.
+directory. `providers.watch_folder.stability_seconds` defaults to five and must
+be positive. This keeps provider misconfiguration in the same fail-fast path as
+database, library, and TMDB settings.
 
 ## Extension
 

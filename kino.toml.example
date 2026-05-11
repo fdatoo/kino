@@ -26,6 +26,16 @@ listen = "127.0.0.1:7777"
 # Runtime override: KINO_TMDB__MAX_REQUESTS_PER_SECOND.
 max_requests_per_second = 20
 
+[providers.disc_rip]
+# Directory scanned for MakeMKV-style output files. Required when this provider
+# section is present, and validated at startup.
+# Runtime override: KINO_PROVIDERS__DISC_RIP__PATH.
+path = "/srv/kino/rips"
+
+# Provider ranking preference. Optional. Defaults to 0.
+# Runtime override: KINO_PROVIDERS__DISC_RIP__PREFERENCE.
+preference = 0
+
 [providers.watch_folder]
 # Directory watched for user-supplied media files. Required when this provider
 # section is present, and validated at startup.
