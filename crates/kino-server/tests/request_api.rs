@@ -108,6 +108,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
             .get("/api/v1/stream/sourcefile/{id}")
             .is_some()
     );
+    assert!(
+        body["paths"]
+            .get("/api/v1/stream/items/{id}/subtitles/{track}.vtt")
+            .is_some()
+    );
     assert!(body["paths"].get("/api/v1/stream/transcode/{id}").is_some());
     assert!(body["paths"].get("/api/v1/library/items/{id}").is_some());
     assert!(
