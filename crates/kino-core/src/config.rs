@@ -43,6 +43,10 @@ pub struct Config {
     #[serde(default)]
     pub tmdb: TmdbConfig,
 
+    /// OCR engine settings. Optional; defaults documented on [`OcrConfig`].
+    #[serde(default)]
+    pub ocr: OcrConfig,
+
     /// Fulfillment provider settings. Optional; no provider is configured by
     /// default.
     #[serde(default)]
@@ -158,6 +162,19 @@ pub struct TmdbConfig {
     pub max_requests_per_second: u32,
 }
 
+/// OCR engine settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrConfig {
+    /// Tesseract binary path. Defaults to `tesseract`, resolved through `PATH`.
+    #[serde(default = "default_tesseract_path")]
+    pub tesseract_path: PathBuf,
+
+    /// Tesseract language code. Defaults to `eng`.
+    #[serde(default = "default_ocr_language")]
+    pub language: String,
+}
+
 /// Fulfillment provider configuration sections.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,6 +244,14 @@ fn default_session_reaper_idle_to_ended() -> Duration {
     Duration::from_secs(300)
 }
 
+fn default_tesseract_path() -> PathBuf {
+    PathBuf::from("tesseract")
+}
+
+fn default_ocr_language() -> String {
+    "eng".into()
+}
+
 fn default_log_level() -> String {
     "info".into()
 }
@@ -256,6 +281,15 @@ impl Default for TmdbConfig {
         Self {
             api_key: None,
             max_requests_per_second: default_tmdb_max_requests_per_second(),
+        }
+    }
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            tesseract_path: default_tesseract_path(),
+            language: default_ocr_language(),
         }
     }
 }
@@ -316,6 +350,13 @@ pub enum ConfigError {
     /// The configured TMDB client settings are invalid.
     #[error("invalid tmdb config: {reason}")]
     InvalidTmdbConfig {
+        /// Human-readable validation failure.
+        reason: &'static str,
+    },
+
+    /// The configured OCR settings are invalid.
+    #[error("invalid ocr config: {reason}")]
+    InvalidOcrConfig {
         /// Human-readable validation failure.
         reason: &'static str,
     },
@@ -404,6 +445,7 @@ impl Config {
         validate_database_path(&self.database_path)?;
         validate_server_config(&self.server)?;
         validate_tmdb_config(&self.tmdb)?;
+        validate_ocr_config(&self.ocr)?;
         validate_provider_configs(&self.providers)?;
         Ok(self)
     }
@@ -473,6 +515,22 @@ fn validate_tmdb_config(config: &TmdbConfig) -> Result<(), ConfigError> {
     if config.max_requests_per_second > 50 {
         return Err(ConfigError::InvalidTmdbConfig {
             reason: "max_requests_per_second must be at most 50",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_ocr_config(config: &OcrConfig) -> Result<(), ConfigError> {
+    if config.tesseract_path.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidOcrConfig {
+            reason: "tesseract_path is empty",
+        });
+    }
+
+    if config.language.trim().is_empty() {
+        return Err(ConfigError::InvalidOcrConfig {
+            reason: "language is empty",
         });
     }
 
@@ -659,6 +717,10 @@ mod tests {
                 api_key = "test-api-key"
                 max_requests_per_second = 10
 
+                [ocr]
+                tesseract_path = "/usr/local/bin/tesseract"
+                language = "jpn"
+
                 [providers.disc_rip]
                 path = "{}"
                 preference = 30
@@ -700,6 +762,11 @@ mod tests {
             assert_eq!(cfg.log_format, LogFormat::Pretty);
             assert_eq!(cfg.tmdb.api_key.as_deref(), Some("test-api-key"));
             assert_eq!(cfg.tmdb.max_requests_per_second, 10);
+            assert_eq!(
+                cfg.ocr.tesseract_path,
+                PathBuf::from("/usr/local/bin/tesseract")
+            );
+            assert_eq!(cfg.ocr.language, "jpn");
             let disc_rip = cfg.providers.disc_rip.expect("disc rip should parse");
             assert_eq!(disc_rip.path, fixture.library_root.join("rips"));
             assert_eq!(disc_rip.preference, 30);
@@ -759,6 +826,8 @@ mod tests {
             );
             assert_eq!(cfg.tmdb.api_key, None);
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
+            assert_eq!(cfg.ocr.tesseract_path, PathBuf::from("tesseract"));
+            assert_eq!(cfg.ocr.language, "eng");
             assert_eq!(
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::HardLink
@@ -957,6 +1026,21 @@ mod tests {
             jail.set_env("KINO_TMDB__API_KEY", "env-api-key");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.tmdb.api_key.as_deref(), Some("env-api-key"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_ocr_config() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_OCR__TESSERACT_PATH", "/opt/bin/tesseract");
+            jail.set_env("KINO_OCR__LANGUAGE", "spa");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.ocr.tesseract_path, PathBuf::from("/opt/bin/tesseract"));
+            assert_eq!(cfg.ocr.language, "spa");
             Ok(())
         });
     }
@@ -1296,6 +1380,32 @@ mod tests {
                 err.to_string().contains("max_requests_per_second"),
                 "got: {err}"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_empty_ocr_language() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [ocr]
+                        language = " "
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidOcrConfig { .. }));
+            assert!(err.to_string().contains("language"), "got: {err}");
             Ok(())
         });
     }

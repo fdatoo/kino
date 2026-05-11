@@ -466,6 +466,7 @@ mod tests {
                 (15, String::from("device tokens")),
                 (16, String::from("playback state")),
                 (17, String::from("playback sessions")),
+                (18, String::from("subtitle provenance")),
             ]
         );
 
@@ -975,7 +976,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            18,
+            19,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -990,7 +991,7 @@ mod tests {
         assert_eq!(table_name, "migration_runner_test");
 
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 18")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 19")
                 .fetch_one(db.write_pool())
                 .await?;
         assert_eq!(recorded, 1);
@@ -1005,22 +1006,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(18, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(19, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 18")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 19")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 18, .. }
+            super::Error::MigrationFailed { version: 19, .. }
         ));
-        assert!(err.to_string().contains("database migration 18 failed"));
+        assert!(err.to_string().contains("database migration 19 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -1057,6 +1058,7 @@ mod tests {
                 (15, String::from("device tokens")),
                 (16, String::from("playback state")),
                 (17, String::from("playback sessions")),
+                (18, String::from("subtitle provenance")),
             ]
         );
 
@@ -1309,6 +1311,7 @@ mod tests {
             library: Default::default(),
             server: Default::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
