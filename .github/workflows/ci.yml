@@ -21,7 +21,7 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg tesseract-ocr
+          sudo apt-get install -y ffmpeg just tesseract-ocr
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -72,6 +72,14 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+      - name: Check OpenAPI drift
+        run: |
+          just openapi
+          if ! git diff --exit-code -- crates/kino-server/openapi.json; then
+            echo "::error::OpenAPI spec drifted. Run \`just openapi\` and commit the result."
+            exit 1
+          fi
 
   spa:
     name: spa
