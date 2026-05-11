@@ -152,6 +152,8 @@ mod tests {
                 (13, String::from("core catalog schemas")),
                 (14, String::from("users")),
                 (15, String::from("device tokens")),
+                (16, String::from("playback state")),
+                (17, String::from("playback sessions")),
             ]
         );
 
