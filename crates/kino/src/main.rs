@@ -177,6 +177,7 @@ mod tests {
             library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
@@ -191,6 +192,7 @@ mod tests {
             library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
@@ -221,6 +223,7 @@ mod tests {
                 (15, String::from("device tokens")),
                 (16, String::from("playback state")),
                 (17, String::from("playback sessions")),
+                (18, String::from("subtitle provenance")),
             ]
         );
 
