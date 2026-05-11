@@ -9,6 +9,7 @@ use kino_db::Db;
 pub mod auth;
 mod openapi;
 mod request;
+mod stream;
 mod token;
 
 /// Errors produced by `kino-server`.
@@ -50,6 +51,7 @@ pub fn router_with_library_root_and_public_base_url(
     let auth_state = auth::AuthState { db: db.clone() };
     let protected_api = Router::new()
         .merge(request::router(db.clone(), library_root.into()))
+        .merge(stream::router(db.clone()))
         .merge(token::router(db))
         .route_layer(middleware::from_fn_with_state(
             auth_state,
