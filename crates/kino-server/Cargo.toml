@@ -18,8 +18,10 @@ serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+utoipa = { workspace = true, features = ["axum_extras"] }
 
 [dev-dependencies]
+oas3 = "0.22.0"
 kino-db = { path = "../kino-db", features = ["test-helpers"] }
 serde_json = { workspace = true }
 sqlx = { workspace = true }

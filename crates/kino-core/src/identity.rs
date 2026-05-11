@@ -13,7 +13,19 @@ use sqlx::{
 use crate::Timestamp;
 
 /// Metadata provider namespace for canonical identities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalIdentityProvider {
     /// The Movie Database.
@@ -44,7 +56,19 @@ impl fmt::Display for CanonicalIdentityProvider {
 }
 
 /// Media kind within a canonical identity provider namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalIdentityKind {
     /// TMDB movie identity.
@@ -189,6 +213,17 @@ impl fmt::Display for CanonicalIdentityId {
         write!(f, "{}:{}:{}", self.provider, self.kind, self.tmdb_id)
     }
 }
+
+impl utoipa::PartialSchema for CanonicalIdentityId {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .build()
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for CanonicalIdentityId {}
 
 impl FromStr for CanonicalIdentityId {
     type Err = ParseCanonicalIdentityIdError;
