@@ -12,7 +12,10 @@ use figment::{
     Figment,
     providers::{Env, Format, Toml},
 };
-use serde::{Deserialize, Deserializer};
+use serde::{
+    Deserialize, Deserializer,
+    de::{SeqAccess, Visitor},
+};
 
 /// Kino's startup configuration.
 ///
@@ -118,6 +121,11 @@ pub struct ServerConfig {
     /// `http://127.0.0.1:8080`.
     #[serde(default = "default_public_base_url")]
     pub public_base_url: String,
+
+    /// Origins allowed to make browser cross-origin API requests. Empty means
+    /// any origin is allowed for non-credentialed requests.
+    #[serde(default, deserialize_with = "comma_separated_strings")]
+    pub cors_allowed_origins: Vec<String>,
 
     /// Playback session background reaper settings. Defaults documented on
     /// [`SessionReaperConfig`].
@@ -266,6 +274,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             public_base_url: default_public_base_url(),
+            cors_allowed_origins: Vec::new(),
             session_reaper: SessionReaperConfig::default(),
         }
     }
@@ -511,6 +520,57 @@ where
 {
     let seconds = u64::deserialize(deserializer)?;
     Ok(Duration::from_secs(seconds))
+}
+
+fn comma_separated_strings<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringListVisitor;
+
+    impl<'de> Visitor<'de> for StringListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string list or a comma-separated string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(split_string_list(value))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(split_string_list(&value))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_any(StringListVisitor)
+}
+
+fn split_string_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn validate_tmdb_config(config: &TmdbConfig) -> Result<(), ConfigError> {
@@ -947,6 +1007,28 @@ mod tests {
             jail.set_env("KINO_SERVER__PUBLIC_BASE_URL", "https://kino.example.test");
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.server.public_base_url, "https://kino.example.test");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_server_cors_allowed_origins() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env(
+                "KINO_SERVER__CORS_ALLOWED_ORIGINS",
+                "http://localhost:3000, https://tools.example.test",
+            );
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(
+                cfg.server.cors_allowed_origins,
+                vec![
+                    "http://localhost:3000".to_owned(),
+                    "https://tools.example.test".to_owned()
+                ]
+            );
             Ok(())
         });
     }

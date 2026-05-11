@@ -2,13 +2,18 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use axum::{Router, middleware};
+use axum::{
+    Router,
+    http::{HeaderValue, Method, header},
+    middleware,
+};
 use kino_core::{
     Config,
     config::{LogFormat, ServerConfig},
 };
 use kino_db::Db;
 use kino_library::SubtitleReocrService;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod admin_config;
 pub mod auth;
@@ -83,6 +88,7 @@ fn router_with_config_and_reocr(
     let public_base_url = config.server.public_base_url.clone();
     let library_root = config.library_root.clone();
     let artwork_cache_dir = config.artwork_cache_dir();
+    let cors = cors_layer(&config.server);
     let protected_api = Router::new()
         .merge(request::router(
             db.clone(),
@@ -104,6 +110,7 @@ fn router_with_config_and_reocr(
         .merge(openapi::router(public_base_url))
         .merge(protected_api)
         .merge(kino_admin::router())
+        .layer(cors)
 }
 
 /// Serve the Kino HTTP API until the listener exits.
@@ -118,6 +125,31 @@ pub async fn serve(config: &Config, db: Db) -> Result<()> {
 /// Serve the Kino HTTP API on an explicit socket address.
 pub async fn serve_on(listen: SocketAddr, db: Db) -> Result<()> {
     serve_with_library_root(listen, db, PathBuf::from(".")).await
+}
+
+fn cors_layer(config: &ServerConfig) -> CorsLayer {
+    let origins = config.cors_allowed_origins.clone();
+    let allow_origin = if origins.is_empty() {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::predicate(move |origin: &HeaderValue, _request_parts| {
+            origins
+                .iter()
+                .any(|allowed| origin.as_bytes() == allowed.as_bytes())
+        })
+    };
+
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .max_age(std::time::Duration::from_secs(600))
 }
 
 /// Serve the Kino HTTP API on an explicit socket address and library root.

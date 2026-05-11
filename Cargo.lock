@@ -1087,6 +1087,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tower-http",
  "tracing",
  "utoipa",
  "webvtt-parser",
