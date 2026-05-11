@@ -13,7 +13,7 @@ use std::{
 
 use kino_core::{
     CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, Config, Id,
-    MediaItemKind, Timestamp,
+    MediaItemKind, Timestamp, TranscodeOutput,
 };
 use kino_db::Db;
 use serde::Serialize;
@@ -161,6 +161,13 @@ pub enum Error {
     #[error("media item not found: {id}")]
     MediaItemNotFound {
         /// Missing media item id.
+        id: Id,
+    },
+
+    /// A media item has no source file to attach a transcode output to.
+    #[error("media item has no source file: {id}")]
+    MediaItemSourceFileNotFound {
+        /// Media item id without source files.
         id: Id,
     },
 
@@ -649,7 +656,20 @@ pub struct CatalogMediaItem {
     pub updated_at: Timestamp,
 }
 
-/// Library catalog read service.
+/// Capability hints describing a registered transcode output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscodeCapabilities {
+    /// Video codec used by the output.
+    pub codec: String,
+    /// Container format used by the output.
+    pub container: String,
+    /// Resolution label for the output, when known.
+    pub resolution: Option<String>,
+    /// HDR format label for the output, when known.
+    pub hdr: Option<String>,
+}
+
+/// Library catalog read and transcode-output registration service.
 #[derive(Clone)]
 pub struct CatalogService {
     db: Db,
@@ -659,6 +679,43 @@ impl CatalogService {
     /// Construct a catalog service backed by Kino's database.
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    /// Persist a transcode output for an existing media item's source file.
+    pub async fn register_transcode_output(
+        &self,
+        media_item_id: Id,
+        _capabilities: TranscodeCapabilities,
+        file_path: impl Into<PathBuf>,
+    ) -> Result<TranscodeOutput> {
+        let source_file_id = self
+            .source_file_id_for_transcode_output(media_item_id)
+            .await?;
+        let now = Timestamp::now();
+        let output = TranscodeOutput::new(Id::new(), source_file_id, file_path, now);
+        let path_text = path_to_db_text(&output.path)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO transcode_outputs (
+                id,
+                source_file_id,
+                path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(output.id)
+        .bind(output.source_file_id)
+        .bind(path_text)
+        .bind(output.created_at)
+        .bind(output.updated_at)
+        .execute(self.db.write_pool())
+        .await?;
+
+        Ok(output)
     }
 
     /// List media items using filters and offset pagination.
@@ -815,9 +872,14 @@ impl CatalogService {
         separated.push_unseparated(") ORDER BY media_item_id, path, id");
 
         let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut source_files = rows
+            .iter()
+            .map(library_source_file_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        self.attach_transcode_outputs(&mut source_files).await?;
+
         let mut by_media_item = HashMap::<Id, Vec<LibrarySourceFile>>::new();
-        for row in &rows {
-            let source_file = library_source_file_from_row(row)?;
+        for source_file in source_files {
             by_media_item
                 .entry(source_file.media_item_id)
                 .or_default()
@@ -826,6 +888,66 @@ impl CatalogService {
 
         for item in items {
             item.source_files = by_media_item.remove(&item.id).unwrap_or_default();
+        }
+
+        Ok(())
+    }
+
+    async fn source_file_id_for_transcode_output(&self, media_item_id: Id) -> Result<Id> {
+        let row = sqlx::query(
+            r#"
+            SELECT source_files.id AS source_file_id
+            FROM media_items
+            LEFT JOIN source_files
+                ON source_files.media_item_id = media_items.id
+            WHERE media_items.id = ?1
+            ORDER BY source_files.created_at, source_files.id
+            LIMIT 1
+            "#,
+        )
+        .bind(media_item_id)
+        .fetch_optional(self.db.read_pool())
+        .await?;
+
+        let Some(row) = row else {
+            return Err(Error::MediaItemNotFound { id: media_item_id });
+        };
+
+        let source_file_id: Option<Id> = row.try_get("source_file_id")?;
+        source_file_id.ok_or(Error::MediaItemSourceFileNotFound { id: media_item_id })
+    }
+
+    async fn attach_transcode_outputs(&self, source_files: &mut [LibrarySourceFile]) -> Result<()> {
+        if source_files.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT id, source_file_id, path, created_at, updated_at
+            FROM transcode_outputs
+            WHERE source_file_id IN (
+            "#,
+        );
+        let mut separated = builder.separated(", ");
+        for source_file in source_files.iter() {
+            separated.push_bind(source_file.id);
+        }
+        separated.push_unseparated(") ORDER BY source_file_id, path, id");
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut by_source_file = HashMap::<Id, Vec<TranscodeOutput>>::new();
+        for row in &rows {
+            let output = transcode_output_from_row(row)?;
+            by_source_file
+                .entry(output.source_file_id)
+                .or_default()
+                .push(output);
+        }
+
+        for source_file in source_files {
+            source_file.transcode_outputs =
+                by_source_file.remove(&source_file.id).unwrap_or_default();
         }
 
         Ok(())
@@ -1406,6 +1528,8 @@ pub struct LibrarySourceFile {
     /// Canonical source path stored in the catalog.
     #[schema(value_type = String)]
     pub path: PathBuf,
+    /// Transcode outputs derived from this source file.
+    pub transcode_outputs: Vec<TranscodeOutput>,
 }
 
 /// Subtitle formats discovered by the probe step.
@@ -2027,6 +2151,18 @@ fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Library
         id: row.try_get("id")?,
         media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
+        transcode_outputs: Vec::new(),
+    })
+}
+
+fn transcode_output_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranscodeOutput> {
+    let path: String = row.try_get("path")?;
+    Ok(TranscodeOutput {
+        id: row.try_get("id")?,
+        source_file_id: row.try_get("source_file_id")?,
+        path: PathBuf::from(path),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 
@@ -2402,6 +2538,7 @@ mod tests {
                     id: missing_source_id,
                     media_item_id,
                     path: missing,
+                    transcode_outputs: Vec::new(),
                 },
             }]
         );
@@ -2465,6 +2602,37 @@ mod tests {
         assert_eq!(fetched.id, matrix);
         assert_eq!(fetched.title.as_deref(), Some("The Matrix"));
         assert_eq!(fetched.source_files.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_transcode_output_persists_row_visible_in_catalog_read()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let source_path = PathBuf::from("/library/Movies/Fake (2026)/Fake (2026).mkv");
+        let source_file_id = insert_source_file(&db, media_item_id, &source_path).await?;
+        let service = CatalogService::new(db);
+
+        let output = service
+            .register_transcode_output(
+                media_item_id,
+                TranscodeCapabilities {
+                    codec: "h264".to_owned(),
+                    container: "mp4".to_owned(),
+                    resolution: Some("1080p".to_owned()),
+                    hdr: None,
+                },
+                "/tmp/fake.mp4",
+            )
+            .await?;
+        let item = service.get(media_item_id).await?;
+
+        assert_eq!(output.source_file_id, source_file_id);
+        assert_eq!(output.path, PathBuf::from("/tmp/fake.mp4"));
+        assert_eq!(item.source_files.len(), 1);
+        assert_eq!(item.source_files[0].transcode_outputs, vec![output]);
 
         Ok(())
     }
