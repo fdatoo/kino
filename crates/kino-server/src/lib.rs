@@ -8,6 +8,7 @@ use kino_db::Db;
 
 mod openapi;
 mod request;
+mod token;
 
 /// Errors produced by `kino-server`.
 #[derive(Debug, thiserror::Error)]
@@ -47,7 +48,8 @@ pub fn router_with_library_root_and_public_base_url(
 ) -> Router {
     Router::new()
         .merge(openapi::router(public_base_url))
-        .merge(request::router(db, library_root.into()))
+        .merge(request::router(db.clone(), library_root.into()))
+        .merge(token::router(db))
         .merge(kino_admin::router())
 }
 
