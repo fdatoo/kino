@@ -43,6 +43,10 @@ pub enum Error {
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
+    /// Transcode handoff failed during ingestion.
+    #[error("transcode handoff failed: {0}")]
+    Transcode(#[from] kino_transcode::Error),
+
     /// A requested entity does not exist.
     #[error("request {id} was not found")]
     RequestNotFound {
