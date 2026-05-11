@@ -58,7 +58,6 @@ pub(crate) struct ListTokensResponse {
 
 pub(crate) fn router(db: Db) -> Router {
     Router::new()
-        // TODO(F-304): require an existing valid admin device token before issuing or listing tokens.
         .route("/api/v1/admin/tokens", post(create_token).get(list_tokens))
         .route("/api/v1/admin/tokens/{token_id}", delete(revoke_token))
         .with_state(TokenState { db })
