@@ -2,6 +2,10 @@
 
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 
+use kino_core::{CanonicalIdentityId, CanonicalIdentityKind};
+use kino_library::{
+    MetadataAsset, MetadataCastMember, MetadataFuture, TmdbMetadata, TmdbMetadataProvider,
+};
 use reqwest::{StatusCode, Url, header};
 use serde::Deserialize;
 use thiserror::Error;
@@ -13,6 +17,7 @@ use crate::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/3/";
+const DEFAULT_IMAGE_BASE_URL: &str = "https://image.tmdb.org/t/p/original/";
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_MAX_REQUESTS_PER_SECOND: NonZeroU32 = match NonZeroU32::new(20) {
     Some(value) => value,
@@ -110,6 +115,8 @@ pub struct TmdbClientConfig {
     pub api_key: String,
     /// Base API URL. Defaults to `https://api.themoviedb.org/3/`.
     pub base_url: Url,
+    /// Base URL for original-size image assets.
+    pub image_base_url: Url,
     /// Maximum request rate enforced by this client instance.
     pub max_requests_per_second: NonZeroU32,
     /// Maximum number of retries after `429 Too Many Requests`.
@@ -125,9 +132,11 @@ impl TmdbClientConfig {
         }
 
         let base_url = parse_base_url(DEFAULT_BASE_URL)?;
+        let image_base_url = parse_base_url(DEFAULT_IMAGE_BASE_URL)?;
         Ok(Self {
             api_key,
             base_url,
+            image_base_url,
             max_requests_per_second: DEFAULT_MAX_REQUESTS_PER_SECOND,
             max_retries: DEFAULT_MAX_RETRIES,
         })
@@ -144,6 +153,12 @@ impl TmdbClientConfig {
     /// Return configuration using a different base URL.
     pub fn with_base_url(mut self, value: &str) -> Result<Self> {
         self.base_url = parse_base_url(value)?;
+        Ok(self)
+    }
+
+    /// Return configuration using a different image asset base URL.
+    pub fn with_image_base_url(mut self, value: &str) -> Result<Self> {
+        self.image_base_url = parse_base_url(value)?;
         Ok(self)
     }
 
@@ -171,6 +186,8 @@ pub struct TmdbMovieDetails {
     pub release_year: Option<i32>,
     /// TMDB overview text.
     pub overview: Option<String>,
+    /// TMDB runtime in minutes, when provided.
+    pub runtime_minutes: Option<u32>,
     /// TMDB popularity value.
     pub popularity: f64,
 }
@@ -304,6 +321,57 @@ impl TmdbClient {
         Ok(details)
     }
 
+    async fn fetch_metadata_payload(
+        &self,
+        identity_id: CanonicalIdentityId,
+    ) -> Result<TmdbMetadata> {
+        match identity_id.kind() {
+            CanonicalIdentityKind::Movie => {
+                let raw: MovieMetadataResponse = self
+                    .get_json(
+                        &format!("movie/{}", identity_id.tmdb_id().get()),
+                        &[("append_to_response", String::from("credits,images"))],
+                    )
+                    .await?;
+                raw.into_metadata(self).await
+            }
+            CanonicalIdentityKind::TvSeries => {
+                let raw: TvMetadataResponse = self
+                    .get_json(
+                        &format!("tv/{}", identity_id.tmdb_id().get()),
+                        &[("append_to_response", String::from("credits,images"))],
+                    )
+                    .await?;
+                raw.into_metadata(self).await
+            }
+        }
+    }
+
+    async fn download_image_asset(&self, path: &str) -> Result<MetadataAsset> {
+        let extension = image_extension(path).ok_or(Error::InvalidResponse {
+            reason: "image path does not include an extension",
+        })?;
+        let url = self
+            .config
+            .image_base_url
+            .join(path.trim_start_matches('/'))
+            .map_err(|source| Error::InvalidRequestPath {
+                path: path.to_owned(),
+                source,
+            })?;
+        let response = self.http.get(url.clone()).send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await?;
+            return Err(Error::HttpStatus { status, body });
+        }
+
+        Ok(
+            MetadataAsset::new(extension, response.bytes().await?.to_vec())
+                .with_source_url(url.to_string()),
+        )
+    }
+
     async fn get_json<T>(&self, path: &str, params: &[(&str, String)]) -> Result<T>
     where
         T: for<'de> Deserialize<'de>,
@@ -349,6 +417,21 @@ impl TmdbClient {
 
             return response.json::<T>().await.map_err(Error::Request);
         }
+    }
+}
+
+impl TmdbMetadataProvider for TmdbClient {
+    fn fetch_metadata<'a>(
+        &'a self,
+        identity_id: CanonicalIdentityId,
+    ) -> MetadataFuture<'a, TmdbMetadata> {
+        Box::pin(async move {
+            self.fetch_metadata_payload(identity_id)
+                .await
+                .map_err(|error| kino_library::Error::MetadataProvider {
+                    reason: error.to_string(),
+                })
+        })
     }
 }
 
@@ -447,6 +530,8 @@ struct MovieDetailsResponse {
     release_date: Option<String>,
     #[serde(default)]
     overview: Option<String>,
+    #[serde(default)]
+    runtime: Option<u32>,
     popularity: f64,
 }
 
@@ -463,6 +548,7 @@ impl MovieDetailsResponse {
                 .as_deref()
                 .and_then(release_year_from_date),
             overview: self.overview,
+            runtime_minutes: self.runtime,
             popularity: self.popularity,
         })
     }
@@ -497,6 +583,102 @@ impl TvDetailsResponse {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct MovieMetadataResponse {
+    title: String,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    #[serde(default)]
+    credits: CreditsResponse,
+    #[serde(default)]
+    images: ImagesResponse,
+}
+
+impl MovieMetadataResponse {
+    async fn into_metadata(self, client: &TmdbClient) -> Result<TmdbMetadata> {
+        let poster_path = required_image_path(self.poster_path, "movie poster_path")?;
+        let backdrop_path = required_image_path(self.backdrop_path, "movie backdrop_path")?;
+
+        Ok(TmdbMetadata::new(
+            self.title,
+            self.overview.unwrap_or_default(),
+            self.release_date,
+            client.download_image_asset(&poster_path).await?,
+            client.download_image_asset(&backdrop_path).await?,
+            optional_logo_asset(client, self.images).await?,
+            cast_members(self.credits.cast),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMetadataResponse {
+    name: String,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    first_air_date: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    #[serde(default)]
+    credits: CreditsResponse,
+    #[serde(default)]
+    images: ImagesResponse,
+}
+
+impl TvMetadataResponse {
+    async fn into_metadata(self, client: &TmdbClient) -> Result<TmdbMetadata> {
+        let poster_path = required_image_path(self.poster_path, "tv poster_path")?;
+        let backdrop_path = required_image_path(self.backdrop_path, "tv backdrop_path")?;
+
+        Ok(TmdbMetadata::new(
+            self.name,
+            self.overview.unwrap_or_default(),
+            self.first_air_date,
+            client.download_image_asset(&poster_path).await?,
+            client.download_image_asset(&backdrop_path).await?,
+            optional_logo_asset(client, self.images).await?,
+            cast_members(self.credits.cast),
+        ))
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CreditsResponse {
+    #[serde(default)]
+    cast: Vec<CastResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CastResponse {
+    #[serde(default)]
+    order: u32,
+    name: String,
+    #[serde(default)]
+    character: Option<String>,
+    #[serde(default)]
+    profile_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ImagesResponse {
+    #[serde(default)]
+    logos: Vec<ImageResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageResponse {
+    file_path: String,
+}
+
 fn parse_base_url(value: &str) -> Result<Url> {
     let normalized = if value.ends_with('/') {
         value.to_owned()
@@ -507,6 +689,43 @@ fn parse_base_url(value: &str) -> Result<Url> {
         value: value.to_owned(),
         source,
     })
+}
+
+fn required_image_path(value: Option<String>, field: &'static str) -> Result<String> {
+    value
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .ok_or(Error::InvalidResponse { reason: field })
+}
+
+async fn optional_logo_asset(
+    client: &TmdbClient,
+    images: ImagesResponse,
+) -> Result<Option<MetadataAsset>> {
+    let Some(logo) = images.logos.into_iter().next() else {
+        return Ok(None);
+    };
+
+    client.download_image_asset(&logo.file_path).await.map(Some)
+}
+
+fn cast_members(cast: Vec<CastResponse>) -> Vec<MetadataCastMember> {
+    cast.into_iter()
+        .map(|member| {
+            MetadataCastMember::new(
+                member.order,
+                member.name,
+                member.character.unwrap_or_default(),
+                member.profile_path,
+            )
+        })
+        .collect()
+}
+
+fn image_extension(path: &str) -> Option<&str> {
+    path.rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| !extension.is_empty())
 }
 
 fn validate_query(query: &str) -> Result<&str> {

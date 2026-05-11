@@ -10,7 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use kino_core::{CanonicalIdentityId, Id, MediaItemKind, TmdbId, id::ParseIdError};
+use kino_core::{
+    CanonicalIdentityId, CanonicalLayoutTransfer, Id, MediaItemKind, TmdbId, id::ParseIdError,
+};
 use kino_db::Db;
 use kino_fulfillment::{
     FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
@@ -23,22 +25,27 @@ use kino_fulfillment::{
     tv::parse_tv_request,
 };
 use kino_library::{
-    CatalogArtworkKind, CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService,
-    CatalogSort, LibraryScanReport, LibraryScanService, ReocrJob, SubtitleReocrService,
+    CanonicalLayoutWriter, CatalogArtworkKind, CatalogListPage, CatalogListQuery, CatalogMediaItem,
+    CatalogService, CatalogSort, LibraryScanReport, LibraryScanService, ReocrJob,
+    SubtitleReocrService,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthenticatedUser;
+use crate::ingestion_orchestrator::ingest_request;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    requests: RequestService,
-    manual_imports: Arc<ManualImportProvider>,
-    catalog: CatalogService,
-    library_scans: LibraryScanService,
-    subtitle_reocr: SubtitleReocrService,
-    tmdb: Option<TmdbClient>,
-    artwork_cache_dir: PathBuf,
+    pub(crate) db: Db,
+    pub(crate) requests: RequestService,
+    pub(crate) manual_imports: Arc<ManualImportProvider>,
+    pub(crate) catalog: CatalogService,
+    pub(crate) library_scans: LibraryScanService,
+    pub(crate) subtitle_reocr: SubtitleReocrService,
+    pub(crate) tmdb: Option<TmdbClient>,
+    pub(crate) library_root: PathBuf,
+    pub(crate) artwork_cache_dir: PathBuf,
+    pub(crate) canonical_layout: CanonicalLayoutWriter,
 }
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -147,20 +154,24 @@ impl From<ReocrJob> for ReocrTrackResponse {
     }
 }
 
-pub(crate) fn router(
+pub(crate) fn router_with_canonical_transfer(
     db: Db,
     library_root: PathBuf,
     artwork_cache_dir: PathBuf,
     subtitle_reocr: SubtitleReocrService,
     tmdb: Option<TmdbClient>,
+    canonical_transfer: CanonicalLayoutTransfer,
 ) -> Router {
     let state = AppState {
+        db: db.clone(),
         requests: RequestService::new(db.clone()),
         manual_imports: Arc::new(ManualImportProvider::new()),
         catalog: CatalogService::new(db.clone()),
-        library_scans: LibraryScanService::new(db.clone(), library_root),
+        library_scans: LibraryScanService::new(db.clone(), library_root.clone()),
         subtitle_reocr,
         tmdb,
+        canonical_layout: CanonicalLayoutWriter::new(&library_root, canonical_transfer),
+        library_root,
         artwork_cache_dir,
     };
 
@@ -437,7 +448,7 @@ pub(crate) async fn re_resolve(
     ),
     request_body = ManualImportRequest,
     responses(
-        (status = 200, description = "Manual import started", body = ManualImportResponse),
+        (status = 200, description = "Manual import completed", body = ManualImportResponse),
         (status = 400, description = "Invalid manual import request", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token"),
         (status = 404, description = "Request not found", body = ErrorResponse),
@@ -492,7 +503,7 @@ pub(crate) async fn manual_import(
         .await
         .map_err(ApiError::ManualImport)?;
     let message = manual_import_message(payload.message.as_deref(), &path, &handle.job_id);
-    let detail = state
+    state
         .requests
         .transition(
             id,
@@ -501,6 +512,7 @@ pub(crate) async fn manual_import(
             Some(message.as_str()),
         )
         .await?;
+    let detail = ingest_request(&state, id, path.clone(), handle.job_id.clone()).await?;
 
     Ok(Json(ManualImportResponse {
         request: detail,

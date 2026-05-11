@@ -18,6 +18,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod admin_config;
 pub mod auth;
+mod ingestion_orchestrator;
 mod openapi;
 mod playback;
 mod request;
@@ -99,14 +100,16 @@ fn router_with_config_reocr_and_tmdb(
     let public_base_url = config.server.public_base_url.clone();
     let library_root = config.library_root.clone();
     let artwork_cache_dir = config.artwork_cache_dir();
+    let canonical_transfer = config.library.canonical_transfer;
     let cors = cors_layer(&config.server);
     let protected_api = Router::new()
-        .merge(request::router(
+        .merge(request::router_with_canonical_transfer(
             db.clone(),
             library_root,
             artwork_cache_dir,
             subtitle_reocr,
             tmdb_client,
+            canonical_transfer,
         ))
         .merge(stream::router(db.clone()))
         .merge(token::router(db.clone()))
@@ -135,6 +138,37 @@ pub fn router_with_tmdb_client(db: Db, tmdb_client: TmdbClient) -> Router {
             database_path: PathBuf::from("kino.db"),
             library_root,
             library: kino_core::LibraryConfig::default(),
+            server: ServerConfig::default(),
+            tmdb: kino_core::config::TmdbConfig::default(),
+            ocr: kino_core::OcrConfig::default(),
+            providers: kino_core::config::ProvidersConfig::default(),
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Pretty,
+        },
+        subtitle_reocr,
+        Some(tmdb_client),
+    )
+}
+
+/// Build the Kino HTTP router with explicit library root and TMDB client.
+pub fn router_with_library_root_and_tmdb_client(
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    artwork_cache_dir: impl Into<PathBuf>,
+    tmdb_client: TmdbClient,
+) -> Router {
+    let library_root = library_root.into();
+    let artwork_cache_dir = artwork_cache_dir.into();
+    let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &library_root);
+    router_with_config_reocr_and_tmdb(
+        db,
+        Config {
+            database_path: PathBuf::from("kino.db"),
+            library_root,
+            library: kino_core::LibraryConfig {
+                artwork_cache_dir: Some(artwork_cache_dir),
+                ..kino_core::LibraryConfig::default()
+            },
             server: ServerConfig::default(),
             tmdb: kino_core::config::TmdbConfig::default(),
             ocr: kino_core::OcrConfig::default(),

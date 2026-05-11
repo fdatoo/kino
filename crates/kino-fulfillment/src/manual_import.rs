@@ -1,11 +1,6 @@
 //! First-party manual import fulfillment provider.
 
-use std::{
-    collections::HashMap,
-    io::ErrorKind,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 use kino_core::Id;
 
@@ -62,7 +57,6 @@ impl FulfillmentProvider for ManualImportProvider {
                     "manual import requires a source path",
                 )
             })?;
-            validate_source_path(&source_path).await?;
 
             let handle = FulfillmentProviderJobHandle::new(
                 MANUAL_IMPORT_PROVIDER_ID,
@@ -124,59 +118,6 @@ struct ManualImportJobState {
     cancelled: bool,
 }
 
-async fn validate_source_path(path: &Path) -> Result<(), FulfillmentProviderError> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|source| path_metadata_error(path, source))?;
-
-    if !metadata.is_file() {
-        return Err(permanent(
-            "path_not_file",
-            format!("path {} is not a file", path.display()),
-        ));
-    }
-
-    tokio::fs::File::open(path)
-        .await
-        .map_err(|source| path_open_error(path, source))?;
-
-    Ok(())
-}
-
-fn path_metadata_error(path: &Path, source: std::io::Error) -> FulfillmentProviderError {
-    match source.kind() {
-        ErrorKind::NotFound => permanent(
-            "path_not_found",
-            format!("path {} does not exist", path.display()),
-        ),
-        ErrorKind::PermissionDenied => permanent(
-            "path_unreadable",
-            format!("path {} is not readable: {source}", path.display()),
-        ),
-        _ => FulfillmentProviderError::transient(
-            "path_metadata_failed",
-            format!("could not read metadata for {}: {source}", path.display()),
-        ),
-    }
-}
-
-fn path_open_error(path: &Path, source: std::io::Error) -> FulfillmentProviderError {
-    match source.kind() {
-        ErrorKind::NotFound => permanent(
-            "path_not_found",
-            format!("path {} does not exist", path.display()),
-        ),
-        ErrorKind::PermissionDenied => permanent(
-            "path_unreadable",
-            format!("path {} is not readable: {source}", path.display()),
-        ),
-        _ => permanent(
-            "path_unreadable",
-            format!("path {} could not be opened: {source}", path.display()),
-        ),
-    }
-}
-
 fn permanent(code: impl Into<String>, message: impl Into<String>) -> FulfillmentProviderError {
     FulfillmentProviderError::permanent(code, message)
 }
@@ -230,32 +171,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_missing_file() {
+    async fn accepts_missing_file_for_ingestion_probe()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let provider = ManualImportProvider::new();
-        let err = provider
-            .start(
-                FulfillmentProviderArgs::new(movie_identity(550))
-                    .with_source_path(temp_path("missing.mkv")),
-            )
-            .await
-            .expect_err("missing file should be rejected");
+        let path = temp_path("missing.mkv");
+        let handle = provider
+            .start(FulfillmentProviderArgs::new(movie_identity(550)).with_source_path(&path))
+            .await?;
 
-        assert_eq!(err.code(), "path_not_found");
-        assert!(!err.is_transient());
+        assert_eq!(
+            provider.status(&handle).await?,
+            FulfillmentProviderJobStatus::Completed {
+                source_paths: vec![path]
+            }
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_directory_path() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    async fn accepts_directory_path_for_ingestion_probe()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("kino-manual-import-dir-{}", Id::new()));
         tokio::fs::create_dir(&path).await?;
         let provider = ManualImportProvider::new();
 
-        let err = provider
+        let handle = provider
             .start(FulfillmentProviderArgs::new(movie_identity(550)).with_source_path(&path))
-            .await
-            .expect_err("directory path should be rejected");
+            .await?;
 
-        assert_eq!(err.code(), "path_not_file");
+        assert_eq!(
+            provider.status(&handle).await?,
+            FulfillmentProviderJobStatus::Completed {
+                source_paths: vec![path.clone()]
+            }
+        );
         tokio::fs::remove_dir(path).await?;
         Ok(())
     }
