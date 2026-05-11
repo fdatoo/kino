@@ -50,29 +50,23 @@ pub fn router_with_library_root_and_public_base_url(
     library_root: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Router {
-    let auth_state = auth::AuthState { db: db.clone() };
-    let protected_api = Router::new()
-        .merge(request::router(db.clone(), library_root.into()))
-        .merge(stream::router(db.clone()))
-        .merge(token::router(db.clone()))
-        .merge(playback::router(db))
-        .route_layer(middleware::from_fn_with_state(
-            auth_state,
-            auth::require_auth,
-        ));
-
-    Router::new()
-        .merge(openapi::router(public_base_url))
-        .merge(protected_api)
-        .merge(kino_admin::router())
+    let library_root = library_root.into();
+    let artwork_cache_dir = kino_core::config::default_artwork_cache_dir(&library_root);
+    router_with_library_root_artwork_cache_and_public_base_url(
+        db,
+        library_root,
+        artwork_cache_dir,
+        public_base_url,
+    )
 }
 
 /// Serve the Kino HTTP API until the listener exits.
 pub async fn serve(config: &Config, db: Db) -> Result<()> {
-    serve_with_library_root_and_public_base_url(
+    serve_with_library_root_artwork_cache_and_public_base_url(
         config.server.listen,
         db,
         config.library_root.clone(),
+        config.artwork_cache_dir(),
         config.server.public_base_url.clone(),
     )
     .await
@@ -105,13 +99,66 @@ pub async fn serve_with_library_root_and_public_base_url(
     library_root: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Result<()> {
+    let library_root = library_root.into();
+    let artwork_cache_dir = kino_core::config::default_artwork_cache_dir(&library_root);
+    serve_with_library_root_artwork_cache_and_public_base_url(
+        listen,
+        db,
+        library_root,
+        artwork_cache_dir,
+        public_base_url,
+    )
+    .await
+}
+
+/// Serve the Kino HTTP API with explicit library, artwork cache, and OpenAPI settings.
+pub async fn serve_with_library_root_artwork_cache_and_public_base_url(
+    listen: SocketAddr,
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    artwork_cache_dir: impl Into<PathBuf>,
+    public_base_url: impl Into<String>,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(listen = %local_addr, "server listening");
     axum::serve(
         listener,
-        router_with_library_root_and_public_base_url(db, library_root, public_base_url),
+        router_with_library_root_artwork_cache_and_public_base_url(
+            db,
+            library_root,
+            artwork_cache_dir,
+            public_base_url,
+        ),
     )
     .await?;
     Ok(())
+}
+
+/// Build the Kino HTTP router with explicit library, artwork cache, and OpenAPI settings.
+pub fn router_with_library_root_artwork_cache_and_public_base_url(
+    db: Db,
+    library_root: impl Into<PathBuf>,
+    artwork_cache_dir: impl Into<PathBuf>,
+    public_base_url: impl Into<String>,
+) -> Router {
+    let auth_state = auth::AuthState { db: db.clone() };
+    let protected_api = Router::new()
+        .merge(request::router(
+            db.clone(),
+            library_root.into(),
+            artwork_cache_dir.into(),
+        ))
+        .merge(stream::router(db.clone()))
+        .merge(token::router(db.clone()))
+        .merge(playback::router(db))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ));
+
+    Router::new()
+        .merge(openapi::router(public_base_url))
+        .merge(protected_api)
+        .merge(kino_admin::router())
 }

@@ -8,6 +8,7 @@ use utoipa::openapi::server::Server;
         crate::playback::record_progress,
         crate::request::list_catalog_items,
         crate::stream::source_file,
+        crate::request::get_catalog_item_image,
         crate::token::create_token,
         crate::token::list_tokens,
         crate::token::revoke_token
