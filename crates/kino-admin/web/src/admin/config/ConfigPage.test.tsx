@@ -54,6 +54,7 @@ test('renders resolved config with masked secret state', async () => {
             watch_folder: null,
         },
         server: {
+            cors_allowed_origins: { value: [], source: 'default' },
             listen: { value: '127.0.0.1:7777', source: 'default' },
             public_base_url: {
                 value: 'https://kino.example.test',
