@@ -81,6 +81,11 @@ pub struct LibraryConfig {
     /// to [`CanonicalLayoutTransfer::HardLink`].
     #[serde(default)]
     pub canonical_transfer: CanonicalLayoutTransfer,
+
+    /// Directory used for image-subtitle OCR staging. Defaults to
+    /// `<library_root>/.kino/subtitles` when omitted.
+    #[serde(default)]
+    pub subtitle_staging_dir: Option<PathBuf>,
 }
 
 /// Filesystem operation used by the canonical layout writer.
@@ -596,6 +601,7 @@ mod tests {
 
                 [library]
                 canonical_transfer = "move"
+                subtitle_staging_dir = "{}/subtitle-staging"
 
                 [server]
                 listen = "0.0.0.0:9000"
@@ -620,6 +626,7 @@ mod tests {
             "#,
             database_path.display(),
             library_root.display(),
+            library_root.display(),
             disc_rip.display(),
             watch_folder.display()
         )
@@ -640,6 +647,10 @@ mod tests {
             assert_eq!(
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::Move
+            );
+            assert_eq!(
+                cfg.library.subtitle_staging_dir,
+                Some(fixture.library_root.join("subtitle-staging"))
             );
             assert_eq!(cfg.log_level, "debug");
             assert_eq!(cfg.log_format, LogFormat::Pretty);
@@ -691,6 +702,7 @@ mod tests {
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::HardLink
             );
+            assert_eq!(cfg.library.subtitle_staging_dir, None);
             assert!(cfg.providers.disc_rip.is_none());
             assert!(cfg.providers.watch_folder.is_none());
             Ok(())
@@ -861,6 +873,20 @@ mod tests {
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::Move
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_library_subtitle_staging_dir() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let staging = fixture.library_root.join("subtitle-staging-env");
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_LIBRARY__SUBTITLE_STAGING_DIR", staging.display());
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.library.subtitle_staging_dir, Some(staging));
             Ok(())
         });
     }

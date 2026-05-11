@@ -946,6 +946,7 @@ dependencies = [
 name = "kino"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "kino-admin",
  "kino-cli",
  "kino-core",
@@ -954,6 +955,8 @@ dependencies = [
  "kino-library",
  "kino-server",
  "kino-transcode",
+ "rand 0.8.6",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror",
@@ -1033,6 +1036,7 @@ dependencies = [
  "kino-db",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror",

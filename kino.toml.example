@@ -20,6 +20,11 @@ log_format = "pretty"
 # Runtime override: KINO_LIBRARY__CANONICAL_TRANSFER.
 canonical_transfer = "hard_link"
 
+# Directory used for image-subtitle OCR staging. Optional. Defaults to
+# <library_root>/.kino/subtitles.
+# Runtime override: KINO_LIBRARY__SUBTITLE_STAGING_DIR.
+# subtitle_staging_dir = "/srv/media/.kino/subtitles"
+
 [server]
 # Address the server binds to. Optional. Defaults to 127.0.0.1:7777.
 listen = "127.0.0.1:7777"

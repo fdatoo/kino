@@ -3,7 +3,8 @@ use std::{path::Path, process::Command};
 use image::{Rgb, RgbImage};
 use kino_library::{
     subtitle_image_extraction::{
-        ImageSubtitleExtraction, ImageSubtitleExtractionFuture, ImageSubtitleFrame,
+        ImageSubtitleExtraction, ImageSubtitleExtractionFuture, ImageSubtitleExtractionInput,
+        ImageSubtitleFrame, ProbeSubtitleKind,
     },
     subtitle_ocr::{TesseractOcrEngine, ocr_subtitle_track},
 };
@@ -24,7 +25,14 @@ async fn tesseract_reads_generated_png_text() -> Result<(), Box<dyn std::error::
     let extraction = GeneratedPngExtraction {
         image_path: image_path.clone(),
     };
-    let frames = extraction.extract_frames().await?;
+    let frames = extraction
+        .extract_image_subtitle_track(ImageSubtitleExtractionInput::new(
+            "movie.mkv",
+            "source-sha256",
+            0,
+            ProbeSubtitleKind::ImagePgs,
+        ))
+        .await?;
     let engine = TesseractOcrEngine::new("eng", "tesseract");
     let cues = ocr_subtitle_track(&engine, &frames).await?;
 
@@ -42,7 +50,10 @@ struct GeneratedPngExtraction {
 }
 
 impl ImageSubtitleExtraction for GeneratedPngExtraction {
-    fn extract_frames<'a>(&'a self) -> ImageSubtitleExtractionFuture<'a> {
+    fn extract_image_subtitle_track<'a>(
+        &'a self,
+        _input: ImageSubtitleExtractionInput,
+    ) -> ImageSubtitleExtractionFuture<'a> {
         Box::pin(async move {
             Ok(vec![ImageSubtitleFrame::new(
                 std::time::Duration::from_secs(1),

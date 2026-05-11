@@ -237,7 +237,8 @@ fn parse_f32(value: &str, field: &'static str) -> Result<f32> {
 mod tests {
     use super::*;
     use crate::subtitle_image_extraction::{
-        ImageSubtitleExtraction, ImageSubtitleExtractionFuture,
+        ImageSubtitleExtraction, ImageSubtitleExtractionFuture, ImageSubtitleExtractionInput,
+        ProbeSubtitleKind,
     };
 
     #[test]
@@ -271,7 +272,10 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
         }
 
         impl ImageSubtitleExtraction for FakeExtraction {
-            fn extract_frames<'a>(&'a self) -> ImageSubtitleExtractionFuture<'a> {
+            fn extract_image_subtitle_track<'a>(
+                &'a self,
+                _input: ImageSubtitleExtractionInput,
+            ) -> ImageSubtitleExtractionFuture<'a> {
                 Box::pin(async move {
                     Ok(vec![ImageSubtitleFrame::new(
                         Duration::from_secs(1),
@@ -296,7 +300,14 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
         let extraction = FakeExtraction {
             image_path: PathBuf::from("frame.png"),
         };
-        let frames = extraction.extract_frames().await?;
+        let frames = extraction
+            .extract_image_subtitle_track(ImageSubtitleExtractionInput::new(
+                "movie.mkv",
+                "source-sha256",
+                0,
+                ProbeSubtitleKind::ImagePgs,
+            ))
+            .await?;
         let cues = ocr_subtitle_track(&FakeEngine, &frames).await?;
 
         assert_eq!(cues.len(), 1);
