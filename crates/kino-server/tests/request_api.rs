@@ -62,6 +62,7 @@ impl OcrEngine for FakeOcrEngine {
 
 struct TmdbTestServer {
     base_url: String,
+    image_base_url: String,
     requests: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
@@ -111,6 +112,7 @@ impl TmdbTestServer {
 
         Ok(Self {
             base_url: format!("http://{address}/3/"),
+            image_base_url: format!("http://{address}/images/"),
             requests,
         })
     }
@@ -118,6 +120,7 @@ impl TmdbTestServer {
     fn client(&self) -> Result<TmdbClient, Box<dyn std::error::Error>> {
         let config = TmdbClientConfig::new("test-api-key")?
             .with_base_url(&self.base_url)?
+            .with_image_base_url(&self.image_base_url)?
             .with_max_requests_per_second(
                 NonZeroU32::new(50).ok_or("test TMDB request rate must be positive")?,
             );
@@ -149,6 +152,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     let app = kino_server::router_with_public_base_url(db, "https://kino.example.test");
 
     let response = app
+        .clone()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
@@ -234,7 +238,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
 async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
-    let app = kino_server::router(db);
+    let app = kino_server::router(db.clone());
 
     let create_response = app
         .clone()
@@ -319,7 +323,7 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
 {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
-    let app = kino_server::router(db);
+    let app = kino_server::router(db.clone());
 
     let first = create_request(&app, &auth, "first").await?;
     let second = create_request(&app, &auth, "second").await?;
@@ -428,10 +432,11 @@ async fn request_resolve_api_fetches_and_scores_tmdb_candidates()
 async fn request_match_api_returns_not_found() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
-    let app = kino_server::router(db);
+    let app = kino_server::router(db.clone());
     let created = create_request(&app, &auth, "Dune").await?;
 
     let response = app
+        .clone()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
@@ -453,7 +458,7 @@ async fn re_resolution_api_records_versioned_identity_history()
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
     let service = RequestService::new(db.clone());
-    let app = kino_server::router(db);
+    let app = kino_server::router(db.clone());
     let first_identity = identity(550);
     let second_identity = identity(551);
     let created = service
@@ -478,6 +483,7 @@ async fn re_resolution_api_records_versioned_identity_history()
         .await?;
 
     let response = app
+        .clone()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
@@ -624,15 +630,53 @@ async fn request_plan_api_records_current_plan_and_history()
 async fn manual_import_walks_state_from_resolved() -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
+    let library_root = tempfile::tempdir()?;
+    let artwork_cache = tempfile::tempdir()?;
     let tmdb = TmdbTestServer::new(vec![
         TmdbTestResponse::json(
             StatusCode::OK,
             r#"{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","popularity":83.1}]}"#,
         ),
         TmdbTestResponse::json(StatusCode::OK, r#"{"results":[]}"#),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{
+                "id":27205,
+                "title":"Inception",
+                "release_date":"2010-07-15",
+                "overview":"A thief enters dreams.",
+                "runtime":1,
+                "popularity":83.1,
+                "poster_path":"/poster.jpg",
+                "backdrop_path":"/backdrop.jpg",
+                "credits":{"cast":[{"order":0,"name":"Leonardo DiCaprio","character":"Cobb","profile_path":null}]},
+                "images":{"logos":[]}
+            }"#,
+        ),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{
+                "id":27205,
+                "title":"Inception",
+                "release_date":"2010-07-15",
+                "overview":"A thief enters dreams.",
+                "runtime":1,
+                "poster_path":"/poster.jpg",
+                "backdrop_path":"/backdrop.jpg",
+                "credits":{"cast":[{"order":0,"name":"Leonardo DiCaprio","character":"Cobb","profile_path":null}]},
+                "images":{"logos":[]}
+            }"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, "poster-bytes"),
+        TmdbTestResponse::json(StatusCode::OK, "backdrop-bytes"),
     ])
     .await?;
-    let app = kino_server::router_with_tmdb_client(db, tmdb.client()?);
+    let app = kino_server::router_with_library_root_and_tmdb_client(
+        db.clone(),
+        library_root.path(),
+        artwork_cache.path(),
+        tmdb.client()?,
+    );
     let created = create_request(&app, &auth, "Inception (2010)").await?;
 
     let resolve_response = app
@@ -647,13 +691,12 @@ async fn manual_import_walks_state_from_resolved() -> Result<(), Box<dyn std::er
         .await?;
     assert_eq!(resolve_response.status(), StatusCode::OK);
 
-    let path = std::env::temp_dir().join(format!(
-        "kino-manual-import-resolved-{}.mkv",
-        created.request.id
-    ));
-    tokio::fs::write(&path, b"movie").await?;
+    let incoming = tempfile::tempdir()?;
+    let path = incoming.path().join("inception.mkv");
+    write_sample_video(&path).await?;
 
     let response = app
+        .clone()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
@@ -686,7 +729,8 @@ async fn manual_import_walks_state_from_resolved() -> Result<(), Box<dyn std::er
         path.display()
     );
     let detail: RequestDetail = serde_json::from_value(body["request"].clone())?;
-    assert_eq!(detail.request.state, RequestState::Ingesting);
+    assert_eq!(detail.request.state, RequestState::Satisfied);
+    assert_eq!(detail.request.failure_reason, None);
     assert_eq!(
         detail.current_plan.as_ref().map(|plan| plan.decision),
         Some(FulfillmentPlanDecision::NeedsProvider)
@@ -710,27 +754,78 @@ async fn manual_import_walks_state_from_resolved() -> Result<(), Box<dyn std::er
             (Some(RequestState::Resolved), RequestState::Planning),
             (Some(RequestState::Planning), RequestState::Fulfilling),
             (Some(RequestState::Fulfilling), RequestState::Ingesting),
+            (Some(RequestState::Ingesting), RequestState::Satisfied),
         ]
     );
     assert_eq!(
-        detail
-            .status_events
-            .last()
-            .and_then(|event| event.message.as_deref()),
+        detail.status_events[4].message.as_deref(),
         Some(expected_message.as_str())
     );
 
-    tokio::fs::remove_file(path).await?;
+    let canonical_path = library_root
+        .path()
+        .join("Movies")
+        .join("Inception (2010)")
+        .join("Inception (2010).mkv");
+    assert!(tokio::fs::try_exists(&canonical_path).await?);
+    assert!(tokio::fs::try_exists(&path).await?);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?has_source_file=true")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let catalog: Value = response_json(catalog_response).await?;
+    assert_eq!(catalog["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        catalog["items"][0]["canonical_identity_id"],
+        "tmdb:movie:27205"
+    );
+    assert_eq!(
+        catalog["items"][0]["source_files"][0]["path"],
+        canonical_path.display().to_string()
+    );
+    assert_eq!(
+        catalog["items"][0]["source_files"][0]["probe"]["video"]["resolution"],
+        "240p"
+    );
+    let (poster_local_path,): (String,) =
+        sqlx::query_as("SELECT poster_local_path FROM media_metadata_cache LIMIT 1")
+            .fetch_one(db.read_pool())
+            .await?;
+    assert!(tokio::fs::try_exists(artwork_cache.path().join(poster_local_path)).await?);
+
+    let second = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/requests/{}/manual-import",
+                    created.request.id
+                ))
+                .bearer(&auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
+        )
+        .await?;
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+
     Ok(())
 }
 
 #[tokio::test]
-async fn manual_import_api_accepts_readable_file_and_starts_ingesting()
+async fn manual_import_api_fails_when_probe_rejects_source()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
     let service = RequestService::new(db.clone());
-    let app = kino_server::router(db);
+    let app = kino_server::router(db.clone());
     let request = fulfilling_request(&service).await?;
     let path = std::env::temp_dir().join(format!("kino-manual-import-api-{}.mkv", request));
     tokio::fs::write(&path, b"movie").await?;
@@ -765,14 +860,29 @@ async fn manual_import_api_accepts_readable_file_and_starts_ingesting()
         path.display()
     );
     let detail: RequestDetail = serde_json::from_value(body["request"].clone())?;
-    assert_eq!(detail.request.state, RequestState::Ingesting);
+    assert_eq!(detail.request.state, RequestState::Failed);
+    assert_eq!(
+        detail.request.failure_reason,
+        Some(kino_core::RequestFailureReason::IngestFailed)
+    );
     assert_eq!(
         detail
             .status_events
-            .last()
+            .iter()
+            .find(|event| event.to_state == RequestState::Ingesting)
             .and_then(|event| event.message.as_deref()),
         Some(expected_message.as_str())
     );
+    assert!(
+        detail
+            .status_events
+            .last()
+            .and_then(|event| event.message.as_deref())
+            .is_some_and(|message| message.contains("ffprobe")),
+        "got: {detail:?}"
+    );
+    assert_eq!(media_item_count(&db).await?, 0);
+    assert!(tokio::fs::try_exists(&path).await?);
 
     tokio::fs::remove_file(path).await?;
     Ok(())
@@ -783,7 +893,7 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
     let db = kino_db::test_db().await?;
     let auth = common::issued_token(&db).await?;
     let service = RequestService::new(db.clone());
-    let app = kino_server::router(db);
+    let app = kino_server::router(db.clone());
     let request = fulfilling_request(&service).await?;
     let path = std::env::temp_dir().join(format!("kino-manual-import-missing-{request}.mkv"));
 
@@ -799,12 +909,20 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response_json(response).await?;
+    let detail: RequestDetail = serde_json::from_value(body["request"].clone())?;
+    assert_eq!(detail.request.state, RequestState::Failed);
+    assert_eq!(
+        detail.request.failure_reason,
+        Some(kino_core::RequestFailureReason::IngestFailed)
+    );
     assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("path_not_found")),
+        detail
+            .status_events
+            .last()
+            .and_then(|event| event.message.as_deref())
+            .is_some_and(|message| message.contains("No such file")),
         "got: {body}"
     );
 
@@ -818,7 +936,8 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
         )
         .await?;
     let detail: RequestDetail = response_json(get_response).await?;
-    assert_eq!(detail.request.state, RequestState::Fulfilling);
+    assert_eq!(detail.request.state, RequestState::Failed);
+    assert_eq!(media_item_count(&db).await?, 0);
 
     Ok(())
 }
@@ -1716,6 +1835,34 @@ async fn create_request(
 
     assert_eq!(response.status(), StatusCode::CREATED);
     response_json(response).await
+}
+
+async fn write_sample_video(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let status = tokio::process::Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("color=c=black:s=320x240:d=1")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(path)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed with {status}").into());
+    }
+
+    Ok(())
+}
+
+async fn media_item_count(db: &kino_db::Db) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+        .fetch_one(db.read_pool())
+        .await
 }
 
 async fn fulfilling_request(

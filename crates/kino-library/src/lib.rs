@@ -20,8 +20,9 @@ pub mod subtitle_ocr;
 pub mod subtitle_reocr;
 
 use kino_core::{
-    CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, CatalogStreamVariant,
-    Config, Id, MediaItemKind, Timestamp, TranscodeOutput, VariantCapabilities, VariantKind,
+    CanonicalIdentityId, CanonicalIdentityProvider, CanonicalIdentitySource,
+    CanonicalLayoutTransfer, CatalogStreamVariant, Config, Id, MediaItemKind, Timestamp,
+    TranscodeOutput, VariantCapabilities, VariantKind,
 };
 use kino_db::Db;
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,13 @@ pub enum Error {
     /// A metadata enrichment response did not include cast members.
     #[error("metadata cast is empty")]
     EmptyMetadataCast,
+
+    /// A metadata provider failed before returning a cacheable payload.
+    #[error("metadata provider failed: {reason}")]
+    MetadataProvider {
+        /// Human-readable provider failure.
+        reason: String,
+    },
 
     /// A cached metadata cast order is outside the accepted range.
     #[error("metadata cast order {position} is invalid")]
@@ -925,6 +933,98 @@ pub struct CatalogMediaItem {
     pub updated_at: Timestamp,
 }
 
+/// Input for creating a provider-backed catalog media item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterMediaItemInput {
+    /// Canonical identity satisfied by this catalog item.
+    pub canonical_identity_id: CanonicalIdentityId,
+}
+
+impl RegisterMediaItemInput {
+    /// Construct a media-item registration input.
+    pub const fn new(canonical_identity_id: CanonicalIdentityId) -> Self {
+        Self {
+            canonical_identity_id,
+        }
+    }
+}
+
+/// Input for attaching an ingested source file to a catalog media item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterSourceFileInput {
+    /// Media item that owns the source file.
+    pub media_item_id: Id,
+    /// Canonical source path stored in the catalog.
+    pub path: PathBuf,
+    /// Probe metadata captured during ingestion.
+    pub probe: SourceFileProbeInput,
+}
+
+impl RegisterSourceFileInput {
+    /// Construct a source-file registration input.
+    pub fn new(media_item_id: Id, path: impl Into<PathBuf>, probe: SourceFileProbeInput) -> Self {
+        Self {
+            media_item_id,
+            path: path.into(),
+            probe,
+        }
+    }
+}
+
+/// Source-file probe facts persisted during ingestion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceFileProbeInput {
+    /// Container format label, when known.
+    pub container: Option<String>,
+    /// Video codec label, when known.
+    pub video_codec: Option<String>,
+    /// Video pixel width, when known.
+    pub video_width: Option<u32>,
+    /// Video pixel height, when known.
+    pub video_height: Option<u32>,
+    /// HDR format label, when known.
+    pub video_hdr: Option<String>,
+    /// Audio streams discovered in the source file.
+    pub audio_tracks: Vec<SourceFileAudioTrackInput>,
+    /// Subtitle streams indexed for the source file.
+    pub subtitle_tracks: Vec<SourceFileSubtitleTrackInput>,
+}
+
+impl SourceFileProbeInput {
+    /// Construct empty source-file probe facts.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Audio stream facts persisted for one source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFileAudioTrackInput {
+    /// Probed stream index in the source file.
+    pub track_index: u32,
+    /// Audio codec label, when known.
+    pub codec: Option<String>,
+    /// Language tag reported for the stream.
+    pub language: Option<String>,
+    /// Audio channel count, when known.
+    pub channels: Option<u32>,
+}
+
+/// Subtitle stream facts persisted for one source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFileSubtitleTrackInput {
+    /// Probed stream index in the source file.
+    pub track_index: u32,
+    /// Subtitle sidecar format exposed to clients.
+    pub format: SubtitleFormat,
+    /// Whether the track is text or OCR-derived.
+    pub provenance: SubtitleProvenance,
+    /// Normalized subtitle language.
+    pub language: String,
+    /// Whether the subtitle stream is marked forced.
+    pub forced: bool,
+}
+
 /// Catalog projection for one subtitle track.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct CatalogSubtitleTrack {
@@ -1019,6 +1119,208 @@ impl CatalogService {
     /// Construct a catalog service backed by Kino's database.
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    /// Create a provider-backed media item for a canonical identity.
+    pub async fn register_media_item(
+        &self,
+        input: RegisterMediaItemInput,
+    ) -> Result<CatalogMediaItem> {
+        let now = Timestamp::now();
+        let media_item_id = Id::new();
+        let media_kind = media_item_kind_for_identity(input.canonical_identity_id);
+        let season_number = media_item_season_number(input.canonical_identity_id);
+        let episode_number = media_item_episode_number(input.canonical_identity_id);
+        let mut tx = self.db.write_pool().begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO canonical_identities (
+                id,
+                provider,
+                media_kind,
+                tmdb_id,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(input.canonical_identity_id)
+        .bind(input.canonical_identity_id.provider().as_str())
+        .bind(input.canonical_identity_id.kind().as_str())
+        .bind(i64::from(input.canonical_identity_id.tmdb_id().get()))
+        .bind(CanonicalIdentitySource::Manual.as_str())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                season_number,
+                episode_number,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(media_kind.as_str())
+        .bind(input.canonical_identity_id)
+        .bind(season_number)
+        .bind(episode_number)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        self.get(media_item_id).await
+    }
+
+    /// Attach an ingested source file and its probe facts to a media item.
+    pub async fn register_source_file(
+        &self,
+        input: RegisterSourceFileInput,
+    ) -> Result<LibrarySourceFile> {
+        let now = Timestamp::now();
+        let source_file_id = Id::new();
+        let path_text = path_to_db_text(&input.path)?;
+        let mut tx = self.db.write_pool().begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO source_files (
+                id,
+                media_item_id,
+                path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(source_file_id)
+        .bind(input.media_item_id)
+        .bind(path_text)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO source_file_probes (
+                source_file_id,
+                container,
+                video_codec,
+                video_width,
+                video_height,
+                video_hdr,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(source_file_id)
+        .bind(input.probe.container.as_deref())
+        .bind(input.probe.video_codec.as_deref())
+        .bind(input.probe.video_width.map(i64::from))
+        .bind(input.probe.video_height.map(i64::from))
+        .bind(input.probe.video_hdr.as_deref())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        for track in &input.probe.audio_tracks {
+            sqlx::query(
+                r#"
+                INSERT INTO source_file_audio_tracks (
+                    source_file_id,
+                    track_index,
+                    codec,
+                    language,
+                    channels
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+            )
+            .bind(source_file_id)
+            .bind(i64::from(track.track_index))
+            .bind(&track.codec)
+            .bind(&track.language)
+            .bind(track.channels.map(i64::from))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for track in &input.probe.subtitle_tracks {
+            sqlx::query(
+                r#"
+                INSERT INTO source_file_subtitle_tracks (
+                    source_file_id,
+                    track_index,
+                    format,
+                    provenance,
+                    language,
+                    forced
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )
+            .bind(source_file_id)
+            .bind(i64::from(track.track_index))
+            .bind(track.format.as_str())
+            .bind(track.provenance.as_str())
+            .bind(&track.language)
+            .bind(if track.forced { 1_i64 } else { 0_i64 })
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        let video = source_file_video_probe_from_input(&input.probe);
+        Ok(LibrarySourceFile {
+            id: source_file_id,
+            media_item_id: input.media_item_id,
+            path: input.path,
+            probe: Some(SourceFileProbe {
+                container: input.probe.container,
+                video,
+            }),
+            audio_tracks: input
+                .probe
+                .audio_tracks
+                .into_iter()
+                .map(source_file_audio_track_from_input)
+                .collect(),
+            subtitle_tracks: input
+                .probe
+                .subtitle_tracks
+                .into_iter()
+                .map(source_file_subtitle_track_from_input)
+                .collect(),
+            transcode_outputs: Vec::new(),
+        })
+    }
+
+    /// Delete a media item and cascading library rows.
+    pub async fn remove_media_item(&self, media_item_id: Id) -> Result<()> {
+        sqlx::query("DELETE FROM media_items WHERE id = ?1")
+            .bind(media_item_id)
+            .execute(self.db.write_pool())
+            .await?;
+
+        Ok(())
     }
 
     /// Persist a transcode output for an existing media item's source file.
@@ -3524,6 +3826,66 @@ fn source_file_probe_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SourceFil
         container: row.try_get("container")?,
         video,
     })
+}
+
+fn source_file_video_probe_from_input(
+    input: &SourceFileProbeInput,
+) -> Option<SourceFileVideoProbe> {
+    if input.video_codec.is_none()
+        && input.video_width.is_none()
+        && input.video_height.is_none()
+        && input.video_hdr.is_none()
+    {
+        return None;
+    }
+
+    Some(SourceFileVideoProbe {
+        codec: input.video_codec.clone(),
+        resolution: video_resolution(input.video_width, input.video_height),
+        hdr: input.video_hdr.clone(),
+    })
+}
+
+fn source_file_audio_track_from_input(input: SourceFileAudioTrackInput) -> SourceFileAudioTrack {
+    SourceFileAudioTrack {
+        track_index: input.track_index,
+        codec: input.codec,
+        language: input.language,
+        channels: input.channels,
+    }
+}
+
+fn source_file_subtitle_track_from_input(
+    input: SourceFileSubtitleTrackInput,
+) -> SourceFileSubtitleTrack {
+    SourceFileSubtitleTrack {
+        track_index: input.track_index,
+        format: input.format,
+        provenance: input.provenance,
+        language: input.language,
+        forced: input.forced,
+    }
+}
+
+fn media_item_kind_for_identity(canonical_identity_id: CanonicalIdentityId) -> MediaItemKind {
+    match canonical_identity_id.kind() {
+        kino_core::CanonicalIdentityKind::Movie => MediaItemKind::Movie,
+        kino_core::CanonicalIdentityKind::TvSeries => MediaItemKind::TvEpisode,
+    }
+}
+
+fn media_item_season_number(canonical_identity_id: CanonicalIdentityId) -> Option<i64> {
+    match canonical_identity_id.kind() {
+        kino_core::CanonicalIdentityKind::Movie => None,
+        kino_core::CanonicalIdentityKind::TvSeries => Some(1),
+    }
+}
+
+fn media_item_episode_number(canonical_identity_id: CanonicalIdentityId) -> Option<i64> {
+    match canonical_identity_id.kind() {
+        kino_core::CanonicalIdentityKind::Movie => None,
+        kino_core::CanonicalIdentityKind::TvSeries => Some(1),
+    }
 }
 
 fn video_resolution(width: Option<u32>, height: Option<u32>) -> Option<String> {
