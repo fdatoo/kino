@@ -451,11 +451,29 @@ pub(crate) async fn manual_import(
     Json(payload): Json<ManualImportRequest>,
 ) -> ApiResult<Json<ManualImportResponse>> {
     let id = parse_id(id)?;
-    let current = state.requests.get(id).await?;
-    if !RequestTransition::StartIngesting.can_apply_from(current.request.state) {
-        return Err(ApiError::InvalidManualImportState {
-            from: current.request.state,
-        });
+    let mut current = state.requests.get(id).await?;
+    match current.request.state {
+        RequestState::Resolved | RequestState::Planning => {
+            let summary = manual_import_plan_summary(payload.message.as_deref()).to_owned();
+            current = state
+                .requests
+                .prepare_for_manual_import(id, &summary)
+                .await?;
+        }
+        RequestState::Fulfilling => {}
+        RequestState::Pending | RequestState::NeedsDisambiguation => {
+            return Err(ApiError::ManualImportRequiresResolved {
+                from: current.request.state,
+            });
+        }
+        RequestState::Ingesting
+        | RequestState::Satisfied
+        | RequestState::Failed
+        | RequestState::Cancelled => {
+            return Err(ApiError::InvalidManualImportState {
+                from: current.request.state,
+            });
+        }
     }
 
     let canonical_identity_id =
@@ -671,6 +689,9 @@ pub(crate) enum ApiError {
     #[error("manual import from {from} is invalid")]
     InvalidManualImportState { from: RequestState },
 
+    #[error("request must be resolved before manual import")]
+    ManualImportRequiresResolved { from: RequestState },
+
     #[error(transparent)]
     ManualImport(FulfillmentProviderError),
 
@@ -755,6 +776,7 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_GATEWAY
             }
             Self::InvalidManualImportState { .. } => StatusCode::CONFLICT,
+            Self::ManualImportRequiresResolved { .. } => StatusCode::CONFLICT,
             Self::ManualImport(error) if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
             Self::ManualImport(_) => StatusCode::BAD_REQUEST,
             Self::Library(kino_library::Error::MediaItemNotFound { .. }) => StatusCode::NOT_FOUND,
@@ -909,6 +931,13 @@ fn manual_import_message(message: Option<&str>, path: &std::path::Path, job_id: 
         Some(message) => format!("{message}; {import_message}"),
         None => import_message,
     }
+}
+
+fn manual_import_plan_summary(message: Option<&str>) -> &str {
+    message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or("manual import")
 }
 
 fn artwork_cache_path(cache_dir: &FsPath, local_path: &FsPath) -> Option<PathBuf> {

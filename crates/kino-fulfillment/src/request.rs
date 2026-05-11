@@ -854,6 +854,86 @@ impl RequestService {
         self.get(request_id).await
     }
 
+    /// Prepare a resolved or planning request for a manual import provider run.
+    pub async fn prepare_for_manual_import(
+        &self,
+        request_id: Id,
+        summary: &str,
+    ) -> Result<RequestDetail> {
+        let summary = validate_plan_summary(summary)?;
+        let mut tx = self.store.begin().await?;
+        let current = self.store.request_in_tx(&mut tx, request_id).await?;
+        let now = Timestamp::now();
+
+        match current.state {
+            RequestState::Resolved => {
+                self.store
+                    .update_state(&mut tx, request_id, RequestState::Planning, now, None)
+                    .await?;
+                self.store
+                    .insert_status_event(
+                        &mut tx,
+                        NewStatusEvent {
+                            id: Id::new(),
+                            request_id,
+                            from_state: Some(RequestState::Resolved),
+                            to_state: RequestState::Planning,
+                            occurred_at: now,
+                            message: None,
+                            actor: Some(RequestEventActor::System),
+                        },
+                    )
+                    .await?;
+            }
+            RequestState::Planning => {}
+            RequestState::Fulfilling => {
+                drop(tx);
+                return self.get(request_id).await;
+            }
+            from => {
+                return Err(Error::InvalidTransition {
+                    from,
+                    transition: RequestTransition::StartPlanning,
+                    to: RequestState::Planning,
+                });
+            }
+        }
+
+        self.insert_current_plan(
+            &mut tx,
+            CurrentPlanInput {
+                request_id,
+                decision: FulfillmentPlanDecision::NeedsProvider,
+                summary,
+                status_event_id: None,
+                created_at: now,
+                actor: Some(RequestEventActor::System),
+            },
+        )
+        .await?;
+
+        self.store
+            .update_state(&mut tx, request_id, RequestState::Fulfilling, now, None)
+            .await?;
+        self.store
+            .insert_status_event(
+                &mut tx,
+                NewStatusEvent {
+                    id: Id::new(),
+                    request_id,
+                    from_state: Some(RequestState::Planning),
+                    to_state: RequestState::Fulfilling,
+                    occurred_at: now,
+                    message: None,
+                    actor: Some(RequestEventActor::System),
+                },
+            )
+            .await?;
+
+        tx.commit().await?;
+        self.get(request_id).await
+    }
+
     async fn insert_current_plan(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
