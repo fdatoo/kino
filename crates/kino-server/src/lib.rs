@@ -2,10 +2,11 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use axum::Router;
+use axum::{Router, middleware};
 use kino_core::Config;
 use kino_db::Db;
 
+pub mod auth;
 mod openapi;
 mod request;
 mod token;
@@ -46,10 +47,18 @@ pub fn router_with_library_root_and_public_base_url(
     library_root: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Router {
-    Router::new()
-        .merge(openapi::router(public_base_url))
+    let auth_state = auth::AuthState { db: db.clone() };
+    let protected_api = Router::new()
         .merge(request::router(db.clone(), library_root.into()))
         .merge(token::router(db))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ));
+
+    Router::new()
+        .merge(openapi::router(public_base_url))
+        .merge(protected_api)
         .merge(kino_admin::router())
 }
 

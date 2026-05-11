@@ -10,7 +10,6 @@ use kino_core::{Id, Timestamp, device_token::DeviceToken, user::SEEDED_USER_ID};
 use kino_db::Db;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 #[derive(Clone)]
@@ -59,7 +58,6 @@ pub(crate) struct ListTokensResponse {
 
 pub(crate) fn router(db: Db) -> Router {
     Router::new()
-        // TODO(F-304): require an existing valid admin device token before issuing or listing tokens.
         .route("/api/v1/admin/tokens", post(create_token).get(list_tokens))
         .route("/api/v1/admin/tokens/{token_id}", delete(revoke_token))
         .with_state(TokenState { db })
@@ -85,7 +83,7 @@ pub(crate) async fn create_token(
     }
 
     let plaintext = generate_plaintext_token()?;
-    let hash = hash_token(&plaintext);
+    let hash = crate::auth::hash_token(&plaintext);
     let token = DeviceToken::new(
         Id::new(),
         SEEDED_USER_ID,
@@ -263,10 +261,6 @@ fn generate_plaintext_token() -> TokenResult<String> {
     let mut bytes = [0_u8; 32];
     OsRng.try_fill_bytes(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn hash_token(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 fn token_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> TokenResult<TokenSummary> {

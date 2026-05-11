@@ -379,7 +379,8 @@ mod tests {
     use std::path::PathBuf;
 
     use kino_core::{
-        CanonicalIdentityId, Config, DeviceToken, Id, SEEDED_USER_ID, Timestamp, TmdbId,
+        CanonicalIdentityId, Config, DeviceToken, Id, PlaybackProgress, PlaybackSession,
+        PlaybackSessionStatus, SEEDED_USER_ID, Timestamp, TmdbId, Watched, WatchedSource,
     };
     use sqlx::migrate::{Migration, MigrationType, Migrator};
 
@@ -596,6 +597,348 @@ mod tests {
 
         assert_eq!(revoked_lookup.0, token.hash);
         assert_eq!(revoked_lookup.1, Some(revoked_at));
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_sessions_support_heartbeat_and_status_transitions()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let identity = movie_identity(604);
+        let media_item_id = Id::new();
+        let token = DeviceToken::new(
+            Id::new(),
+            SEEDED_USER_ID,
+            "Bedroom iPad",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "2026-05-11T00:55:00Z".parse()?,
+        );
+        let started_at: Timestamp = "2026-05-11T01:00:00Z".parse()?;
+        let heartbeat_at: Timestamp = "2026-05-11T01:05:00Z".parse()?;
+        let idle_at: Timestamp = "2026-05-11T01:10:00Z".parse()?;
+        let ended_at: Timestamp = "2026-05-11T01:12:00Z".parse()?;
+        let session = PlaybackSession::active(
+            Id::new(),
+            SEEDED_USER_ID,
+            token.id,
+            media_item_id,
+            Id::new().to_string(),
+            started_at,
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO canonical_identities (
+                id,
+                provider,
+                media_kind,
+                tmdb_id,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6)
+            "#,
+        )
+        .bind(identity)
+        .bind(identity.provider().as_str())
+        .bind(identity.kind().as_str())
+        .bind(i64::from(identity.tmdb_id().get()))
+        .bind(started_at)
+        .bind(started_at)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, 'movie', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(identity)
+        .bind(started_at)
+        .bind(started_at)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO device_tokens (
+                id,
+                user_id,
+                label,
+                hash,
+                last_seen_at,
+                revoked_at,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(token.id)
+        .bind(token.user_id)
+        .bind(&token.label)
+        .bind(&token.hash)
+        .bind(token.last_seen_at)
+        .bind(token.revoked_at)
+        .bind(token.created_at)
+        .execute(db.write_pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO playback_sessions (
+                id,
+                user_id,
+                token_id,
+                media_item_id,
+                variant_id,
+                started_at,
+                last_seen_at,
+                ended_at,
+                status
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(session.id)
+        .bind(session.user_id)
+        .bind(session.token_id)
+        .bind(session.media_item_id)
+        .bind(&session.variant_id)
+        .bind(session.started_at)
+        .bind(session.last_seen_at)
+        .bind(session.ended_at)
+        .bind(session.status.as_str())
+        .execute(db.write_pool())
+        .await?;
+
+        let inserted: (String, Timestamp, Option<Timestamp>) = sqlx::query_as(
+            "SELECT status, last_seen_at, ended_at FROM playback_sessions WHERE id = ?1",
+        )
+        .bind(session.id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(
+            PlaybackSessionStatus::parse(&inserted.0),
+            Some(PlaybackSessionStatus::Active)
+        );
+        assert_eq!(inserted.1, started_at);
+        assert_eq!(inserted.2, None);
+
+        sqlx::query("UPDATE playback_sessions SET last_seen_at = ?1 WHERE id = ?2")
+            .bind(heartbeat_at)
+            .bind(session.id)
+            .execute(db.write_pool())
+            .await?;
+
+        let heartbeated: Timestamp =
+            sqlx::query_scalar("SELECT last_seen_at FROM playback_sessions WHERE id = ?1")
+                .bind(session.id)
+                .fetch_one(db.read_pool())
+                .await?;
+        assert_eq!(heartbeated, heartbeat_at);
+
+        sqlx::query("UPDATE playback_sessions SET status = ?1, last_seen_at = ?2 WHERE id = ?3")
+            .bind(PlaybackSessionStatus::Idle.as_str())
+            .bind(idle_at)
+            .bind(session.id)
+            .execute(db.write_pool())
+            .await?;
+
+        let idled: (String, Timestamp, Option<Timestamp>) = sqlx::query_as(
+            "SELECT status, last_seen_at, ended_at FROM playback_sessions WHERE id = ?1",
+        )
+        .bind(session.id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(
+            PlaybackSessionStatus::parse(&idled.0),
+            Some(PlaybackSessionStatus::Idle)
+        );
+        assert_eq!(idled.1, idle_at);
+        assert_eq!(idled.2, None);
+
+        sqlx::query("UPDATE playback_sessions SET status = ?1, ended_at = ?2 WHERE id = ?3")
+            .bind(PlaybackSessionStatus::Ended.as_str())
+            .bind(ended_at)
+            .bind(session.id)
+            .execute(db.write_pool())
+            .await?;
+
+        let ended: (String, Option<Timestamp>) =
+            sqlx::query_as("SELECT status, ended_at FROM playback_sessions WHERE id = ?1")
+                .bind(session.id)
+                .fetch_one(db.read_pool())
+                .await?;
+        assert_eq!(
+            PlaybackSessionStatus::parse(&ended.0),
+            Some(PlaybackSessionStatus::Ended)
+        );
+        assert_eq!(ended.1, Some(ended_at));
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_progress_upsert_preserves_higher_position()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let initial_updated_at = Timestamp::now();
+        let progress =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 100, initial_updated_at, None)?;
+
+        insert_playback_progress(&db, &progress).await?;
+
+        let lower_position =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 50, Timestamp::now(), None)?;
+        upsert_playback_progress(&db, &lower_position).await?;
+
+        let stored: (i64, Timestamp, Option<Id>) = sqlx::query_as(
+            r#"
+            SELECT position_seconds, updated_at, source_device_token_id
+            FROM playback_progress
+            WHERE user_id = ?1 AND media_item_id = ?2
+            "#,
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+
+        assert_eq!(stored.0, 100);
+        assert_eq!(stored.1, initial_updated_at);
+        assert_eq!(stored.2, None);
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_progress_upsert_accepts_higher_position()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let progress =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 100, Timestamp::now(), None)?;
+
+        insert_playback_progress(&db, &progress).await?;
+
+        let updated_at = Timestamp::now();
+        let higher_position =
+            PlaybackProgress::new(SEEDED_USER_ID, media_item_id, 200, updated_at, None)?;
+        upsert_playback_progress(&db, &higher_position).await?;
+
+        let stored: (i64, Timestamp) = sqlx::query_as(
+            r#"
+            SELECT position_seconds, updated_at
+            FROM playback_progress
+            WHERE user_id = ?1 AND media_item_id = ?2
+            "#,
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+
+        assert_eq!(stored.0, 200);
+        assert_eq!(stored.1, updated_at);
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watched_rows_support_insert_manual_toggle_and_delete()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let watched = Watched::new(
+            SEEDED_USER_ID,
+            media_item_id,
+            Timestamp::now(),
+            WatchedSource::Auto,
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO watched (
+                user_id,
+                media_item_id,
+                watched_at,
+                source
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(watched.user_id)
+        .bind(watched.media_item_id)
+        .bind(watched.watched_at)
+        .bind(watched.source.as_str())
+        .execute(db.write_pool())
+        .await?;
+
+        let inserted_source: String = sqlx::query_scalar(
+            "SELECT source FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(
+            WatchedSource::parse(&inserted_source),
+            Some(WatchedSource::Auto)
+        );
+
+        let watched_at = Timestamp::now();
+        sqlx::query(
+            r#"
+            UPDATE watched
+            SET watched_at = ?1, source = ?2
+            WHERE user_id = ?3 AND media_item_id = ?4
+            "#,
+        )
+        .bind(watched_at)
+        .bind(WatchedSource::Manual.as_str())
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .execute(db.write_pool())
+        .await?;
+
+        let updated: (Timestamp, String) = sqlx::query_as(
+            "SELECT watched_at, source FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
+        )
+        .bind(SEEDED_USER_ID)
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(updated.0, watched_at);
+        assert_eq!(
+            WatchedSource::parse(&updated.1),
+            Some(WatchedSource::Manual)
+        );
+
+        sqlx::query("DELETE FROM watched WHERE user_id = ?1 AND media_item_id = ?2")
+            .bind(SEEDED_USER_ID)
+            .bind(media_item_id)
+            .execute(db.write_pool())
+            .await?;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watched")
+            .fetch_one(db.read_pool())
+            .await?;
+        assert_eq!(count, 0);
 
         db.close().await;
         Ok(())
@@ -879,6 +1222,90 @@ mod tests {
         Ok(())
     }
 
+    async fn insert_personal_media_item(db: &super::Db) -> std::result::Result<Id, sqlx::Error> {
+        let id = Id::new();
+        let now = Timestamp::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, 'personal', NULL, ?2, ?3)
+            "#,
+        )
+        .bind(id)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(id)
+    }
+
+    async fn insert_playback_progress(
+        db: &super::Db,
+        progress: &PlaybackProgress,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO playback_progress (
+                user_id,
+                media_item_id,
+                position_seconds,
+                updated_at,
+                source_device_token_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(progress.user_id)
+        .bind(progress.media_item_id)
+        .bind(progress.position_seconds)
+        .bind(progress.updated_at)
+        .bind(progress.source_device_token_id)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(())
+    }
+
+    async fn upsert_playback_progress(
+        db: &super::Db,
+        progress: &PlaybackProgress,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO playback_progress (
+                user_id,
+                media_item_id,
+                position_seconds,
+                updated_at,
+                source_device_token_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(user_id, media_item_id) DO UPDATE SET
+                position_seconds = excluded.position_seconds,
+                updated_at = excluded.updated_at,
+                source_device_token_id = excluded.source_device_token_id
+            WHERE excluded.position_seconds > playback_progress.position_seconds
+            "#,
+        )
+        .bind(progress.user_id)
+        .bind(progress.media_item_id)
+        .bind(progress.position_seconds)
+        .bind(progress.updated_at)
+        .bind(progress.source_device_token_id)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(())
+    }
+
     fn config(database_path: PathBuf) -> Config {
         Config {
             database_path,
@@ -886,6 +1313,7 @@ mod tests {
             library: Default::default(),
             server: Default::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),

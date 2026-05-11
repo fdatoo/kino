@@ -18,10 +18,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg tesseract-ocr
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -50,7 +50,7 @@ jobs:
         id: cargo-cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: cargo-lock-${{ hashFiles('Cargo.lock') }}
+          key: cargo-lock-${{ hashFiles('Cargo.lock', 'crates/kino-db/migrations/**', 'crates/kino-server/openapi.json') }}
           cache-workspace-crates: "true"
 
       - name: Log Cargo cache result
