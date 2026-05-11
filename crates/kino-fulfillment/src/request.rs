@@ -323,7 +323,7 @@ impl fmt::Display for RequestTransition {
 }
 
 /// Actor associated with a request status event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestEventActor {
     /// Kino changed state automatically.
@@ -349,7 +349,7 @@ impl RequestEventActor {
 }
 
 /// Durable status event for a request state change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RequestStatusEvent {
     /// Event id.
     pub id: Id,
@@ -368,7 +368,7 @@ pub struct RequestStatusEvent {
 }
 
 /// Provenance for a request canonical identity version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestIdentityProvenance {
     /// Resolver match scoring selected the identity.
@@ -402,7 +402,7 @@ impl RequestIdentityProvenance {
 }
 
 /// Versioned canonical identity selected for a request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RequestIdentityVersion {
     /// Request id.
     pub request_id: Id,
@@ -421,7 +421,7 @@ pub struct RequestIdentityVersion {
 }
 
 /// Top-level decision produced by fulfillment planning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FulfillmentPlanDecision {
     /// The requested media already exists in the library.
@@ -452,7 +452,7 @@ impl FulfillmentPlanDecision {
 }
 
 /// Versioned fulfillment plan recorded for a request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct FulfillmentPlan {
     /// Plan id.
     pub id: Id,
@@ -503,7 +503,7 @@ impl<'a> NewFulfillmentPlan<'a> {
 }
 
 /// Candidate supplied by a resolver before request-level scoring.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RequestMatchCandidateInput {
     /// Candidate canonical identity id.
     pub canonical_identity_id: CanonicalIdentityId,
@@ -516,7 +516,7 @@ pub struct RequestMatchCandidateInput {
 }
 
 /// Ranked candidate stored when a request needs disambiguation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RequestMatchCandidate {
     /// Request-local rank starting at one.
     pub rank: u32,
@@ -533,7 +533,7 @@ pub struct RequestMatchCandidate {
 }
 
 /// Internal detail projection for request reads.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RequestDetail {
     /// Current request projection.
     pub request: Request,
@@ -664,7 +664,7 @@ impl Default for RequestListQuery {
 }
 
 /// One page of request list results.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RequestListPage {
     /// Default request projections.
     pub requests: Vec<Request>,
