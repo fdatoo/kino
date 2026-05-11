@@ -11,6 +11,7 @@ mod openapi;
 mod playback;
 mod request;
 pub mod session_reaper;
+mod stream;
 mod token;
 
 /// Errors produced by `kino-server`.
@@ -148,6 +149,7 @@ pub fn router_with_library_root_artwork_cache_and_public_base_url(
             library_root.into(),
             artwork_cache_dir.into(),
         ))
+        .merge(stream::router(db.clone()))
         .merge(token::router(db.clone()))
         .merge(playback::router(db))
         .route_layer(middleware::from_fn_with_state(
