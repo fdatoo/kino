@@ -39,6 +39,21 @@ listen = "127.0.0.1:7777"
 # Runtime override: KINO_SERVER__PUBLIC_BASE_URL.
 public_base_url = "http://127.0.0.1:8080"
 
+[server.session_reaper]
+# Seconds between playback session reaper sweeps. Optional. Defaults to 30.
+# Runtime override: KINO_SERVER__SESSION_REAPER__TICK_SECONDS.
+tick_seconds = 30
+
+# Seconds after which active playback sessions become idle. Optional. Defaults
+# to 60.
+# Runtime override: KINO_SERVER__SESSION_REAPER__ACTIVE_TO_IDLE_SECONDS.
+active_to_idle_seconds = 60
+
+# Seconds after which idle playback sessions become ended. Optional. Defaults
+# to 300.
+# Runtime override: KINO_SERVER__SESSION_REAPER__IDLE_TO_ENDED_SECONDS.
+idle_to_ended_seconds = 300
+
 [tmdb]
 # TMDB v3 API key. Optional until request resolution is enabled.
 # Runtime override: KINO_TMDB__API_KEY.
