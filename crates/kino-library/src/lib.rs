@@ -918,7 +918,7 @@ impl StorageLayoutScanner {
 }
 
 /// Result of scanning a Kino-owned library directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StorageLayoutScan {
     /// Canonical media files found under the owned layout.
     pub media_files: Vec<CanonicalLayoutFile>,
@@ -933,7 +933,7 @@ impl StorageLayoutScan {
 }
 
 /// A media file that follows Kino's canonical library layout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CanonicalLayoutFile {
     /// Filesystem path to the canonical media file.
     pub path: PathBuf,
@@ -942,7 +942,8 @@ pub struct CanonicalLayoutFile {
 }
 
 /// Media path family matched by the scanner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CanonicalLayoutFileKind {
     /// Movie path under `Movies/Title (Year)/Title (Year).ext`.
     Movie,
@@ -951,7 +952,7 @@ pub enum CanonicalLayoutFileKind {
 }
 
 /// A filesystem entry that does not follow Kino's storage policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StorageLayoutViolation {
     /// Filesystem path that violated the policy.
     pub path: PathBuf,
@@ -960,7 +961,8 @@ pub struct StorageLayoutViolation {
 }
 
 /// Stable reason a filesystem entry violated the storage policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageLayoutViolationKind {
     /// Entry is not one of Kino's owned top-level directories.
     UnknownTopLevelEntry,
@@ -968,6 +970,137 @@ pub enum StorageLayoutViolationKind {
     NonCanonicalMoviePath,
     /// Entry under `TV` does not match the TV layout.
     NonCanonicalTvPath,
+}
+
+/// Service that scans Kino's library layout and reconciles it with source-file rows.
+#[derive(Clone)]
+pub struct LibraryScanService {
+    db: Db,
+    scanner: StorageLayoutScanner,
+}
+
+impl LibraryScanService {
+    /// Construct a scan service for an explicit library root.
+    pub fn new(db: Db, library_root: impl Into<PathBuf>) -> Self {
+        Self {
+            db,
+            scanner: StorageLayoutScanner::new(library_root),
+        }
+    }
+
+    /// Construct a scan service from process configuration.
+    pub fn from_config(db: Db, config: &Config) -> Self {
+        Self {
+            db,
+            scanner: StorageLayoutScanner::from_config(config),
+        }
+    }
+
+    /// Scan the canonical library directory and report DB/disk drift.
+    pub async fn scan(&self) -> Result<LibraryScanReport> {
+        let layout = self.scanner.scan().await?;
+        let source_files = self.source_files().await?;
+        let db_paths = source_files
+            .iter()
+            .map(|source_file| source_file.path.clone())
+            .collect::<HashSet<_>>();
+        let mut canonical_files = layout.media_files;
+        canonical_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut orphans = canonical_files
+            .iter()
+            .filter(|file| !db_paths.contains(&file.path))
+            .map(|file| LibraryScanOrphan {
+                path: file.path.clone(),
+                kind: file.kind,
+            })
+            .collect::<Vec<_>>();
+
+        let mut missing = Vec::new();
+        for source_file in source_files {
+            if !try_exists(&source_file.path).await? {
+                missing.push(LibraryScanMissingFile { source_file });
+            }
+        }
+
+        let mut layout_violations = layout.violations;
+        orphans.sort_by(|left, right| left.path.cmp(&right.path));
+        missing.sort_by(|left, right| left.source_file.path.cmp(&right.source_file.path));
+        layout_violations.sort_by(|left, right| left.path.cmp(&right.path));
+
+        Ok(LibraryScanReport {
+            scanned_at: Timestamp::now(),
+            canonical_files,
+            orphans,
+            missing,
+            layout_violations,
+        })
+    }
+
+    async fn source_files(&self) -> Result<Vec<LibrarySourceFile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, media_item_id, path
+            FROM source_files
+            ORDER BY path, id
+            "#,
+        )
+        .fetch_all(self.db.read_pool())
+        .await?;
+
+        rows.iter()
+            .map(|row| {
+                let path: String = row.try_get("path")?;
+                Ok(LibrarySourceFile {
+                    id: row.try_get("id")?,
+                    media_item_id: row.try_get("media_item_id")?,
+                    path: PathBuf::from(path),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Complete output from a library scan and DB reconciliation run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibraryScanReport {
+    /// Time the report was produced.
+    pub scanned_at: Timestamp,
+    /// Canonical media files found on disk.
+    pub canonical_files: Vec<CanonicalLayoutFile>,
+    /// Canonical media files with no matching `source_files.path` row.
+    pub orphans: Vec<LibraryScanOrphan>,
+    /// Source-file rows whose filesystem path no longer exists.
+    pub missing: Vec<LibraryScanMissingFile>,
+    /// Filesystem entries that do not follow Kino's canonical layout.
+    pub layout_violations: Vec<StorageLayoutViolation>,
+}
+
+/// Canonical media file on disk with no matching source-file row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibraryScanOrphan {
+    /// Filesystem path found by the canonical layout scan.
+    pub path: PathBuf,
+    /// Media path family matched by the scanner.
+    pub kind: CanonicalLayoutFileKind,
+}
+
+/// Source-file row whose filesystem path no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibraryScanMissingFile {
+    /// Source-file row that points at the missing path.
+    pub source_file: LibrarySourceFile,
+}
+
+/// Persisted source-file row used for library reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibrarySourceFile {
+    /// Source-file id.
+    pub id: Id,
+    /// Media item that owns this source file.
+    pub media_item_id: Id,
+    /// Canonical source path stored in the catalog.
+    pub path: PathBuf,
 }
 
 /// Subtitle formats discovered by the probe step.
@@ -1825,6 +1958,85 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reconciles_canonical_files_with_source_file_rows()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let library_root = tempfile::tempdir()?;
+        let known = library_root
+            .path()
+            .join(MOVIES_DIRECTORY)
+            .join("Known (2001)")
+            .join("Known (2001).mkv");
+        let orphan = library_root
+            .path()
+            .join(MOVIES_DIRECTORY)
+            .join("Orphan (2002)")
+            .join("Orphan (2002).mkv");
+        let missing = library_root
+            .path()
+            .join(TV_DIRECTORY)
+            .join("Missing")
+            .join("Season 01")
+            .join("Missing - S01E01.mkv");
+        let violation = library_root.path().join("loose.mkv");
+
+        let known_parent = known.parent().ok_or("known path should have parent")?;
+        let orphan_parent = orphan.parent().ok_or("orphan path should have parent")?;
+        tokio::fs::create_dir_all(known_parent).await?;
+        tokio::fs::create_dir_all(orphan_parent).await?;
+        tokio::fs::write(&known, b"known").await?;
+        tokio::fs::write(&orphan, b"orphan").await?;
+        tokio::fs::write(&violation, b"loose").await?;
+        let known_source_id = insert_source_file(&db, media_item_id, &known).await?;
+        let missing_source_id = insert_source_file(&db, media_item_id, &missing).await?;
+
+        let service = LibraryScanService::new(db, library_root.path());
+        let report = service.scan().await?;
+
+        assert_eq!(
+            report.canonical_files,
+            vec![
+                CanonicalLayoutFile {
+                    path: known.clone(),
+                    kind: CanonicalLayoutFileKind::Movie,
+                },
+                CanonicalLayoutFile {
+                    path: orphan.clone(),
+                    kind: CanonicalLayoutFileKind::Movie,
+                },
+            ]
+        );
+        assert_eq!(
+            report.orphans,
+            vec![LibraryScanOrphan {
+                path: orphan,
+                kind: CanonicalLayoutFileKind::Movie,
+            }]
+        );
+        assert_eq!(
+            report.missing,
+            vec![LibraryScanMissingFile {
+                source_file: LibrarySourceFile {
+                    id: missing_source_id,
+                    media_item_id,
+                    path: missing,
+                },
+            }]
+        );
+        assert_eq!(
+            report.layout_violations,
+            vec![StorageLayoutViolation {
+                path: violation,
+                kind: StorageLayoutViolationKind::UnknownTopLevelEntry,
+            }]
+        );
+        assert_ne!(known_source_id, missing_source_id);
+
+        Ok(())
+    }
+
     async fn insert_personal_media_item(db: &Db) -> std::result::Result<Id, sqlx::Error> {
         let id = Id::new();
         let now = Timestamp::now();
@@ -1842,6 +2054,38 @@ mod tests {
             "#,
         )
         .bind(id)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(id)
+    }
+
+    async fn insert_source_file(
+        db: &Db,
+        media_item_id: Id,
+        path: &Path,
+    ) -> std::result::Result<Id, sqlx::Error> {
+        let id = Id::new();
+        let now = Timestamp::now();
+        let path = path.to_string_lossy().into_owned();
+
+        sqlx::query(
+            r#"
+            INSERT INTO source_files (
+                id,
+                media_item_id,
+                path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(id)
+        .bind(media_item_id)
+        .bind(path)
         .bind(now)
         .bind(now)
         .execute(db.write_pool())

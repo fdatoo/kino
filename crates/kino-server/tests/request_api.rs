@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request as HttpRequest, StatusCode, header},
 };
-use kino_core::{CanonicalIdentityId, TmdbId};
+use kino_core::{CanonicalIdentityId, Id, Timestamp, TmdbId};
 use kino_fulfillment::{
     FulfillmentPlanDecision, NewRequest, RequestDetail, RequestIdentityProvenance, RequestListPage,
     RequestService, RequestState, RequestTransition,
@@ -534,6 +534,58 @@ async fn manual_import_api_rejects_invalid_request_state() -> Result<(), Box<dyn
     Ok(())
 }
 
+#[tokio::test]
+async fn admin_library_scan_reports_orphans_and_missing_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let library_root = tempfile::tempdir()?;
+    let orphan = library_root
+        .path()
+        .join("Movies")
+        .join("Orphan (2002)")
+        .join("Orphan (2002).mkv");
+    let missing = library_root
+        .path()
+        .join("Movies")
+        .join("Missing (2003)")
+        .join("Missing (2003).mkv");
+    let orphan_parent = orphan.parent().ok_or("orphan path should have parent")?;
+    tokio::fs::create_dir_all(orphan_parent).await?;
+    tokio::fs::write(&orphan, b"orphan").await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let source_file_id = insert_source_file(&db, media_item_id, &missing).await?;
+    let app = kino_server::router_with_library_root(db, library_root.path());
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/admin/library/scan")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["orphans"][0]["path"], orphan.display().to_string());
+    assert_eq!(body["orphans"][0]["kind"], "movie");
+    assert_eq!(
+        body["missing"][0]["source_file"]["id"],
+        source_file_id.to_string()
+    );
+    assert_eq!(
+        body["missing"][0]["source_file"]["media_item_id"],
+        media_item_id.to_string()
+    );
+    assert_eq!(
+        body["missing"][0]["source_file"]["path"],
+        missing.display().to_string()
+    );
+    assert_eq!(body["layout_violations"], serde_json::json!([]));
+
+    Ok(())
+}
+
 async fn create_request(
     app: &axum::Router,
     message: &str,
@@ -597,6 +649,63 @@ async fn fulfilling_request(
         .await?;
 
     Ok(created.request.id)
+}
+
+async fn insert_personal_media_item(db: &kino_db::Db) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO media_items (
+            id,
+            media_kind,
+            canonical_identity_id,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, 'personal', NULL, ?2, ?3)
+        "#,
+    )
+    .bind(id)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
+}
+
+async fn insert_source_file(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    path: &std::path::Path,
+) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+    let path = path.to_string_lossy().into_owned();
+
+    sqlx::query(
+        r#"
+        INSERT INTO source_files (
+            id,
+            media_item_id,
+            path,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(id)
+    .bind(media_item_id)
+    .bind(path)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
 }
 
 fn identity(tmdb_id: u32) -> CanonicalIdentityId {

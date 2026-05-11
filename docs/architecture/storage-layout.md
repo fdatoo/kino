@@ -46,6 +46,18 @@ whitespace. A segment that becomes empty is rejected.
 `Metadata/` is reserved for Kino-managed metadata and other sidecars. Media
 scans treat it as owned storage but do not discover playable media from it.
 
+## Reconciliation
+
+Library scan compares canonical files on disk with `source_files.path` rows in
+the database. The scan is report-only in Phase 1:
+
+- Orphans are canonical media files on disk with no matching source-file row.
+- Missing files are source-file rows whose path no longer exists.
+- Layout violations are filesystem entries that do not follow the canonical
+  storage layout.
+
+Kino does not auto-delete, move, relink, or create rows during scan.
+
 ## Startup Warning
 
 If `library_root` is non-empty at startup, Kino logs a warning:
