@@ -467,6 +467,7 @@ mod tests {
                 (16, String::from("playback state")),
                 (17, String::from("playback sessions")),
                 (18, String::from("subtitle provenance")),
+                (19, String::from("catalog fts")),
                 (20, String::from("metadata artwork")),
             ]
         );
@@ -1060,6 +1061,7 @@ mod tests {
                 (16, String::from("playback state")),
                 (17, String::from("playback sessions")),
                 (18, String::from("subtitle provenance")),
+                (19, String::from("catalog fts")),
                 (20, String::from("metadata artwork")),
             ]
         );

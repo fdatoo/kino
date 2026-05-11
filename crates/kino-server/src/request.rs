@@ -56,6 +56,8 @@ pub(crate) struct ListCatalogItemsQuery {
     #[serde(rename = "type")]
     #[param(rename = "type")]
     pub(crate) media_type: Option<String>,
+    /// Full-text search across title and cast names.
+    pub(crate) search: Option<String>,
     /// Case-insensitive title substring.
     pub(crate) title_contains: Option<String>,
     /// Filter by source-file presence.
@@ -312,6 +314,9 @@ pub(crate) async fn list_catalog_items(
     let mut catalog_query = CatalogListQuery::new();
     if let Some(media_type) = query.media_type {
         catalog_query = catalog_query.with_media_kind(parse_media_item_kind(&media_type)?);
+    }
+    if let Some(search) = query.search {
+        catalog_query = catalog_query.with_search(search);
     }
     if let Some(title_contains) = query.title_contains {
         catalog_query = catalog_query.with_title_contains(title_contains);
