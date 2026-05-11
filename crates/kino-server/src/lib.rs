@@ -15,6 +15,7 @@ mod openapi;
 mod playback;
 mod request;
 pub mod session_reaper;
+mod stream;
 mod token;
 
 /// Errors produced by `kino-server`.
@@ -71,9 +72,10 @@ pub fn router_with_config(db: Db, config: Config) -> Router {
     let artwork_cache_dir = config.artwork_cache_dir();
     let protected_api = Router::new()
         .merge(request::router(db.clone(), library_root, artwork_cache_dir))
+        .merge(stream::router(db.clone()))
         .merge(token::router(db.clone()))
-        .merge(admin_config::router(config))
         .merge(playback::router(db))
+        .merge(admin_config::router(config))
         .route_layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_auth,

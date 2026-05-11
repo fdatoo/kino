@@ -58,6 +58,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert!(body["paths"].get("/api/v1/admin/config").is_some());
     assert!(
         body["paths"]
+            .get("/api/v1/stream/sourcefile/{id}")
+            .is_some()
+    );
+    assert!(
+        body["paths"]
             .get("/api/v1/library/items/{id}/images/{kind}")
             .is_some()
     );
