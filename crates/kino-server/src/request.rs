@@ -15,13 +15,17 @@ use kino_fulfillment::{
     RequestEventActor, RequestListPage, RequestListQuery, RequestMatchCandidateInput,
     RequestService, RequestState, RequestTransition,
 };
-use kino_library::{LibraryScanReport, LibraryScanService};
+use kino_library::{
+    CatalogListPage, CatalogListQuery, CatalogMediaItem, CatalogService, LibraryScanReport,
+    LibraryScanService, MediaItemKind,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct AppState {
     requests: RequestService,
     manual_imports: Arc<ManualImportProvider>,
+    catalog: CatalogService,
     library_scans: LibraryScanService,
 }
 
@@ -36,6 +40,17 @@ struct CreateRequest {
 #[serde(deny_unknown_fields)]
 struct ListRequestsQuery {
     state: Option<RequestState>,
+    limit: Option<u32>,
+    offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListCatalogItemsQuery {
+    #[serde(rename = "type")]
+    media_type: Option<String>,
+    title_contains: Option<String>,
+    has_source_file: Option<bool>,
     limit: Option<u32>,
     offset: Option<u64>,
 }
@@ -80,6 +95,7 @@ pub(crate) fn router(db: Db, library_root: PathBuf) -> Router {
     let state = AppState {
         requests: RequestService::new(db.clone()),
         manual_imports: Arc::new(ManualImportProvider::new()),
+        catalog: CatalogService::new(db.clone()),
         library_scans: LibraryScanService::new(db, library_root),
     };
 
@@ -96,6 +112,8 @@ pub(crate) fn router(db: Db, library_root: PathBuf) -> Router {
             "/api/admin/requests/{id}/manual-import",
             post(manual_import),
         )
+        .route("/api/library/items", get(list_catalog_items))
+        .route("/api/library/items/{id}", get(get_catalog_item))
         .route("/api/admin/library/scan", get(scan_library))
         .with_state(state)
 }
@@ -261,6 +279,40 @@ async fn scan_library(State(state): State<AppState>) -> ApiResult<Json<LibrarySc
     Ok(Json(report))
 }
 
+async fn list_catalog_items(
+    State(state): State<AppState>,
+    Query(query): Query<ListCatalogItemsQuery>,
+) -> ApiResult<Json<CatalogListPage>> {
+    let mut catalog_query = CatalogListQuery::new();
+    if let Some(media_type) = query.media_type {
+        catalog_query = catalog_query.with_media_kind(parse_media_item_kind(&media_type)?);
+    }
+    if let Some(title_contains) = query.title_contains {
+        catalog_query = catalog_query.with_title_contains(title_contains);
+    }
+    if let Some(has_source_file) = query.has_source_file {
+        catalog_query = catalog_query.with_has_source_file(has_source_file);
+    }
+    if let Some(limit) = query.limit {
+        catalog_query = catalog_query.with_limit(limit);
+    }
+    if let Some(offset) = query.offset {
+        catalog_query = catalog_query.with_offset(offset);
+    }
+
+    let page = state.catalog.list(catalog_query).await?;
+    Ok(Json(page))
+}
+
+async fn get_catalog_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<CatalogMediaItem>> {
+    let id = parse_id(id)?;
+    let item = state.catalog.get(id).await?;
+    Ok(Json(item))
+}
+
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -279,6 +331,9 @@ enum ApiError {
 
     #[error(transparent)]
     Library(#[from] kino_library::Error),
+
+    #[error("invalid media item type: {value}")]
+    InvalidMediaItemType { value: String },
 }
 
 #[derive(Serialize)]
@@ -326,6 +381,14 @@ impl IntoResponse for ApiError {
             Self::InvalidManualImportState { .. } => StatusCode::CONFLICT,
             Self::ManualImport(error) if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
             Self::ManualImport(_) => StatusCode::BAD_REQUEST,
+            Self::Library(kino_library::Error::MediaItemNotFound { .. }) => StatusCode::NOT_FOUND,
+            Self::Library(kino_library::Error::InvalidCatalogListLimit { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Library(kino_library::Error::InvalidCatalogListOffset { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::InvalidMediaItemType { .. } => StatusCode::BAD_REQUEST,
             Self::Library(_) => {
                 tracing::error!(error = %self, "library admin api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -350,6 +413,17 @@ fn parse_id(value: String) -> ApiResult<Id> {
     value
         .parse()
         .map_err(|source| ApiError::InvalidId { value, source })
+}
+
+fn parse_media_item_kind(value: &str) -> ApiResult<MediaItemKind> {
+    match value {
+        "movie" => Ok(MediaItemKind::Movie),
+        "tv" | "tv_series" => Ok(MediaItemKind::TvSeries),
+        "personal" => Ok(MediaItemKind::Personal),
+        _ => Err(ApiError::InvalidMediaItemType {
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn manual_import_message(message: Option<&str>, path: &std::path::Path, job_id: &str) -> String {
