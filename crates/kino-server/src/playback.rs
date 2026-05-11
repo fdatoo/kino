@@ -5,11 +5,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use kino_core::{Id, PlaybackProgress, Timestamp};
+use kino_core::{Id, PlaybackProgress, Timestamp, Watched, WatchedSource};
 use kino_db::Db;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthenticatedUser;
+
+const WATCHED_THRESHOLD_NUMERATOR: i128 = 90;
+const WATCHED_THRESHOLD_DENOMINATOR: i128 = 100;
 
 #[derive(Clone)]
 pub(crate) struct PlaybackState {
@@ -41,6 +44,10 @@ pub(crate) fn router(db: Db) -> Router {
         .route(
             "/api/v1/playback/progress/{media_item_id}",
             get(get_progress),
+        )
+        .route(
+            "/api/v1/playback/watched/{media_item_id}",
+            post(mark_watched).delete(unmark_watched),
         )
         .with_state(PlaybackState { db })
 }
@@ -93,6 +100,15 @@ pub(crate) async fn record_progress(
     .bind(progress.updated_at)
     .bind(progress.source_device_token_id)
     .execute(state.db.write_pool())
+    .await?;
+
+    auto_mark_watched(
+        &state.db,
+        progress.user_id,
+        progress.media_item_id,
+        progress.position_seconds,
+        updated_at,
+    )
     .await?;
 
     sqlx::query(
@@ -151,7 +167,9 @@ pub(crate) async fn get_progress(
         r#"
         SELECT 1
         FROM watched
-        WHERE user_id = ?1 AND media_item_id = ?2
+        WHERE user_id = ?1
+            AND media_item_id = ?2
+            AND unmarked = 0
         LIMIT 1
         "#,
     )
@@ -167,6 +185,168 @@ pub(crate) async fn get_progress(
         watched,
     })
     .into_response())
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/playback/watched/{media_item_id}",
+    tag = "playback",
+    params(
+        ("media_item_id" = Id, Path, description = "Media item to mark watched")
+    ),
+    responses(
+        (status = 204, description = "Media item marked watched"),
+        (status = 500, description = "Watched marker write failed", body = PlaybackErrorResponse)
+    )
+)]
+pub(crate) async fn mark_watched(
+    State(state): State<PlaybackState>,
+    AuthenticatedUser { user, .. }: AuthenticatedUser,
+    Path(media_item_id): Path<Id>,
+) -> PlaybackResult<StatusCode> {
+    let watched = Watched::new(
+        user.id,
+        media_item_id,
+        Timestamp::now(),
+        WatchedSource::Manual,
+    );
+
+    sqlx::query(
+        r#"
+        INSERT INTO watched (
+            user_id,
+            media_item_id,
+            watched_at,
+            source,
+            unmarked
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(user_id, media_item_id) DO UPDATE SET
+            watched_at = excluded.watched_at,
+            source = excluded.source,
+            unmarked = excluded.unmarked
+        "#,
+    )
+    .bind(watched.user_id)
+    .bind(watched.media_item_id)
+    .bind(watched.watched_at)
+    .bind(watched.source.as_str())
+    .bind(watched.unmarked)
+    .execute(state.db.write_pool())
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/playback/watched/{media_item_id}",
+    tag = "playback",
+    params(
+        ("media_item_id" = Id, Path, description = "Media item to unmark watched")
+    ),
+    responses(
+        (status = 204, description = "Media item unmarked watched"),
+        (status = 500, description = "Watched marker write failed", body = PlaybackErrorResponse)
+    )
+)]
+pub(crate) async fn unmark_watched(
+    State(state): State<PlaybackState>,
+    AuthenticatedUser { user, .. }: AuthenticatedUser,
+    Path(media_item_id): Path<Id>,
+) -> PlaybackResult<StatusCode> {
+    let watched = Watched::manual_unmarked(user.id, media_item_id, Timestamp::UNIX_EPOCH);
+
+    sqlx::query(
+        r#"
+        INSERT INTO watched (
+            user_id,
+            media_item_id,
+            watched_at,
+            source,
+            unmarked
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(user_id, media_item_id) DO UPDATE SET
+            watched_at = excluded.watched_at,
+            source = excluded.source,
+            unmarked = excluded.unmarked
+        "#,
+    )
+    .bind(watched.user_id)
+    .bind(watched.media_item_id)
+    .bind(watched.watched_at)
+    .bind(watched.source.as_str())
+    .bind(watched.unmarked)
+    .execute(state.db.write_pool())
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auto_mark_watched(
+    db: &Db,
+    user_id: Id,
+    media_item_id: Id,
+    position_seconds: i64,
+    watched_at: Timestamp,
+) -> PlaybackResult<()> {
+    let Some(duration_seconds) = max_probe_duration_seconds(db, media_item_id).await? else {
+        return Ok(());
+    };
+
+    if !meets_watched_threshold(position_seconds, duration_seconds) {
+        return Ok(());
+    }
+
+    let watched = Watched::new(user_id, media_item_id, watched_at, WatchedSource::Auto);
+
+    sqlx::query(
+        r#"
+        INSERT INTO watched (
+            user_id,
+            media_item_id,
+            watched_at,
+            source,
+            unmarked
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(user_id, media_item_id) DO NOTHING
+        "#,
+    )
+    .bind(watched.user_id)
+    .bind(watched.media_item_id)
+    .bind(watched.watched_at)
+    .bind(watched.source.as_str())
+    .bind(watched.unmarked)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
+async fn max_probe_duration_seconds(db: &Db, media_item_id: Id) -> PlaybackResult<Option<i64>> {
+    let duration = sqlx::query_scalar(
+        r#"
+        SELECT MAX(probe_duration_seconds)
+        FROM source_files
+        WHERE media_item_id = ?1
+        "#,
+    )
+    .bind(media_item_id)
+    .fetch_one(db.read_pool())
+    .await?;
+
+    Ok(duration)
+}
+
+fn meets_watched_threshold(position_seconds: i64, duration_seconds: i64) -> bool {
+    if duration_seconds <= 0 {
+        return false;
+    }
+
+    i128::from(position_seconds) * WATCHED_THRESHOLD_DENOMINATOR
+        >= i128::from(duration_seconds) * WATCHED_THRESHOLD_NUMERATOR
 }
 
 pub(crate) type PlaybackResult<T> = std::result::Result<T, PlaybackApiError>;
