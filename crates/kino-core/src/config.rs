@@ -83,6 +83,11 @@ pub struct LibraryConfig {
     #[serde(default)]
     pub canonical_transfer: CanonicalLayoutTransfer,
 
+    /// Directory used for content-addressed artwork caching. Defaults to
+    /// `<library_root>/.kino/artwork` when omitted.
+    #[serde(default)]
+    pub artwork_cache_dir: Option<PathBuf>,
+
     /// Directory used for image-subtitle OCR staging. Defaults to
     /// `<library_root>/.kino/subtitles` when omitted.
     #[serde(default)]
@@ -449,6 +454,19 @@ impl Config {
         validate_provider_configs(&self.providers)?;
         Ok(self)
     }
+
+    /// Return the artwork cache directory, applying the library-root default.
+    pub fn artwork_cache_dir(&self) -> PathBuf {
+        self.library
+            .artwork_cache_dir
+            .clone()
+            .unwrap_or_else(|| default_artwork_cache_dir(&self.library_root))
+    }
+}
+
+/// Return Kino's default content-addressed artwork cache directory.
+pub fn default_artwork_cache_dir(library_root: &Path) -> PathBuf {
+    library_root.join(".kino").join("artwork")
 }
 
 fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigError> {
@@ -702,6 +720,7 @@ mod tests {
 
                 [library]
                 canonical_transfer = "move"
+                artwork_cache_dir = "{}/artwork-cache"
                 subtitle_staging_dir = "{}/subtitle-staging"
 
                 [server]
@@ -733,6 +752,7 @@ mod tests {
             database_path.display(),
             library_root.display(),
             library_root.display(),
+            library_root.display(),
             disc_rip.display(),
             watch_folder.display()
         )
@@ -753,6 +773,10 @@ mod tests {
             assert_eq!(
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::Move
+            );
+            assert_eq!(
+                cfg.library.artwork_cache_dir,
+                Some(fixture.library_root.join("artwork-cache"))
             );
             assert_eq!(
                 cfg.library.subtitle_staging_dir,
@@ -831,6 +855,11 @@ mod tests {
             assert_eq!(
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::HardLink
+            );
+            assert_eq!(cfg.library.artwork_cache_dir, None);
+            assert_eq!(
+                cfg.artwork_cache_dir(),
+                fixture.library_root.join(".kino").join("artwork")
             );
             assert_eq!(cfg.library.subtitle_staging_dir, None);
             assert!(cfg.providers.disc_rip.is_none());
@@ -1057,6 +1086,21 @@ mod tests {
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::Move
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_library_artwork_cache_dir() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let cache = fixture.library_root.join("artwork-cache-env");
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_LIBRARY__ARTWORK_CACHE_DIR", cache.display());
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.library.artwork_cache_dir, Some(cache.clone()));
+            assert_eq!(cfg.artwork_cache_dir(), cache);
             Ok(())
         });
     }
