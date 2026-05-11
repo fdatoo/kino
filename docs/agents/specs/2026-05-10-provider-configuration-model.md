@@ -18,11 +18,13 @@ known provider. The initial model includes:
 [providers.watch_folder]
 path = "/srv/kino/incoming"
 preference = 0
+stability_seconds = 5
 ```
 
 `ProvidersConfig` owns optional provider sections. `WatchFolderProviderConfig`
-is a serde-derived typed config struct with provider-specific fields plus the
-selection preference used by fulfillment ranking.
+is a serde-derived typed config struct with provider-specific fields, the
+selection preference used by fulfillment ranking, and the file-stability window
+used before handing a file to ingestion.
 
 Missing provider sections are valid and mean no provider of that type is
 configured. Present provider sections are validated during `Config::load`.
@@ -31,8 +33,9 @@ configured. Present provider sections are validated during `Config::load`.
 
 `providers.watch_folder.path` is required when the section is present. Startup
 rejects an empty path, a missing path, or a path that does not point to a
-directory. This keeps provider misconfiguration in the same fail-fast path as
-database, library, and TMDB settings.
+directory. `stability_seconds` defaults to five and must be positive. This keeps
+provider misconfiguration in the same fail-fast path as database, library, and
+TMDB settings.
 
 ## Extension
 

@@ -7,7 +7,7 @@ use std::{
     sync::Mutex,
 };
 
-use kino_core::{CanonicalIdentityId, Id};
+use kino_core::Id;
 
 use crate::{
     FulfillmentProvider, FulfillmentProviderArgs, FulfillmentProviderCancelResult,
@@ -72,7 +72,6 @@ impl FulfillmentProvider for ManualImportProvider {
             self.jobs.lock().map_err(lock_error)?.insert(
                 handle.job_id.clone(),
                 ManualImportJobState {
-                    canonical_identity_id: args.canonical_identity_id,
                     source_path,
                     cancelled: false,
                 },
@@ -92,11 +91,9 @@ impl FulfillmentProvider for ManualImportProvider {
                 Some(job) if job.cancelled => Ok(FulfillmentProviderJobStatus::Cancelled {
                     cleanup: FulfillmentProviderCleanup::NothingToCleanUp,
                 }),
-                Some(job) => {
-                    let _canonical_identity_id = job.canonical_identity_id;
-                    let _source_path = job.source_path.as_path();
-                    Ok(FulfillmentProviderJobStatus::Completed)
-                }
+                Some(job) => Ok(FulfillmentProviderJobStatus::Completed {
+                    source_path: job.source_path.clone(),
+                }),
                 None => Err(unknown_job()),
             }
         })
@@ -123,7 +120,6 @@ impl FulfillmentProvider for ManualImportProvider {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManualImportJobState {
-    canonical_identity_id: CanonicalIdentityId,
     source_path: PathBuf,
     cancelled: bool,
 }
@@ -196,7 +192,7 @@ fn unknown_job() -> FulfillmentProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kino_core::TmdbId;
+    use kino_core::{CanonicalIdentityId, TmdbId};
 
     #[tokio::test]
     async fn starts_completed_job_for_readable_file()
@@ -212,7 +208,9 @@ mod tests {
         assert_eq!(handle.provider_id, MANUAL_IMPORT_PROVIDER_ID);
         assert_eq!(
             provider.status(&handle).await?,
-            FulfillmentProviderJobStatus::Completed
+            FulfillmentProviderJobStatus::Completed {
+                source_path: path.clone()
+            }
         );
 
         tokio::fs::remove_file(path).await?;

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use kino_core::{CanonicalIdentityId, CanonicalIdentityKind};
 
@@ -234,8 +234,11 @@ pub enum FulfillmentProviderJobStatus {
         /// Current progress.
         progress: FulfillmentProviderProgress,
     },
-    /// Provider completed fulfillment.
-    Completed,
+    /// Provider completed fulfillment and produced a source file for ingestion.
+    Completed {
+        /// Source file ready for ingestion.
+        source_path: PathBuf,
+    },
     /// Provider cancelled fulfillment and cleaned up partial state.
     Cancelled {
         /// Cleanup result for partial provider-owned state.
