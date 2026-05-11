@@ -19,6 +19,7 @@ use utoipa::openapi::server::Server;
         crate::stream::media_playlist,
         crate::stream::master_playlist,
         crate::stream::source_file,
+        crate::stream::subtitle_track,
         crate::stream::transcode_output,
         crate::request::get_catalog_item_image,
         crate::request::reocr_subtitle_track,

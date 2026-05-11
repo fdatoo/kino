@@ -3,9 +3,15 @@ use axum::{
     http::{Request as HttpRequest, StatusCode, header},
 };
 use kino_core::{Id, PlaybackSessionStatus, Timestamp};
+use kino_library::{
+    OcrSubtitleExtractionInput, OcrSubtitleTrack, ProbedSubtitleFormat, ProbedSubtitleTrack,
+    SubtitleExtractionInput, SubtitleService, subtitle_ocr,
+};
 use m3u8_rs::{AlternativeMediaType, MediaPlaylistType, Playlist};
+use std::time::Duration;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
+use webvtt_parser::Vtt;
 
 mod common;
 
@@ -531,6 +537,125 @@ async fn stream_source_file_requires_auth() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[tokio::test]
+async fn subtitle_srt_sidecar_serves_webvtt() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = stream_fixture().await?;
+    let track_id = seed_text_subtitle(
+        &fixture,
+        2,
+        "eng",
+        ProbedSubtitleFormat::Srt,
+        "1\n00:00:01,000 --> 00:00:02,500\nHello, Kino\n",
+    )
+    .await?;
+
+    let response = fetch_subtitle(
+        &fixture,
+        fixture.media_item_id,
+        track_id,
+        Some(&fixture.auth),
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static("text/vtt"))
+    );
+    let body = response_text(response).await?;
+    let parsed = parse_webvtt(&body)?;
+    assert_eq!(parsed.cues.len(), 1);
+    assert_eq!(parsed.cues[0].start.as_milliseconds(), 1_000);
+    assert_eq!(parsed.cues[0].end.as_milliseconds(), 2_500);
+    assert_eq!(parsed.cues[0].text, "Hello, Kino");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn subtitle_ass_sidecar_serves_webvtt() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = stream_fixture().await?;
+    let track_id = seed_text_subtitle(
+        &fixture,
+        3,
+        "spa",
+        ProbedSubtitleFormat::Ass,
+        "[Script Info]\nTitle: Kino\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:03.50,0:00:05.75,Default,,0,0,0,,{\\i1}Hola, Kino\n",
+    )
+    .await?;
+
+    let response = fetch_subtitle(
+        &fixture,
+        fixture.media_item_id,
+        track_id,
+        Some(&fixture.auth),
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await?;
+    let parsed = parse_webvtt(&body)?;
+    assert_eq!(parsed.cues.len(), 1);
+    assert_eq!(parsed.cues[0].start.as_milliseconds(), 3_500);
+    assert_eq!(parsed.cues[0].end.as_milliseconds(), 5_750);
+    assert_eq!(parsed.cues[0].text, "Hola, Kino");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn subtitle_ocr_sidecar_serves_webvtt() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = stream_fixture().await?;
+    let track_id = seed_ocr_subtitle(&fixture).await?;
+
+    let response = fetch_subtitle(
+        &fixture,
+        fixture.media_item_id,
+        track_id,
+        Some(&fixture.auth),
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await?;
+    let parsed = parse_webvtt(&body)?;
+    assert_eq!(parsed.cues.len(), 1);
+    assert_eq!(parsed.cues[0].start.as_milliseconds(), 6_250);
+    assert_eq!(parsed.cues[0].end.as_milliseconds(), 7_750);
+    assert_eq!(parsed.cues[0].text, "OCR KINO");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn subtitle_unknown_track_returns_not_found() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = stream_fixture().await?;
+
+    let response = fetch_subtitle(
+        &fixture,
+        fixture.media_item_id,
+        Id::new(),
+        Some(&fixture.auth),
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn subtitle_track_requires_auth() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = stream_fixture().await?;
+    let track_id = seed_ocr_subtitle(&fixture).await?;
+
+    let response = fetch_subtitle(&fixture, fixture.media_item_id, track_id, None).await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
 struct StreamFixture {
     app: axum::Router,
     db: kino_db::Db,
@@ -541,7 +666,7 @@ struct StreamFixture {
     transcode_output_id: Id,
     bytes: Vec<u8>,
     transcode_bytes: Vec<u8>,
-    _temp_dir: TempDir,
+    temp_dir: TempDir,
 }
 
 struct HlsFixture {
@@ -639,8 +764,91 @@ async fn stream_fixture() -> Result<StreamFixture, Box<dyn std::error::Error>> {
         transcode_output_id,
         bytes,
         transcode_bytes,
-        _temp_dir: temp_dir,
+        temp_dir,
     })
+}
+
+async fn seed_text_subtitle(
+    fixture: &StreamFixture,
+    track_index: u32,
+    language: &str,
+    format: ProbedSubtitleFormat,
+    text: &str,
+) -> Result<Id, Box<dyn std::error::Error>> {
+    let service = SubtitleService::new(fixture.db.clone());
+    let result = service
+        .extract_text_subtitles(SubtitleExtractionInput::new(
+            fixture.media_item_id,
+            fixture.temp_dir.path().join("sidecars"),
+            vec![ProbedSubtitleTrack::new(
+                track_index,
+                language,
+                format,
+                text,
+            )],
+        ))
+        .await?;
+
+    let Some(sidecar) = result.sidecars.first() else {
+        return Err("subtitle sidecar was not created".into());
+    };
+    Ok(sidecar.id)
+}
+
+async fn seed_ocr_subtitle(fixture: &StreamFixture) -> Result<Id, Box<dyn std::error::Error>> {
+    let service = SubtitleService::new(fixture.db.clone());
+    let result = service
+        .extract_ocr_subtitles(OcrSubtitleExtractionInput::new(
+            fixture.media_item_id,
+            fixture.temp_dir.path().join("sidecars"),
+            vec![OcrSubtitleTrack::new(
+                4,
+                "jpn",
+                vec![subtitle_ocr::OcrCue {
+                    start: Duration::from_millis(6_250),
+                    end: Duration::from_millis(7_750),
+                    text: String::from("OCR KINO"),
+                    confidence: 94.5,
+                }],
+            )],
+        ))
+        .await?;
+
+    let Some(sidecar) = result.sidecars.first() else {
+        return Err("subtitle sidecar was not created".into());
+    };
+    Ok(sidecar.id)
+}
+
+async fn fetch_subtitle(
+    fixture: &StreamFixture,
+    media_item_id: Id,
+    track_id: Id,
+    auth: Option<&str>,
+) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+    let mut request = HttpRequest::builder().method("GET").uri(format!(
+        "/api/v1/stream/items/{media_item_id}/subtitles/{track_id}.vtt"
+    ));
+    if let Some(token) = auth {
+        request = request.bearer(token);
+    }
+
+    Ok(fixture
+        .app
+        .clone()
+        .oneshot(request.body(Body::empty())?)
+        .await?)
+}
+
+async fn response_text(
+    response: axum::response::Response,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok(std::str::from_utf8(&bytes)?.to_owned())
+}
+
+fn parse_webvtt(body: &str) -> Result<Vtt<'_>, Box<dyn std::error::Error>> {
+    Vtt::parse(body).map_err(|error| format!("webvtt parse failed: {error:?}").into())
 }
 
 fn source_bytes() -> Vec<u8> {
