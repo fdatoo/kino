@@ -33,6 +33,8 @@ async fn start() -> Result<(), Error> {
 async fn run(config: Config) -> Result<(), Error> {
     let db = Db::open(&config).await?;
     ensure_bootstrap_device_token(&db).await?;
+    let _session_reaper =
+        kino_server::session_reaper::spawn(db.clone(), config.server.session_reaper.into());
     kino_server::serve(&config, db).await?;
     Ok(())
 }
@@ -177,6 +179,7 @@ mod tests {
             library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
@@ -191,6 +194,7 @@ mod tests {
             library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
@@ -221,6 +225,7 @@ mod tests {
                 (15, String::from("device tokens")),
                 (16, String::from("playback state")),
                 (17, String::from("playback sessions")),
+                (18, String::from("subtitle provenance")),
             ]
         );
 
