@@ -26,6 +26,10 @@ use tokio_util::io::ReaderStream;
 
 use crate::{auth::AuthenticatedUser, session_service};
 
+const HLS_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
+const HLS_SEGMENT_TARGET_SECONDS: u64 = 6;
+const DEFAULT_HLS_BANDWIDTH: u64 = 2_000_000;
+
 #[derive(Clone)]
 pub(crate) struct StreamState {
     db: Db,
@@ -38,6 +42,10 @@ pub(crate) fn router(db: Db) -> Router {
         .route(
             "/api/v1/stream/items/{id}/{variant_id}/master.m3u8",
             get(master_playlist),
+        )
+        .route(
+            "/api/v1/stream/items/{id}/{variant_id}/media.m3u8",
+            get(media_playlist),
         )
         .route("/api/v1/stream/sourcefile/{id}", get(source_file))
         .route("/api/v1/stream/transcode/{id}", get(transcode_output))
@@ -79,6 +87,53 @@ pub(crate) async fn master_playlist(
         &probe,
         &subtitles,
     );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HLS_CONTENT_TYPE)
+        .body(Body::from(playlist))
+        .map_err(StreamError::Response)
+}
+
+/// Serve a VOD HLS media playlist backed by source-file byte ranges.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/items/{id}/{variant_id}/media.m3u8",
+    tag = "stream",
+    params(
+        ("id" = Id, Path, description = "Media item id"),
+        ("variant_id" = Id, Path, description = "Source-file variant id")
+    ),
+    responses(
+        (status = 200, description = "HLS media playlist", body = String, content_type = "application/vnd.apple.mpegurl"),
+        (status = 404, description = "Media item variant not found", body = StreamErrorResponse),
+        (status = 422, description = "Media item variant is not playlist-ready", body = StreamErrorResponse),
+        (status = 500, description = "Media playlist generation failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn media_playlist(
+    State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
+    AxumPath((id, variant_id)): AxumPath<(Id, Id)>,
+) -> StreamResult<Response> {
+    let source_file = lookup_source_variant(&state.db, id, variant_id).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        source_file.media_item_id,
+        variant_id.to_string(),
+    )
+    .await?;
+
+    let metadata = tokio::fs::metadata(&source_file.path).await?;
+    let playlist = build_media_playlist(
+        variant_id,
+        source_file
+            .probe_duration_seconds
+            .ok_or_else(|| playlist_unavailable("source file has no probed duration"))?,
+        metadata.len(),
+    )?;
 
     Response::builder()
         .status(StatusCode::OK)
@@ -247,6 +302,13 @@ struct SubtitleTrackRow {
     forced: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRangeSegment {
+    offset: u64,
+    length: u64,
+    duration_seconds: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResolvedRange {
     start: u64,
@@ -293,6 +355,9 @@ pub(crate) enum StreamError {
     #[error("range not satisfiable for source file of {file_size} bytes: {reason}")]
     RangeNotSatisfiable { file_size: u64, reason: String },
 
+    #[error("media playlist unavailable: {reason}")]
+    PlaylistUnavailable { reason: String },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -325,6 +390,7 @@ impl IntoResponse for StreamError {
         let status = match &self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::PlaylistUnavailable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Io(_)
             | Self::Probe(_)
             | Self::Sqlx(_)
@@ -693,9 +759,6 @@ async fn lookup_subtitle_tracks(db: &Db, media_item_id: Id) -> StreamResult<Vec<
         .map_err(StreamError::Sqlx)
 }
 
-const HLS_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
-const DEFAULT_HLS_BANDWIDTH: u64 = 2_000_000;
-
 fn build_master_playlist(
     media_item_id: Id,
     variant_id: Id,
@@ -770,6 +833,74 @@ fn build_master_playlist(
     playlist.push('\n');
 
     playlist
+}
+
+fn build_media_playlist(
+    source_file_id: Id,
+    duration_seconds: u64,
+    file_size: u64,
+) -> StreamResult<String> {
+    if duration_seconds == 0 {
+        return Err(playlist_unavailable("source file duration is zero"));
+    }
+    if file_size == 0 {
+        return Err(playlist_unavailable("source file is empty"));
+    }
+
+    let segments = byte_range_segments(duration_seconds, file_size);
+    let target_duration = segments
+        .iter()
+        .map(|segment| segment.duration_seconds)
+        .max()
+        .unwrap_or(HLS_SEGMENT_TARGET_SECONDS);
+    let source_uri = format!("/api/v1/stream/sourcefile/{source_file_id}");
+    let mut playlist = String::new();
+    playlist.push_str("#EXTM3U\n");
+    playlist.push_str("#EXT-X-VERSION:4\n");
+    playlist.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+
+    for segment in segments {
+        playlist.push_str(&format!(
+            "#EXTINF:{:.3},\n",
+            segment.duration_seconds as f64
+        ));
+        playlist.push_str(&format!(
+            "#EXT-X-BYTERANGE:{}@{}\n",
+            segment.length, segment.offset
+        ));
+        playlist.push_str(&source_uri);
+        playlist.push('\n');
+    }
+
+    playlist.push_str("#EXT-X-ENDLIST\n");
+    Ok(playlist)
+}
+
+fn byte_range_segments(duration_seconds: u64, file_size: u64) -> Vec<ByteRangeSegment> {
+    let duration_segment_count = duration_seconds.div_ceil(HLS_SEGMENT_TARGET_SECONDS);
+    let segment_count = duration_segment_count.min(file_size);
+    let base_length = file_size / segment_count;
+    let remainder = file_size % segment_count;
+    let mut segments = Vec::with_capacity(segment_count as usize);
+    let mut offset = 0;
+
+    for index in 0..segment_count {
+        let length = base_length + if index < remainder { 1 } else { 0 };
+        let duration_seconds = if index + 1 == segment_count {
+            duration_seconds - (HLS_SEGMENT_TARGET_SECONDS * index)
+        } else {
+            HLS_SEGMENT_TARGET_SECONDS
+        };
+        segments.push(ByteRangeSegment {
+            offset,
+            length,
+            duration_seconds,
+        });
+        offset += length;
+    }
+
+    segments
 }
 
 trait ProbeResultExt {
@@ -933,6 +1064,12 @@ fn parse_range_bound(value: &str, file_size: u64) -> StreamResult<u64> {
 fn unsatisfiable(file_size: u64, reason: impl Into<String>) -> StreamError {
     StreamError::RangeNotSatisfiable {
         file_size,
+        reason: reason.into(),
+    }
+}
+
+fn playlist_unavailable(reason: impl Into<String>) -> StreamError {
+    StreamError::PlaylistUnavailable {
         reason: reason.into(),
     }
 }

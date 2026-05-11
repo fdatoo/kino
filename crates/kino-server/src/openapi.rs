@@ -16,6 +16,7 @@ use utoipa::openapi::server::Server;
         crate::request::get_catalog_item,
         crate::request::manual_import,
         crate::session_admin::list_sessions,
+        crate::stream::media_playlist,
         crate::stream::master_playlist,
         crate::stream::source_file,
         crate::stream::subtitle_track,
