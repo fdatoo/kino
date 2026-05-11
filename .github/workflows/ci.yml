@@ -50,7 +50,7 @@ jobs:
         id: cargo-cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: cargo-lock-${{ hashFiles('Cargo.lock') }}
+          key: cargo-lock-${{ hashFiles('Cargo.lock', 'crates/kino-db/migrations/**', 'crates/kino-server/openapi.json') }}
           cache-workspace-crates: "true"
 
       - name: Log Cargo cache result
