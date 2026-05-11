@@ -100,21 +100,21 @@ pub(crate) fn router(db: Db, library_root: PathBuf) -> Router {
     };
 
     Router::new()
-        .route("/api/requests", post(create_request).get(list_requests))
+        .route("/api/v1/requests", post(create_request).get(list_requests))
         .route(
-            "/api/requests/{id}",
+            "/api/v1/requests/{id}",
             get(get_request).delete(cancel_request),
         )
-        .route("/api/requests/{id}/matches", post(score_matches))
-        .route("/api/requests/{id}/plans", post(record_plan))
-        .route("/api/requests/{id}/re-resolution", post(re_resolve))
+        .route("/api/v1/requests/{id}/matches", post(score_matches))
+        .route("/api/v1/requests/{id}/plans", post(record_plan))
+        .route("/api/v1/requests/{id}/re-resolution", post(re_resolve))
         .route(
-            "/api/admin/requests/{id}/manual-import",
+            "/api/v1/admin/requests/{id}/manual-import",
             post(manual_import),
         )
-        .route("/api/library/items", get(list_catalog_items))
-        .route("/api/library/items/{id}", get(get_catalog_item))
-        .route("/api/admin/library/scan", get(scan_library))
+        .route("/api/v1/library/items", get(list_catalog_items))
+        .route("/api/v1/library/items/{id}", get(get_catalog_item))
+        .route("/api/v1/admin/library/scan", get(scan_library))
         .with_state(state)
 }
 

@@ -21,7 +21,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri("/api/requests")
+                .uri("/api/v1/requests")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"target":"Inception (2010)","message":"requested from curl"}"#,
@@ -43,7 +43,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!("/api/requests/{}", created.request.id))
+                .uri(format!("/api/v1/requests/{}", created.request.id))
                 .body(Body::empty())?,
         )
         .await?;
@@ -57,7 +57,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri("/api/requests")
+                .uri("/api/v1/requests")
                 .body(Body::empty())?,
         )
         .await?;
@@ -72,7 +72,7 @@ async fn request_api_exercises_happy_path_end_to_end() -> Result<(), Box<dyn std
         .oneshot(
             HttpRequest::builder()
                 .method("DELETE")
-                .uri(format!("/api/requests/{}", created.request.id))
+                .uri(format!("/api/v1/requests/{}", created.request.id))
                 .body(Body::empty())?,
         )
         .await?;
@@ -105,7 +105,7 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri("/api/requests?state=pending&limit=2&offset=0")
+                .uri("/api/v1/requests?state=pending&limit=2&offset=0")
                 .body(Body::empty())?,
         )
         .await?;
@@ -125,7 +125,7 @@ async fn list_request_api_accepts_filter_and_pagination() -> Result<(), Box<dyn 
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri("/api/requests?limit=0")
+                .uri("/api/v1/requests?limit=0")
                 .body(Body::empty())?,
         )
         .await?;
@@ -146,7 +146,7 @@ async fn request_match_api_resolves_high_confidence_match() -> Result<(), Box<dy
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri(format!("/api/requests/{}/matches", created.request.id))
+                .uri(format!("/api/v1/requests/{}/matches", created.request.id))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{
@@ -197,7 +197,7 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri(format!("/api/requests/{}/matches", created.request.id))
+                .uri(format!("/api/v1/requests/{}/matches", created.request.id))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{
@@ -231,7 +231,7 @@ async fn request_match_api_parks_low_confidence_match_with_candidates()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!("/api/requests/{}", created.request.id))
+                .uri(format!("/api/v1/requests/{}", created.request.id))
                 .body(Body::empty())?,
         )
         .await?;
@@ -276,7 +276,7 @@ async fn re_resolution_api_records_versioned_identity_history()
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!(
-                    "/api/requests/{}/re-resolution",
+                    "/api/v1/requests/{}/re-resolution",
                     created.request.id
                 ))
                 .header(header::CONTENT_TYPE, "application/json")
@@ -350,7 +350,7 @@ async fn request_plan_api_records_current_plan_and_history()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri(format!("/api/requests/{}/plans", created.request.id))
+                .uri(format!("/api/v1/requests/{}/plans", created.request.id))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{
@@ -373,7 +373,7 @@ async fn request_plan_api_records_current_plan_and_history()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri(format!("/api/requests/{}/plans", created.request.id))
+                .uri(format!("/api/v1/requests/{}/plans", created.request.id))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{
@@ -397,7 +397,7 @@ async fn request_plan_api_records_current_plan_and_history()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!("/api/requests/{}", created.request.id))
+                .uri(format!("/api/v1/requests/{}", created.request.id))
                 .body(Body::empty())?,
         )
         .await?;
@@ -423,7 +423,7 @@ async fn manual_import_api_accepts_readable_file_and_starts_ingesting()
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri(format!("/api/admin/requests/{request}/manual-import"))
+                .uri(format!("/api/v1/admin/requests/{request}/manual-import"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{
@@ -474,7 +474,7 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri(format!("/api/admin/requests/{request}/manual-import"))
+                .uri(format!("/api/v1/admin/requests/{request}/manual-import"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
         )
@@ -493,7 +493,7 @@ async fn manual_import_api_surfaces_missing_path() -> Result<(), Box<dyn std::er
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!("/api/requests/{request}"))
+                .uri(format!("/api/v1/requests/{request}"))
                 .body(Body::empty())?,
         )
         .await?;
@@ -520,7 +520,7 @@ async fn manual_import_api_rejects_invalid_request_state() -> Result<(), Box<dyn
             HttpRequest::builder()
                 .method("POST")
                 .uri(format!(
-                    "/api/admin/requests/{}/manual-import",
+                    "/api/v1/admin/requests/{}/manual-import",
                     created.request.id
                 ))
                 .header(header::CONTENT_TYPE, "application/json")
@@ -560,7 +560,7 @@ async fn admin_library_scan_reports_orphans_and_missing_files()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri("/api/admin/library/scan")
+                .uri("/api/v1/admin/library/scan")
                 .body(Body::empty())?,
         )
         .await?;
@@ -605,7 +605,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri("/api/library/items?type=movie&title_contains=matrix&has_source_file=true&limit=1")
+                .uri("/api/v1/library/items?type=movie&title_contains=matrix&has_source_file=true&limit=1")
                 .body(Body::empty())?,
         )
         .await?;
@@ -625,7 +625,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri("/api/library/items?limit=1")
+                .uri("/api/v1/library/items?limit=1")
                 .body(Body::empty())?,
         )
         .await?;
@@ -638,7 +638,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!("/api/library/items/{matrix}"))
+                .uri(format!("/api/v1/library/items/{matrix}"))
                 .body(Body::empty())?,
         )
         .await?;
@@ -665,7 +665,7 @@ async fn catalog_api_reports_invalid_filters_and_missing_items()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri("/api/library/items?type=episode")
+                .uri("/api/v1/library/items?type=episode")
                 .body(Body::empty())?,
         )
         .await?;
@@ -675,7 +675,7 @@ async fn catalog_api_reports_invalid_filters_and_missing_items()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!("/api/library/items/{}", Id::new()))
+                .uri(format!("/api/v1/library/items/{}", Id::new()))
                 .body(Body::empty())?,
         )
         .await?;
@@ -693,7 +693,7 @@ async fn create_request(
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri("/api/requests")
+                .uri("/api/v1/requests")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"target":"{message}","message":"{message}"}}"#
@@ -941,7 +941,7 @@ async fn create_request_requires_target() -> Result<(), Box<dyn std::error::Erro
         .oneshot(
             HttpRequest::builder()
                 .method("POST")
-                .uri("/api/requests")
+                .uri("/api/v1/requests")
                 .body(Body::empty())?,
         )
         .await?;
