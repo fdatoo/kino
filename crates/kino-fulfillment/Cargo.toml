@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
+kino-transcode = { path = "../kino-transcode" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 sqlx = { workspace = true }

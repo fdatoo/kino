@@ -6,3 +6,10 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+kino-core = { path = "../kino-core" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
