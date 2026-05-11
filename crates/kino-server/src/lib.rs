@@ -26,7 +26,9 @@ pub fn router(db: Db) -> Router {
 
 /// Build the Kino HTTP router with an explicit library root.
 pub fn router_with_library_root(db: Db, library_root: impl Into<PathBuf>) -> Router {
-    Router::new().merge(request::router(db, library_root.into()))
+    Router::new()
+        .merge(request::router(db, library_root.into()))
+        .merge(kino_admin::router())
 }
 
 /// Serve the Kino HTTP API until the listener exits.
