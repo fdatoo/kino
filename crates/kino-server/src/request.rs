@@ -36,10 +36,12 @@ pub(crate) struct AppState {
     artwork_cache_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct CreateRequest {
+pub(crate) struct CreateRequest {
+    /// Raw title or query text requested by the user.
     target: String,
+    /// Optional status-event message.
     message: Option<String>,
 }
 
@@ -85,24 +87,30 @@ pub(crate) struct ListCatalogItemsQuery {
     pub(crate) cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct ScoreMatchesRequest {
+pub(crate) struct ScoreMatchesRequest {
+    /// Candidate identities to score for this request.
     candidates: Vec<RequestMatchCandidateInput>,
+    /// Optional status-event message.
     message: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct ReResolveRequest {
+pub(crate) struct ReResolveRequest {
+    /// Canonical identity selected by the resolver or operator.
     canonical_identity_id: CanonicalIdentityId,
+    /// Optional status-event message.
     message: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct RecordPlanRequest {
+pub(crate) struct RecordPlanRequest {
+    /// Planner decision to persist.
     decision: FulfillmentPlanDecision,
+    /// Human-readable reason for the decision.
     summary: String,
 }
 
@@ -179,7 +187,17 @@ pub(crate) fn router(
         .with_state(state)
 }
 
-async fn create_request(
+#[utoipa::path(
+    post,
+    path = "/api/v1/requests",
+    tag = "requests",
+    request_body = CreateRequest,
+    responses(
+        (status = 201, description = "Request created", body = RequestDetail),
+        (status = 500, description = "Request creation failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_request(
     State(state): State<AppState>,
     Json(payload): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<RequestDetail>)> {
@@ -248,7 +266,22 @@ pub(crate) async fn get_request(
     Ok(Json(detail))
 }
 
-async fn cancel_request(
+#[utoipa::path(
+    delete,
+    path = "/api/v1/requests/{id}",
+    tag = "requests",
+    params(
+        ("id" = Id, Path, description = "Request id")
+    ),
+    responses(
+        (status = 200, description = "Request cancelled", body = RequestDetail),
+        (status = 400, description = "Invalid request id", body = ErrorResponse),
+        (status = 404, description = "Request not found", body = ErrorResponse),
+        (status = 409, description = "Request cannot be cancelled from its current state", body = ErrorResponse),
+        (status = 500, description = "Request cancellation failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn cancel_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RequestDetail>> {
@@ -260,7 +293,23 @@ async fn cancel_request(
     Ok(Json(detail))
 }
 
-async fn score_matches(
+#[utoipa::path(
+    post,
+    path = "/api/v1/requests/{id}/matches",
+    tag = "requests",
+    params(
+        ("id" = Id, Path, description = "Request id")
+    ),
+    request_body = ScoreMatchesRequest,
+    responses(
+        (status = 200, description = "Request match candidates scored", body = RequestDetail),
+        (status = 400, description = "Invalid request id or match candidates", body = ErrorResponse),
+        (status = 404, description = "Request not found", body = ErrorResponse),
+        (status = 409, description = "Request cannot resolve matches from its current state", body = ErrorResponse),
+        (status = 500, description = "Match scoring failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn score_matches(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<ScoreMatchesRequest>,
@@ -278,7 +327,23 @@ async fn score_matches(
     Ok(Json(detail))
 }
 
-async fn record_plan(
+#[utoipa::path(
+    post,
+    path = "/api/v1/requests/{id}/plans",
+    tag = "requests",
+    params(
+        ("id" = Id, Path, description = "Request id")
+    ),
+    request_body = RecordPlanRequest,
+    responses(
+        (status = 200, description = "Fulfillment plan recorded", body = RequestDetail),
+        (status = 400, description = "Invalid request id or fulfillment plan", body = ErrorResponse),
+        (status = 404, description = "Request not found", body = ErrorResponse),
+        (status = 409, description = "Request cannot record a plan from its current state", body = ErrorResponse),
+        (status = 500, description = "Plan persistence failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn record_plan(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<RecordPlanRequest>,
@@ -295,7 +360,23 @@ async fn record_plan(
     Ok(Json(detail))
 }
 
-async fn re_resolve(
+#[utoipa::path(
+    post,
+    path = "/api/v1/requests/{id}/re-resolution",
+    tag = "requests",
+    params(
+        ("id" = Id, Path, description = "Request id")
+    ),
+    request_body = ReResolveRequest,
+    responses(
+        (status = 200, description = "Request identity re-resolved", body = RequestDetail),
+        (status = 400, description = "Invalid request id or canonical identity", body = ErrorResponse),
+        (status = 404, description = "Request not found", body = ErrorResponse),
+        (status = 409, description = "Request cannot be re-resolved from its current state", body = ErrorResponse),
+        (status = 500, description = "Request re-resolution failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn re_resolve(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<ReResolveRequest>,
@@ -377,7 +458,19 @@ pub(crate) async fn manual_import(
     }))
 }
 
-async fn scan_library(State(state): State<AppState>) -> ApiResult<Json<LibraryScanReport>> {
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/library/scan",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Library scan report", body = LibraryScanReport),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 500, description = "Library scan failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn scan_library(
+    State(state): State<AppState>,
+) -> ApiResult<Json<LibraryScanReport>> {
     let report = state.library_scans.scan().await?;
     Ok(Json(report))
 }

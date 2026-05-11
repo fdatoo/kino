@@ -2052,7 +2052,7 @@ impl StorageLayoutScanner {
 }
 
 /// Result of scanning a Kino-owned library directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct StorageLayoutScan {
     /// Canonical media files found under the owned layout.
     pub media_files: Vec<CanonicalLayoutFile>,
@@ -2067,16 +2067,17 @@ impl StorageLayoutScan {
 }
 
 /// A media file that follows Kino's canonical library layout.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct CanonicalLayoutFile {
     /// Filesystem path to the canonical media file.
+    #[schema(value_type = String)]
     pub path: PathBuf,
     /// Media path family matched by the scanner.
     pub kind: CanonicalLayoutFileKind,
 }
 
 /// Media path family matched by the scanner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalLayoutFileKind {
     /// Movie path under `Movies/Title (Year)/Title (Year).ext`.
@@ -2086,16 +2087,17 @@ pub enum CanonicalLayoutFileKind {
 }
 
 /// A filesystem entry that does not follow Kino's storage policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct StorageLayoutViolation {
     /// Filesystem path that violated the policy.
+    #[schema(value_type = String)]
     pub path: PathBuf,
     /// Stable reason for the violation.
     pub kind: StorageLayoutViolationKind,
 }
 
 /// Stable reason a filesystem entry violated the storage policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageLayoutViolationKind {
     /// Entry is not one of Kino's owned top-level directories.
@@ -2187,7 +2189,7 @@ impl LibraryScanService {
 }
 
 /// Complete output from a library scan and DB reconciliation run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct LibraryScanReport {
     /// Time the report was produced.
     pub scanned_at: Timestamp,
@@ -2202,16 +2204,17 @@ pub struct LibraryScanReport {
 }
 
 /// Canonical media file on disk with no matching source-file row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct LibraryScanOrphan {
     /// Filesystem path found by the canonical layout scan.
+    #[schema(value_type = String)]
     pub path: PathBuf,
     /// Media path family matched by the scanner.
     pub kind: CanonicalLayoutFileKind,
 }
 
 /// Source-file row whose filesystem path no longer exists.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct LibraryScanMissingFile {
     /// Source-file row that points at the missing path.
     pub source_file: LibrarySourceFile,

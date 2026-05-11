@@ -10,11 +10,17 @@ use utoipa::openapi::server::Server;
         crate::playback::mark_watched,
         crate::playback::record_progress,
         crate::playback::unmark_watched,
+        crate::request::cancel_request,
+        crate::request::create_request,
         crate::request::get_request,
         crate::request::list_catalog_items,
         crate::request::list_requests,
         crate::request::get_catalog_item,
         crate::request::manual_import,
+        crate::request::record_plan,
+        crate::request::re_resolve,
+        crate::request::scan_library,
+        crate::request::score_matches,
         crate::session_admin::list_sessions,
         crate::stream::media_playlist,
         crate::stream::master_playlist,
@@ -39,6 +45,7 @@ use utoipa::openapi::server::Server;
 pub(crate) struct ApiDoc;
 
 pub(crate) fn router(public_base_url: impl Into<String>) -> Router {
+    // `just openapi` starts the binary, fetches this route, and rewrites the committed spec.
     let public_base_url = public_base_url.into();
     Router::new().route(
         "/api/openapi.json",
