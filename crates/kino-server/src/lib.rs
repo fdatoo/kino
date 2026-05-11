@@ -17,6 +17,7 @@ mod playback;
 mod request;
 mod session_admin;
 pub mod session_reaper;
+pub mod session_service;
 mod stream;
 mod token;
 
