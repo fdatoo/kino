@@ -7,6 +7,7 @@ use utoipa::openapi::server::Server;
     paths(
         crate::playback::record_progress,
         crate::request::list_catalog_items,
+        crate::stream::source_file,
         crate::request::get_catalog_item_image,
         crate::token::create_token,
         crate::token::list_tokens,
@@ -15,6 +16,7 @@ use utoipa::openapi::server::Server;
     info(title = "Kino API", version = "0.1.0-phase-2"),
     tags(
         (name = "requests", description = "Request lifecycle operations"),
+        (name = "stream", description = "Source media streaming operations"),
         (name = "library", description = "Library catalog operations"),
         (name = "playback", description = "Playback state operations"),
         (name = "admin", description = "Administrative operations")
