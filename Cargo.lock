@@ -1025,6 +1025,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+ "utoipa",
 ]
 
 [[package]]

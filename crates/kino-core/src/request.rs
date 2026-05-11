@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CanonicalIdentityId, Id, Timestamp};
 
 /// Durable request state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestState {
     /// A request has been accepted but not resolved to canonical media.
@@ -127,7 +127,7 @@ impl fmt::Display for RequestState {
 }
 
 /// Typed reason for a failed request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFailureReason {
     /// No configured provider accepted the request.
@@ -170,7 +170,7 @@ impl fmt::Display for RequestFailureReason {
 }
 
 /// Principal that owns a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestRequester {
     /// Request submitted without an authenticated user.
@@ -216,7 +216,7 @@ impl RequestRequester {
 }
 
 /// Target media identity captured by a request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RequestTarget {
     /// Raw query text supplied by the requester.
     pub raw_query: String,
@@ -225,7 +225,7 @@ pub struct RequestTarget {
 }
 
 /// Current request projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Request {
     /// Request id.
     pub id: Id,
