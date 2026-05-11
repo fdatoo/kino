@@ -43,11 +43,15 @@ struct CreateRequest {
     message: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
-struct ListRequestsQuery {
+pub(crate) struct ListRequestsQuery {
+    /// Request state to include.
     state: Option<RequestState>,
+    /// Maximum number of requests to return.
     limit: Option<u32>,
+    /// Number of matching requests to skip.
     offset: Option<u64>,
 }
 
@@ -102,18 +106,22 @@ struct RecordPlanRequest {
     summary: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct ManualImportRequest {
+pub(crate) struct ManualImportRequest {
+    /// Existing source path to ingest for the request.
+    #[schema(value_type = String)]
     path: PathBuf,
+    /// Optional status-event message.
     message: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct ManualImportResponse {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ManualImportResponse {
     request: RequestDetail,
     provider_id: String,
     job_id: String,
+    #[schema(value_type = String)]
     path: PathBuf,
 }
 
@@ -187,7 +195,18 @@ async fn create_request(
     Ok((StatusCode::CREATED, Json(detail)))
 }
 
-async fn list_requests(
+#[utoipa::path(
+    get,
+    path = "/api/v1/requests",
+    tag = "requests",
+    params(ListRequestsQuery),
+    responses(
+        (status = 200, description = "Requests visible to the requester", body = RequestListPage),
+        (status = 400, description = "Invalid request list query", body = ErrorResponse),
+        (status = 500, description = "Request list failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list_requests(
     State(state): State<AppState>,
     Query(query): Query<ListRequestsQuery>,
 ) -> ApiResult<Json<RequestListPage>> {
@@ -206,7 +225,21 @@ async fn list_requests(
     Ok(Json(page))
 }
 
-async fn get_request(
+#[utoipa::path(
+    get,
+    path = "/api/v1/requests/{id}",
+    tag = "requests",
+    params(
+        ("id" = Id, Path, description = "Request id")
+    ),
+    responses(
+        (status = 200, description = "Request detail", body = RequestDetail),
+        (status = 400, description = "Invalid request id", body = ErrorResponse),
+        (status = 404, description = "Request not found", body = ErrorResponse),
+        (status = 500, description = "Request read failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RequestDetail>> {
@@ -280,7 +313,24 @@ async fn re_resolve(
     Ok(Json(detail))
 }
 
-async fn manual_import(
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/requests/{id}/manual-import",
+    tag = "admin",
+    params(
+        ("id" = Id, Path, description = "Request id")
+    ),
+    request_body = ManualImportRequest,
+    responses(
+        (status = 200, description = "Manual import started", body = ManualImportResponse),
+        (status = 400, description = "Invalid manual import request", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Request not found", body = ErrorResponse),
+        (status = 409, description = "Request cannot start ingesting", body = ErrorResponse),
+        (status = 503, description = "Manual import provider unavailable", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn manual_import(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<ManualImportRequest>,

@@ -63,7 +63,18 @@ input {
     padding: 8px 10px;
 }
 
-input:focus {
+select {
+    min-height: 40px;
+    width: 100%;
+    border: 1px solid #c7cfd8;
+    border-radius: 6px;
+    background: #ffffff;
+    color: #1b1f24;
+    padding: 8px 10px;
+}
+
+input:focus,
+select:focus {
     border-color: #2563eb;
     outline: 3px solid rgb(37 99 235 / 18%);
 }
@@ -189,9 +200,10 @@ code {
     padding: 24px 0;
 }
 
-.section-heading {
+.section-heading,
+.detail-heading {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     gap: 16px;
 }
@@ -499,6 +511,40 @@ tr:last-child td {
     padding: 1px 8px;
 }
 
+.state-pill {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    border: 1px solid #c7cfd8;
+    border-radius: 999px;
+    background: #eef2f6;
+    color: #26384f;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 3px 10px;
+    white-space: nowrap;
+}
+
+.text-action {
+    color: #1f5f4a;
+    font-weight: 700;
+    text-decoration: none;
+}
+
+.text-action:hover {
+    text-decoration: underline;
+}
+
+.request-filter {
+    width: min(100%, 280px);
+    margin-top: 16px;
+}
+
+.request-summary,
+.import-result {
+    margin-top: 16px;
+}
+
 .config-subsection h3 {
     margin: 0 0 10px;
     color: #26384f;
@@ -516,11 +562,14 @@ tr:last-child td {
     .top-actions,
     .inline-form,
     .sessions-layout,
-    .token-result {
+    .token-result,
+    .detail-heading {
         grid-template-columns: 1fr;
     }
 
-    .top-bar {
+    .top-bar,
+    .section-heading,
+    .detail-heading {
         display: grid;
     }
 

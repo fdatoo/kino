@@ -6,6 +6,8 @@ import {
     RouterProvider,
 } from 'react-router-dom';
 import { ConfigPage } from './admin/config/ConfigPage';
+import { RequestDetail } from './admin/requests/RequestDetail';
+import { RequestsPage } from './admin/requests/RequestsPage';
 import { SessionsPage } from './admin/sessions/SessionsPage';
 import { TokensPage } from './admin/tokens/TokensPage';
 import { AuthGate } from './auth/AuthGate';
@@ -28,6 +30,14 @@ const router = createBrowserRouter(
                 {
                     path: '/tokens',
                     element: <TokensPage />,
+                },
+                {
+                    path: '/requests',
+                    element: <RequestsPage />,
+                },
+                {
+                    path: '/requests/:id',
+                    element: <RequestDetail />,
                 },
                 {
                     path: '/config',
