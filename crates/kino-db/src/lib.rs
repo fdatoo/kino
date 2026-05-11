@@ -378,7 +378,9 @@ mod tests {
     use std::borrow::Cow;
     use std::path::PathBuf;
 
-    use kino_core::{CanonicalIdentityId, Config, Id, Timestamp, TmdbId};
+    use kino_core::{
+        CanonicalIdentityId, Config, DeviceToken, Id, SEEDED_USER_ID, Timestamp, TmdbId,
+    };
     use sqlx::migrate::{Migration, MigrationType, Migrator};
 
     #[tokio::test]
@@ -459,8 +461,137 @@ mod tests {
                 (11, String::from("metadata cache")),
                 (12, String::from("source files")),
                 (13, String::from("core catalog schemas")),
+                (14, String::from("users")),
+                (15, String::from("device tokens")),
             ]
         );
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn users_migration_seeds_owner_user_once()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+
+        let seeded: (Id, String, Timestamp) =
+            sqlx::query_as("SELECT id, display_name, created_at FROM users")
+                .fetch_one(db.read_pool())
+                .await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db.read_pool())
+            .await?;
+
+        assert_eq!(seeded.0, SEEDED_USER_ID);
+        assert_eq!(seeded.1, "Owner");
+        assert_eq!(seeded.2.to_string(), "2026-05-11T00:00:00Z");
+        assert_eq!(count, 1);
+
+        db.migrate().await?;
+
+        let count_after_rerun: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db.read_pool())
+            .await?;
+        let seeded_after_rerun: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE id = ?1 AND display_name = 'Owner'",
+        )
+        .bind(SEEDED_USER_ID)
+        .fetch_one(db.read_pool())
+        .await?;
+
+        assert_eq!(count_after_rerun, 1);
+        assert_eq!(seeded_after_rerun, 1);
+
+        db.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_tokens_support_insert_hash_lookup_and_revocation()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = super::test_db().await?;
+        let token = DeviceToken::new(
+            Id::new(),
+            SEEDED_USER_ID,
+            "Living room Apple TV",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            Timestamp::now(),
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO device_tokens (
+                id,
+                user_id,
+                label,
+                hash,
+                last_seen_at,
+                revoked_at,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(token.id)
+        .bind(token.user_id)
+        .bind(&token.label)
+        .bind(&token.hash)
+        .bind(token.last_seen_at)
+        .bind(token.revoked_at)
+        .bind(token.created_at)
+        .execute(db.write_pool())
+        .await?;
+
+        let stored: (
+            Id,
+            Id,
+            String,
+            String,
+            Option<Timestamp>,
+            Option<Timestamp>,
+            Timestamp,
+        ) = sqlx::query_as(
+            r#"
+                SELECT
+                    id,
+                    user_id,
+                    label,
+                    hash,
+                    last_seen_at,
+                    revoked_at,
+                    created_at
+                FROM device_tokens
+                WHERE hash = ?1
+                "#,
+        )
+        .bind(&token.hash)
+        .fetch_one(db.read_pool())
+        .await?;
+
+        assert_eq!(stored.0, token.id);
+        assert_eq!(stored.1, token.user_id);
+        assert_eq!(stored.2, token.label);
+        assert_eq!(stored.3, token.hash);
+        assert_eq!(stored.4, None);
+        assert_eq!(stored.5, None);
+        assert_eq!(stored.6, token.created_at);
+
+        let revoked_at = Timestamp::now();
+        sqlx::query("UPDATE device_tokens SET revoked_at = ?1 WHERE hash = ?2")
+            .bind(revoked_at)
+            .bind(&token.hash)
+            .execute(db.write_pool())
+            .await?;
+
+        let revoked_lookup: (String, Option<Timestamp>) =
+            sqlx::query_as("SELECT hash, revoked_at FROM device_tokens WHERE hash = ?1")
+                .bind(&token.hash)
+                .fetch_one(db.read_pool())
+                .await?;
+
+        assert_eq!(revoked_lookup.0, token.hash);
+        assert_eq!(revoked_lookup.1, Some(revoked_at));
 
         db.close().await;
         Ok(())
@@ -499,7 +630,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            14,
+            16,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -511,12 +642,12 @@ mod tests {
         )
         .fetch_one(db.write_pool())
         .await?;
+        assert_eq!(table_name, "migration_runner_test");
+
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 14")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 16")
                 .fetch_one(db.write_pool())
                 .await?;
-
-        assert_eq!(table_name, "migration_runner_test");
         assert_eq!(recorded, 1);
 
         db.close().await;
@@ -529,22 +660,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(14, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(16, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 14")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 16")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 14, .. }
+            super::Error::MigrationFailed { version: 16, .. }
         ));
-        assert!(err.to_string().contains("database migration 14 failed"));
+        assert!(err.to_string().contains("database migration 16 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -577,6 +708,8 @@ mod tests {
                 (11, String::from("metadata cache")),
                 (12, String::from("source files")),
                 (13, String::from("core catalog schemas")),
+                (14, String::from("users")),
+                (15, String::from("device tokens")),
             ]
         );
 
