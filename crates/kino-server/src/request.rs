@@ -22,7 +22,7 @@ use kino_library::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     requests: RequestService,
     manual_imports: Arc<ManualImportProvider>,
     catalog: CatalogService,
@@ -44,15 +44,22 @@ struct ListRequestsQuery {
     offset: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
-struct ListCatalogItemsQuery {
+pub(crate) struct ListCatalogItemsQuery {
+    /// Media item kind to include.
     #[serde(rename = "type")]
-    media_type: Option<String>,
-    title_contains: Option<String>,
-    has_source_file: Option<bool>,
-    limit: Option<u32>,
-    offset: Option<u64>,
+    #[param(rename = "type")]
+    pub(crate) media_type: Option<String>,
+    /// Case-insensitive title substring.
+    pub(crate) title_contains: Option<String>,
+    /// Filter by source-file presence.
+    pub(crate) has_source_file: Option<bool>,
+    /// Maximum number of items to return.
+    pub(crate) limit: Option<u32>,
+    /// Number of matching items to skip.
+    pub(crate) offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,7 +286,17 @@ async fn scan_library(State(state): State<AppState>) -> ApiResult<Json<LibrarySc
     Ok(Json(report))
 }
 
-async fn list_catalog_items(
+#[utoipa::path(
+    get,
+    path = "/api/v1/library/items",
+    tag = "library",
+    params(ListCatalogItemsQuery),
+    responses(
+        (status = 200, description = "Catalog media items", body = CatalogListPage),
+        (status = 400, description = "Invalid catalog list query", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list_catalog_items(
     State(state): State<AppState>,
     Query(query): Query<ListCatalogItemsQuery>,
 ) -> ApiResult<Json<CatalogListPage>> {
@@ -313,10 +330,10 @@ async fn get_catalog_item(
     Ok(Json(item))
 }
 
-type ApiResult<T> = std::result::Result<T, ApiError>;
+pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]
-enum ApiError {
+pub(crate) enum ApiError {
     #[error("invalid request id {value}: {source}")]
     InvalidId { value: String, source: ParseIdError },
 
@@ -336,8 +353,8 @@ enum ApiError {
     InvalidMediaItemType { value: String },
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct ErrorResponse {
     error: String,
 }
 
