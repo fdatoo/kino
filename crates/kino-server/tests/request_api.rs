@@ -586,6 +586,104 @@ async fn admin_library_scan_reports_orphans_and_missing_files()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let matrix_identity = identity(603);
+    let fight_club_identity = identity(550);
+    let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
+    let fight_club = insert_tmdb_media_item(&db, fight_club_identity).await?;
+    insert_catalog_title(&db, matrix, matrix_identity, "The Matrix").await?;
+    insert_catalog_title(&db, fight_club, fight_club_identity, "Fight Club").await?;
+    let matrix_path =
+        std::path::PathBuf::from("/library/Movies/The Matrix (1999)/The Matrix (1999).mkv");
+    insert_source_file(&db, matrix, &matrix_path).await?;
+    let app = kino_server::router(db);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/library/items?type=movie&title_contains=matrix&has_source_file=true&limit=1")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed: Value = response_json(list_response).await?;
+    assert_eq!(listed["items"][0]["id"], matrix.to_string());
+    assert_eq!(listed["items"][0]["media_kind"], "movie");
+    assert_eq!(listed["items"][0]["title"], "The Matrix");
+    assert_eq!(
+        listed["items"][0]["source_files"][0]["path"],
+        matrix_path.display().to_string()
+    );
+    assert_eq!(listed["next_offset"], Value::Null);
+
+    let paged_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/library/items?limit=1")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(paged_response.status(), StatusCode::OK);
+    let paged: Value = response_json(paged_response).await?;
+    assert_eq!(paged["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(paged["next_offset"], 1);
+
+    let get_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/library/items/{matrix}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let fetched: Value = response_json(get_response).await?;
+    assert_eq!(fetched["id"], matrix.to_string());
+    assert_eq!(
+        fetched["canonical_identity_id"],
+        matrix_identity.to_string()
+    );
+    assert_eq!(fetched["source_files"].as_array().map(Vec::len), Some(1));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_api_reports_invalid_filters_and_missing_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let app = kino_server::router(db);
+
+    let invalid_filter = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/library/items?type=episode")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(invalid_filter.status(), StatusCode::BAD_REQUEST);
+
+    let missing = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/library/items/{}", Id::new()))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
 async fn create_request(
     app: &axum::Router,
     message: &str,
@@ -706,6 +804,98 @@ async fn insert_source_file(
     .await?;
 
     Ok(id)
+}
+
+async fn insert_tmdb_media_item(
+    db: &kino_db::Db,
+    canonical_identity_id: CanonicalIdentityId,
+) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO canonical_identities (
+            id,
+            provider,
+            media_kind,
+            tmdb_id,
+            source,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, 'manual', ?5, ?6)
+        "#,
+    )
+    .bind(canonical_identity_id)
+    .bind(canonical_identity_id.provider().as_str())
+    .bind(canonical_identity_id.kind().as_str())
+    .bind(i64::from(canonical_identity_id.tmdb_id().get()))
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO media_items (
+            id,
+            media_kind,
+            canonical_identity_id,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(id)
+    .bind(canonical_identity_id.kind().as_str())
+    .bind(canonical_identity_id)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
+}
+
+async fn insert_catalog_title(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    canonical_identity_id: CanonicalIdentityId,
+    title: &str,
+) -> Result<(), sqlx::Error> {
+    let now = Timestamp::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO media_metadata_cache (
+            media_item_id,
+            canonical_identity_id,
+            provider,
+            title,
+            description,
+            release_date,
+            poster_path,
+            backdrop_path,
+            logo_path,
+            metadata_path,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, 'description', NULL, 'poster.jpg', 'backdrop.jpg', NULL, 'metadata.json', ?5, ?6)
+        "#,
+    )
+    .bind(media_item_id)
+    .bind(canonical_identity_id)
+    .bind(canonical_identity_id.provider().as_str())
+    .bind(title)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
 }
 
 fn identity(tmdb_id: u32) -> CanonicalIdentityId {

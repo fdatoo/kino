@@ -4,7 +4,7 @@
 //! `MediaItem` records, including subtitle sidecars extracted by ingestion.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     path::{Path, PathBuf},
@@ -148,10 +148,46 @@ pub enum Error {
         /// Probed subtitle stream index.
         track_index: u32,
     },
+
+    /// A media item kind read from storage is not recognized.
+    #[error("invalid media item kind: {value}")]
+    InvalidMediaItemKind {
+        /// Persisted media item kind value.
+        value: String,
+    },
+
+    /// The requested media item does not exist.
+    #[error("media item not found: {id}")]
+    MediaItemNotFound {
+        /// Missing media item id.
+        id: Id,
+    },
+
+    /// A catalog list limit was outside the accepted range.
+    #[error("invalid catalog list limit {limit}; expected 1..={max}")]
+    InvalidCatalogListLimit {
+        /// Requested limit.
+        limit: u32,
+        /// Maximum accepted limit.
+        max: u32,
+    },
+
+    /// A catalog list offset was outside the accepted range.
+    #[error("invalid catalog list offset {offset}; maximum is {max}")]
+    InvalidCatalogListOffset {
+        /// Requested offset.
+        offset: u64,
+        /// Maximum accepted offset.
+        max: u64,
+    },
 }
 
 /// Crate-local `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+const DEFAULT_CATALOG_LIST_LIMIT: u32 = 50;
+const MAX_CATALOG_LIST_LIMIT: u32 = 200;
+const MAX_CATALOG_LIST_OFFSET: u64 = i64::MAX as u64;
 
 /// Boxed future returned by metadata provider implementations.
 pub type MetadataFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -516,6 +552,297 @@ impl MetadataService {
             .join(identity_id.provider().as_str())
             .join(identity_id.kind().as_str())
             .join(identity_id.tmdb_id().to_string())
+    }
+}
+
+/// Stable media item kind used by catalog reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaItemKind {
+    /// Movie media item.
+    Movie,
+    /// TV series media item.
+    TvSeries,
+    /// Personal media item.
+    Personal,
+}
+
+impl MediaItemKind {
+    /// Database representation for this media item kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Movie => "movie",
+            Self::TvSeries => "tv_series",
+            Self::Personal => "personal",
+        }
+    }
+
+    fn from_db_str(value: String) -> Result<Self> {
+        match value.as_str() {
+            "movie" => Ok(Self::Movie),
+            "tv_series" => Ok(Self::TvSeries),
+            "personal" => Ok(Self::Personal),
+            _ => Err(Error::InvalidMediaItemKind { value }),
+        }
+    }
+}
+
+/// Query filters and pagination for catalog item listing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogListQuery {
+    /// Optional media kind filter.
+    pub media_kind: Option<MediaItemKind>,
+    /// Optional case-insensitive metadata title substring filter.
+    pub title_contains: Option<String>,
+    /// Optional filter for items with or without at least one source file.
+    pub has_source_file: Option<bool>,
+    /// Maximum number of items to return.
+    pub limit: Option<u32>,
+    /// Number of matching items to skip.
+    pub offset: Option<u64>,
+}
+
+impl CatalogListQuery {
+    /// Construct an empty catalog list query.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filter by media item kind.
+    pub const fn with_media_kind(mut self, media_kind: MediaItemKind) -> Self {
+        self.media_kind = Some(media_kind);
+        self
+    }
+
+    /// Filter by cached metadata title substring.
+    pub fn with_title_contains(mut self, title_contains: impl Into<String>) -> Self {
+        self.title_contains = Some(title_contains.into());
+        self
+    }
+
+    /// Filter by source-file presence.
+    pub const fn with_has_source_file(mut self, has_source_file: bool) -> Self {
+        self.has_source_file = Some(has_source_file);
+        self
+    }
+
+    /// Set the page size.
+    pub const fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Set the page offset.
+    pub const fn with_offset(mut self, offset: u64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+}
+
+/// One page of catalog media items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogListPage {
+    /// Media items in this page.
+    pub items: Vec<CatalogMediaItem>,
+    /// Offset to request the next page, when more matches exist.
+    pub next_offset: Option<u64>,
+}
+
+/// Catalog projection for one media item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogMediaItem {
+    /// Media item id.
+    pub id: Id,
+    /// Media item kind.
+    pub media_kind: MediaItemKind,
+    /// Canonical identity for provider-backed media.
+    pub canonical_identity_id: Option<CanonicalIdentityId>,
+    /// Cached display title, when metadata has been enriched.
+    pub title: Option<String>,
+    /// Source files attached to this media item.
+    pub source_files: Vec<LibrarySourceFile>,
+    /// Creation timestamp.
+    pub created_at: Timestamp,
+    /// Last update timestamp.
+    pub updated_at: Timestamp,
+}
+
+/// Library catalog read service.
+#[derive(Clone)]
+pub struct CatalogService {
+    db: Db,
+}
+
+impl CatalogService {
+    /// Construct a catalog service backed by Kino's database.
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+
+    /// List media items using filters and offset pagination.
+    pub async fn list(&self, query: CatalogListQuery) -> Result<CatalogListPage> {
+        let limit = validated_catalog_limit(query.limit)?;
+        let offset = validated_catalog_offset(query.offset)?;
+        let fetch_limit = limit + 1;
+        let rows = self.fetch_media_items(&query, fetch_limit, offset).await?;
+        let mut items = rows
+            .iter()
+            .map(catalog_media_item_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        let has_next = items.len() > limit as usize;
+        if has_next {
+            items.truncate(limit as usize);
+        }
+        self.attach_source_files(&mut items).await?;
+
+        let next_offset = if has_next {
+            Some(offset + u64::from(limit))
+        } else {
+            None
+        };
+
+        Ok(CatalogListPage { items, next_offset })
+    }
+
+    /// Get one media item by id.
+    pub async fn get(&self, id: Id) -> Result<CatalogMediaItem> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                media_items.id,
+                media_items.media_kind,
+                media_items.canonical_identity_id,
+                media_items.created_at,
+                media_items.updated_at,
+                media_metadata_cache.title
+            FROM media_items
+            LEFT JOIN media_metadata_cache
+                ON media_metadata_cache.media_item_id = media_items.id
+            WHERE media_items.id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(self.db.read_pool())
+        .await?;
+
+        let Some(row) = row else {
+            return Err(Error::MediaItemNotFound { id });
+        };
+
+        let mut item = catalog_media_item_from_row(&row)?;
+        self.attach_source_files(std::slice::from_mut(&mut item))
+            .await?;
+        Ok(item)
+    }
+
+    async fn fetch_media_items(
+        &self,
+        query: &CatalogListQuery,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT
+                media_items.id,
+                media_items.media_kind,
+                media_items.canonical_identity_id,
+                media_items.created_at,
+                media_items.updated_at,
+                media_metadata_cache.title
+            FROM media_items
+            LEFT JOIN media_metadata_cache
+                ON media_metadata_cache.media_item_id = media_items.id
+            WHERE 1 = 1
+            "#,
+        );
+
+        if let Some(media_kind) = query.media_kind {
+            builder.push(" AND media_items.media_kind = ");
+            builder.push_bind(media_kind.as_str());
+        }
+
+        if let Some(title_contains) = query
+            .title_contains
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            builder.push(r#" AND media_metadata_cache.title LIKE "#);
+            builder.push_bind(like_contains_pattern(title_contains));
+            builder.push(r#" ESCAPE '\' "#);
+        }
+
+        if let Some(has_source_file) = query.has_source_file {
+            if has_source_file {
+                builder.push(
+                    r#"
+                    AND EXISTS (
+                        SELECT 1
+                        FROM source_files
+                        WHERE source_files.media_item_id = media_items.id
+                    )
+                    "#,
+                );
+            } else {
+                builder.push(
+                    r#"
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM source_files
+                        WHERE source_files.media_item_id = media_items.id
+                    )
+                    "#,
+                );
+            }
+        }
+
+        builder.push(" ORDER BY media_items.created_at, media_items.id LIMIT ");
+        builder.push_bind(i64::from(limit));
+        builder.push(" OFFSET ");
+        builder.push_bind(
+            i64::try_from(offset).map_err(|_| Error::InvalidCatalogListOffset {
+                offset,
+                max: MAX_CATALOG_LIST_OFFSET,
+            })?,
+        );
+
+        Ok(builder.build().fetch_all(self.db.read_pool()).await?)
+    }
+
+    async fn attach_source_files(&self, items: &mut [CatalogMediaItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT id, media_item_id, path
+            FROM source_files
+            WHERE media_item_id IN (
+            "#,
+        );
+        let mut separated = builder.separated(", ");
+        for item in items.iter() {
+            separated.push_bind(item.id);
+        }
+        separated.push_unseparated(") ORDER BY media_item_id, path, id");
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut by_media_item = HashMap::<Id, Vec<LibrarySourceFile>>::new();
+        for row in &rows {
+            let source_file = library_source_file_from_row(row)?;
+            by_media_item
+                .entry(source_file.media_item_id)
+                .or_default()
+                .push(source_file);
+        }
+
+        for item in items {
+            item.source_files = by_media_item.remove(&item.id).unwrap_or_default();
+        }
+
+        Ok(())
     }
 }
 
@@ -1048,16 +1375,7 @@ impl LibraryScanService {
         .fetch_all(self.db.read_pool())
         .await?;
 
-        rows.iter()
-            .map(|row| {
-                let path: String = row.try_get("path")?;
-                Ok(LibrarySourceFile {
-                    id: row.try_get("id")?,
-                    media_item_id: row.try_get("media_item_id")?,
-                    path: PathBuf::from(path),
-                })
-            })
-            .collect()
+        rows.iter().map(library_source_file_from_row).collect()
     }
 }
 
@@ -1650,6 +1968,68 @@ fn path_option_to_db_text(path: Option<&Path>) -> Result<Option<String>> {
     path.map(path_to_db_text).transpose()
 }
 
+fn validated_catalog_limit(limit: Option<u32>) -> Result<u32> {
+    let limit = limit.unwrap_or(DEFAULT_CATALOG_LIST_LIMIT);
+    if !(1..=MAX_CATALOG_LIST_LIMIT).contains(&limit) {
+        return Err(Error::InvalidCatalogListLimit {
+            limit,
+            max: MAX_CATALOG_LIST_LIMIT,
+        });
+    }
+
+    Ok(limit)
+}
+
+fn validated_catalog_offset(offset: Option<u64>) -> Result<u64> {
+    let offset = offset.unwrap_or(0);
+    if offset > MAX_CATALOG_LIST_OFFSET {
+        return Err(Error::InvalidCatalogListOffset {
+            offset,
+            max: MAX_CATALOG_LIST_OFFSET,
+        });
+    }
+
+    Ok(offset)
+}
+
+fn like_contains_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() + 2);
+    pattern.push('%');
+    for ch in value.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                pattern.push('\\');
+                pattern.push(ch);
+            }
+            _ => pattern.push(ch),
+        }
+    }
+    pattern.push('%');
+    pattern
+}
+
+fn catalog_media_item_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogMediaItem> {
+    let media_kind: String = row.try_get("media_kind")?;
+    Ok(CatalogMediaItem {
+        id: row.try_get("id")?,
+        media_kind: MediaItemKind::from_db_str(media_kind)?,
+        canonical_identity_id: row.try_get("canonical_identity_id")?,
+        title: row.try_get("title")?,
+        source_files: Vec::new(),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<LibrarySourceFile> {
+    let path: String = row.try_get("path")?;
+    Ok(LibrarySourceFile {
+        id: row.try_get("id")?,
+        media_item_id: row.try_get("media_item_id")?,
+        path: PathBuf::from(path),
+    })
+}
+
 fn metadata_from_row(
     row: &sqlx::sqlite::SqliteRow,
     cast: Vec<MetadataCastMember>,
@@ -2037,6 +2417,70 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn catalog_lists_filters_and_gets_media_items()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let fight_club_identity = movie_identity(550);
+        let matrix_identity = movie_identity(603);
+        let breaking_bad_identity = tv_identity(1396);
+        let fight_club = insert_tmdb_media_item(&db, fight_club_identity).await?;
+        let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
+        let breaking_bad = insert_tmdb_media_item(&db, breaking_bad_identity).await?;
+        insert_catalog_title(&db, fight_club, fight_club_identity, "Fight Club").await?;
+        insert_catalog_title(&db, matrix, matrix_identity, "The Matrix").await?;
+        insert_catalog_title(&db, breaking_bad, breaking_bad_identity, "Breaking Bad").await?;
+        let matrix_path = PathBuf::from("/library/Movies/The Matrix (1999)/The Matrix (1999).mkv");
+        insert_source_file(&db, matrix, &matrix_path).await?;
+        let service = CatalogService::new(db);
+
+        let movies = service
+            .list(CatalogListQuery::new().with_media_kind(MediaItemKind::Movie))
+            .await?;
+        assert_eq!(
+            movies.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![fight_club, matrix]
+        );
+
+        let title_match = service
+            .list(CatalogListQuery::new().with_title_contains("matrix"))
+            .await?;
+        assert_eq!(title_match.items.len(), 1);
+        assert_eq!(title_match.items[0].id, matrix);
+
+        let with_source = service
+            .list(CatalogListQuery::new().with_has_source_file(true))
+            .await?;
+        assert_eq!(with_source.items.len(), 1);
+        assert_eq!(with_source.items[0].id, matrix);
+        assert_eq!(with_source.items[0].source_files[0].path, matrix_path);
+
+        let first_page = service
+            .list(CatalogListQuery::new().with_limit(2).with_offset(0))
+            .await?;
+        assert_eq!(first_page.items.len(), 2);
+        assert_eq!(first_page.next_offset, Some(2));
+
+        let fetched = service.get(matrix).await?;
+        assert_eq!(fetched.id, matrix);
+        assert_eq!(fetched.title.as_deref(), Some("The Matrix"));
+        assert_eq!(fetched.source_files.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_get_reports_missing_media_item()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let service = CatalogService::new(db);
+        let missing = Id::new();
+        let result = service.get(missing).await;
+
+        assert!(matches!(result, Err(Error::MediaItemNotFound { id }) if id == missing));
+        Ok(())
+    }
+
     async fn insert_personal_media_item(db: &Db) -> std::result::Result<Id, sqlx::Error> {
         let id = Id::new();
         let now = Timestamp::now();
@@ -2092,6 +2536,45 @@ mod tests {
         .await?;
 
         Ok(id)
+    }
+
+    async fn insert_catalog_title(
+        db: &Db,
+        media_item_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
+        title: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let now = Timestamp::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_metadata_cache (
+                media_item_id,
+                canonical_identity_id,
+                provider,
+                title,
+                description,
+                release_date,
+                poster_path,
+                backdrop_path,
+                logo_path,
+                metadata_path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'description', NULL, 'poster.jpg', 'backdrop.jpg', NULL, 'metadata.json', ?5, ?6)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(canonical_identity_id)
+        .bind(canonical_identity_id.provider().as_str())
+        .bind(title)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(())
     }
 
     async fn insert_tmdb_media_item(
@@ -2153,6 +2636,13 @@ mod tests {
             panic!("test tmdb id should be valid");
         };
         CanonicalIdentityId::tmdb_movie(tmdb_id)
+    }
+
+    fn tv_identity(value: u32) -> CanonicalIdentityId {
+        let Some(tmdb_id) = kino_core::TmdbId::new(value) else {
+            panic!("test tmdb id should be valid");
+        };
+        CanonicalIdentityId::tmdb_tv_series(tmdb_id)
     }
 
     fn sample_metadata() -> TmdbMetadata {
