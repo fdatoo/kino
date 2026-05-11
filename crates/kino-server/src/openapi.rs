@@ -7,7 +7,8 @@ use utoipa::openapi::server::Server;
     paths(
         crate::request::list_catalog_items,
         crate::token::create_token,
-        crate::token::list_tokens
+        crate::token::list_tokens,
+        crate::token::revoke_token
     ),
     info(title = "Kino API", version = "0.1.0-phase-2"),
     tags(

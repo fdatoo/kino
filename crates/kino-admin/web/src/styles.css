@@ -15,6 +15,10 @@
     -moz-osx-font-smoothing: grayscale;
 }
 
+* {
+    box-sizing: border-box;
+}
+
 body {
     margin: 0;
     min-width: 320px;
@@ -28,24 +32,110 @@ select {
     font: inherit;
 }
 
-.app-shell {
+button {
+    min-height: 40px;
+    border: 1px solid #1f5f4a;
+    border-radius: 6px;
+    background: #247158;
+    color: #ffffff;
+    cursor: pointer;
+    font-weight: 700;
+    padding: 0 16px;
+}
+
+button:hover:not(:disabled) {
+    background: #1f5f4a;
+}
+
+button:disabled {
+    border-color: #a8b2bd;
+    background: #c4cbd3;
+    cursor: not-allowed;
+}
+
+input {
+    min-height: 40px;
+    width: 100%;
+    border: 1px solid #c7cfd8;
+    border-radius: 6px;
+    background: #ffffff;
+    color: #1b1f24;
+    padding: 8px 10px;
+}
+
+input:focus {
+    border-color: #2563eb;
+    outline: 3px solid rgb(37 99 235 / 18%);
+}
+
+h1,
+h2,
+p {
+    margin: 0;
+}
+
+h1 {
+    font-size: 2rem;
+    line-height: 1.15;
+}
+
+h2 {
+    font-size: 1.125rem;
+    line-height: 1.3;
+}
+
+code {
+    display: block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    color: #26384f;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 0.9rem;
+    margin-top: 8px;
+}
+
+.auth-shell {
     display: grid;
     min-height: 100vh;
     place-items: center;
-    padding: 32px;
+    padding: 24px;
 }
 
-.panel {
-    width: min(100%, 680px);
+.auth-panel {
+    width: min(100%, 520px);
     border: 1px solid #d7dce1;
     border-radius: 8px;
     background: #ffffff;
-    padding: 40px;
-    box-shadow: 0 24px 80px rgb(27 31 36 / 8%);
+    padding: 32px;
+    box-shadow: 0 18px 60px rgb(27 31 36 / 7%);
+}
+
+.admin-shell {
+    width: min(100%, 1120px);
+    margin: 0 auto;
+    padding: 28px 20px 48px;
+}
+
+.top-bar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+    margin-bottom: 28px;
+}
+
+.top-bar button {
+    border-color: #9aa6b2;
+    background: #ffffff;
+    color: #26384f;
+}
+
+.top-bar button:hover:not(:disabled) {
+    background: #eef2f6;
 }
 
 .eyebrow {
-    margin: 0 0 12px;
+    margin: 0 0 8px;
     color: #617083;
     font-size: 0.75rem;
     font-weight: 700;
@@ -53,15 +143,116 @@ select {
     text-transform: uppercase;
 }
 
-h1 {
-    margin: 0;
-    font-size: clamp(2rem, 4vw, 3.25rem);
-    line-height: 1.05;
+.section-block {
+    border-top: 1px solid #d7dce1;
+    padding: 24px 0;
 }
 
-p {
-    margin: 16px 0 0;
-    color: #4c5b6d;
-    font-size: 1rem;
-    line-height: 1.7;
+.form-stack {
+    display: grid;
+    gap: 16px;
+    margin-top: 24px;
+}
+
+.inline-form {
+    display: grid;
+    grid-template-columns: minmax(240px, 1fr) auto;
+    gap: 14px;
+    margin-top: 16px;
+}
+
+.field {
+    display: grid;
+    gap: 6px;
+    color: #26384f;
+    font-weight: 700;
+}
+
+.inline-field {
+    min-width: 0;
+}
+
+.field span {
+    font-size: 0.875rem;
+}
+
+.status {
+    margin-top: 14px;
+    color: #247158;
+    font-weight: 700;
+}
+
+.status-error {
+    color: #b42318;
+}
+
+.muted {
+    margin-top: 16px;
+    color: #617083;
+}
+
+.token-result {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 14px;
+    margin-top: 18px;
+    border: 1px solid #b8d0c7;
+    border-radius: 8px;
+    background: #f0faf6;
+    padding: 16px;
+}
+
+.table-wrap {
+    width: 100%;
+    overflow-x: auto;
+    margin-top: 16px;
+    border: 1px solid #d7dce1;
+    border-radius: 8px;
+    background: #ffffff;
+}
+
+table {
+    width: 100%;
+    min-width: 720px;
+    border-collapse: collapse;
+}
+
+th,
+td {
+    border-bottom: 1px solid #e3e7eb;
+    padding: 12px 14px;
+    text-align: left;
+    vertical-align: middle;
+}
+
+th {
+    color: #617083;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+}
+
+tr:last-child td {
+    border-bottom: 0;
+}
+
+.table-action {
+    width: 1%;
+    white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+    .auth-panel {
+        padding: 24px;
+    }
+
+    .top-bar,
+    .inline-form,
+    .token-result {
+        grid-template-columns: 1fr;
+    }
+
+    .top-bar {
+        display: grid;
+    }
 }
