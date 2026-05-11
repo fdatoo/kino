@@ -16,6 +16,7 @@ export function AdminHeader({ onSignOut, title }: AdminHeaderProps) {
                 <nav className="primary-nav" aria-label="Primary">
                     <NavLink to="/tokens">Tokens</NavLink>
                     <NavLink to="/config">Config</NavLink>
+                    <NavLink to="/sessions">Sessions</NavLink>
                 </nav>
                 <button type="button" onClick={onSignOut}>
                     Sign out

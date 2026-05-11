@@ -32,6 +32,8 @@ pub(crate) struct AdminPlaybackSession {
     media_item_id: Id,
     /// Opaque playable variant identifier.
     variant_id: String,
+    /// Latest recorded playback position in seconds, when known.
+    position_seconds: Option<i64>,
     /// Current playback session status.
     status: PlaybackSessionStatus,
     /// Session start timestamp.
@@ -48,6 +50,7 @@ struct PlaybackSessionRow {
     token_id: Id,
     media_item_id: Id,
     variant_id: String,
+    position_seconds: Option<i64>,
     started_at: Timestamp,
     last_seen_at: Timestamp,
     ended_at: Option<Timestamp>,
@@ -65,7 +68,7 @@ pub(crate) fn router(db: Db) -> Router {
     path = "/api/v1/admin/sessions",
     tag = "admin",
     params(
-        ("status" = Option<PlaybackSessionStatus>, Query, description = "Playback session status to include")
+        ("status" = Option<String>, Query, description = "Comma-separated playback session statuses to include")
     ),
     responses(
         (status = 200, description = "Playback sessions visible to admin", body = [AdminPlaybackSession]),
@@ -77,14 +80,14 @@ pub(crate) async fn list_sessions(
     State(state): State<SessionAdminState>,
     Query(query): Query<RawListSessionsQuery>,
 ) -> SessionAdminResult<Json<Vec<AdminPlaybackSession>>> {
-    let status = query
+    let statuses = query
         .status
         .as_deref()
-        .map(parse_requested_status)
+        .map(parse_requested_statuses)
         .transpose()?;
 
-    let sessions = match status {
-        Some(status) => fetch_sessions(&state.db, &[status]).await?,
+    let sessions = match statuses {
+        Some(statuses) => fetch_sessions(&state.db, &statuses).await?,
         None => {
             fetch_sessions(
                 &state.db,
@@ -104,17 +107,21 @@ async fn fetch_sessions(
     let mut query = sqlx::QueryBuilder::new(
         r#"
         SELECT
-            id,
-            user_id,
-            token_id,
-            media_item_id,
-            variant_id,
-            started_at,
-            last_seen_at,
-            ended_at,
-            status
+            playback_sessions.id,
+            playback_sessions.user_id,
+            playback_sessions.token_id,
+            playback_sessions.media_item_id,
+            playback_sessions.variant_id,
+            playback_progress.position_seconds,
+            playback_sessions.started_at,
+            playback_sessions.last_seen_at,
+            playback_sessions.ended_at,
+            playback_sessions.status
         FROM playback_sessions
-        WHERE status IN (
+        LEFT JOIN playback_progress
+            ON playback_progress.user_id = playback_sessions.user_id
+            AND playback_progress.media_item_id = playback_sessions.media_item_id
+        WHERE playback_sessions.status IN (
         "#,
     );
 
@@ -125,7 +132,7 @@ async fn fetch_sessions(
     separated.push_unseparated(
         r#"
         )
-        ORDER BY last_seen_at DESC, id
+        ORDER BY playback_sessions.last_seen_at DESC, playback_sessions.id
         "#,
     );
 
@@ -136,6 +143,7 @@ async fn fetch_sessions(
             Id,
             Id,
             String,
+            Option<i64>,
             Timestamp,
             Timestamp,
             Option<Timestamp>,
@@ -152,10 +160,11 @@ async fn fetch_sessions(
                 token_id: row.2,
                 media_item_id: row.3,
                 variant_id: row.4,
-                started_at: row.5,
-                last_seen_at: row.6,
-                ended_at: row.7,
-                status: row.8,
+                position_seconds: row.5,
+                started_at: row.6,
+                last_seen_at: row.7,
+                ended_at: row.8,
+                status: row.9,
             })
         })
         .collect()
@@ -167,6 +176,9 @@ pub(crate) type SessionAdminResult<T> = std::result::Result<T, SessionAdminApiEr
 pub(crate) enum SessionAdminApiError {
     #[error("invalid playback session status filter: {0}")]
     InvalidRequestedStatus(String),
+
+    #[error("empty playback session status filter")]
+    EmptyRequestedStatus,
 
     #[error("invalid playback session status in database: {0}")]
     InvalidPersistedStatus(String),
@@ -183,7 +195,7 @@ pub(crate) struct SessionAdminErrorResponse {
 impl IntoResponse for SessionAdminApiError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::InvalidRequestedStatus(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidRequestedStatus(_) | Self::EmptyRequestedStatus => StatusCode::BAD_REQUEST,
             Self::InvalidPersistedStatus(_) | Self::Sqlx(_) => {
                 tracing::error!(error = %self, "session admin api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -200,9 +212,26 @@ impl IntoResponse for SessionAdminApiError {
     }
 }
 
-fn parse_requested_status(status: &str) -> SessionAdminResult<PlaybackSessionStatus> {
-    PlaybackSessionStatus::parse(status)
-        .ok_or_else(|| SessionAdminApiError::InvalidRequestedStatus(status.to_owned()))
+fn parse_requested_statuses(statuses: &str) -> SessionAdminResult<Vec<PlaybackSessionStatus>> {
+    let mut parsed = Vec::new();
+
+    for status in statuses.split(',') {
+        let status = status.trim();
+        if status.is_empty() {
+            return Err(SessionAdminApiError::EmptyRequestedStatus);
+        }
+
+        parsed.push(
+            PlaybackSessionStatus::parse(status)
+                .ok_or_else(|| SessionAdminApiError::InvalidRequestedStatus(status.to_owned()))?,
+        );
+    }
+
+    if parsed.is_empty() {
+        return Err(SessionAdminApiError::EmptyRequestedStatus);
+    }
+
+    Ok(parsed)
 }
 
 impl TryFrom<PlaybackSessionRow> for AdminPlaybackSession {
@@ -218,6 +247,7 @@ impl TryFrom<PlaybackSessionRow> for AdminPlaybackSession {
             token_id: row.token_id,
             media_item_id: row.media_item_id,
             variant_id: row.variant_id,
+            position_seconds: row.position_seconds,
             status,
             started_at: row.started_at,
             last_seen_at: row.last_seen_at,
