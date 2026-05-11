@@ -15,12 +15,14 @@ use kino_fulfillment::{
     RequestEventActor, RequestListPage, RequestListQuery, RequestMatchCandidateInput,
     RequestService, RequestState, RequestTransition,
 };
+use kino_library::{LibraryScanReport, LibraryScanService};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct AppState {
     requests: RequestService,
     manual_imports: Arc<ManualImportProvider>,
+    library_scans: LibraryScanService,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,10 +76,11 @@ struct ManualImportResponse {
     path: PathBuf,
 }
 
-pub(crate) fn router(db: Db) -> Router {
+pub(crate) fn router(db: Db, library_root: PathBuf) -> Router {
     let state = AppState {
-        requests: RequestService::new(db),
+        requests: RequestService::new(db.clone()),
         manual_imports: Arc::new(ManualImportProvider::new()),
+        library_scans: LibraryScanService::new(db, library_root),
     };
 
     Router::new()
@@ -93,6 +96,7 @@ pub(crate) fn router(db: Db) -> Router {
             "/api/admin/requests/{id}/manual-import",
             post(manual_import),
         )
+        .route("/api/admin/library/scan", get(scan_library))
         .with_state(state)
 }
 
@@ -252,6 +256,11 @@ async fn manual_import(
     }))
 }
 
+async fn scan_library(State(state): State<AppState>) -> ApiResult<Json<LibraryScanReport>> {
+    let report = state.library_scans.scan().await?;
+    Ok(Json(report))
+}
+
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -267,6 +276,9 @@ enum ApiError {
 
     #[error(transparent)]
     ManualImport(FulfillmentProviderError),
+
+    #[error(transparent)]
+    Library(#[from] kino_library::Error),
 }
 
 #[derive(Serialize)]
@@ -314,6 +326,10 @@ impl IntoResponse for ApiError {
             Self::InvalidManualImportState { .. } => StatusCode::CONFLICT,
             Self::ManualImport(error) if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
             Self::ManualImport(_) => StatusCode::BAD_REQUEST,
+            Self::Library(_) => {
+                tracing::error!(error = %self, "library admin api failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Fulfillment(_) => {
                 tracing::error!(error = %self, "request api failed");
                 StatusCode::INTERNAL_SERVER_ERROR

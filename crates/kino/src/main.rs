@@ -148,6 +148,7 @@ mod tests {
                 (9, String::from("minimal media items")),
                 (10, String::from("subtitle sidecars")),
                 (11, String::from("metadata cache")),
+                (12, String::from("source files")),
             ]
         );
 
