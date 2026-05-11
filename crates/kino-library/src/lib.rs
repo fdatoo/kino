@@ -2747,6 +2747,34 @@ impl SubtitleService {
             .collect()
     }
 
+    /// Return one current subtitle sidecar by id.
+    pub async fn get(&self, id: Id) -> Result<Option<SubtitleSidecar>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                media_item_id,
+                language,
+                format,
+                provenance,
+                forced,
+                track_index,
+                path,
+                archived_at,
+                created_at,
+                updated_at
+            FROM subtitle_sidecars
+            WHERE id = ?1
+                AND archived_at IS NULL
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(self.db.read_pool())
+        .await?;
+
+        row.as_ref().map(subtitle_sidecar_from_row).transpose()
+    }
+
     /// Return indexed subtitle sidecars for a media item.
     pub async fn sidecars(&self, media_item_id: Id) -> Result<Vec<SubtitleSidecar>> {
         let rows = sqlx::query(
