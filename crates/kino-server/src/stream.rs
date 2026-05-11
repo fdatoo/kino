@@ -22,6 +22,8 @@ use sqlx::Row;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, SeekFrom};
 use tokio_util::io::ReaderStream;
 
+use crate::{auth::AuthenticatedUser, session_service};
+
 #[derive(Clone)]
 pub(crate) struct StreamState {
     db: Db,
@@ -56,10 +58,19 @@ pub(crate) fn router(db: Db) -> Router {
 )]
 pub(crate) async fn source_file(
     State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
     AxumPath(id): AxumPath<Id>,
     headers: HeaderMap,
 ) -> StreamResult<Response> {
     let source_file = lookup_source_file(&state.db, id).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        source_file.media_item_id,
+        id.to_string(),
+    )
+    .await?;
     stream_file(source_file.path, headers).await
 }
 
@@ -82,10 +93,19 @@ pub(crate) async fn source_file(
 )]
 pub(crate) async fn transcode_output(
     State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
     AxumPath(id): AxumPath<Id>,
     headers: HeaderMap,
 ) -> StreamResult<Response> {
     let transcode_output = lookup_transcode_output(&state.db, id).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        transcode_output.media_item_id,
+        id.to_string(),
+    )
+    .await?;
     stream_file(transcode_output.path, headers).await
 }
 
@@ -118,6 +138,7 @@ async fn stream_file(path: PathBuf, headers: HeaderMap) -> StreamResult<Response
 
 #[derive(Debug, Clone)]
 struct SourceFileRow {
+    media_item_id: Id,
     path: PathBuf,
 }
 
@@ -173,6 +194,9 @@ pub(crate) enum StreamError {
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
 
+    #[error(transparent)]
+    Session(#[from] session_service::Error),
+
     #[error("response build failed: {0}")]
     Response(#[from] axum::http::Error),
 }
@@ -187,7 +211,7 @@ impl IntoResponse for StreamError {
         let status = match &self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
-            Self::Io(_) | Self::Sqlx(_) | Self::Response(_) => {
+            Self::Io(_) | Self::Sqlx(_) | Self::Session(_) | Self::Response(_) => {
                 tracing::error!(error = %self, "stream api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -227,7 +251,7 @@ impl IntoResponse for StreamError {
 async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
     let Some(row) = sqlx::query(
         r#"
-        SELECT path
+        SELECT media_item_id, path
         FROM source_files
         WHERE id = ?1
         "#,
@@ -241,6 +265,7 @@ async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
 
     let path: String = row.try_get("path")?;
     Ok(SourceFileRow {
+        media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
     })
 }
@@ -248,9 +273,10 @@ async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
 async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
     let Some(row) = sqlx::query(
         r#"
-        SELECT path
+        SELECT source_files.media_item_id, transcode_outputs.path
         FROM transcode_outputs
-        WHERE id = ?1
+        JOIN source_files ON source_files.id = transcode_outputs.source_file_id
+        WHERE transcode_outputs.id = ?1
         "#,
     )
     .bind(id)
@@ -262,6 +288,7 @@ async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow>
 
     let path: String = row.try_get("path")?;
     Ok(SourceFileRow {
+        media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
     })
 }

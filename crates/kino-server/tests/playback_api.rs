@@ -3,7 +3,8 @@ use axum::{
     http::{Request as HttpRequest, StatusCode, header},
 };
 use kino_core::{
-    Id, PlaybackProgress, PlaybackSession, Timestamp, WatchedSource, user::SEEDED_USER_ID,
+    Id, PlaybackProgress, PlaybackSession, PlaybackSessionStatus, Timestamp, WatchedSource,
+    user::SEEDED_USER_ID,
 };
 use serde::Deserialize;
 use tower::util::ServiceExt;
@@ -66,6 +67,41 @@ async fn playback_progress_heartbeat_persists_max_position_from_same_device()
     assert_eq!(row_after_higher.position_seconds, 200);
     assert!(row_after_higher.updated_at >= row_after_lower.updated_at);
     assert_eq!(row_after_higher.source_device_token_id, Some(token_id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_heartbeat_revives_idle_session() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let (token, token_id) = common::issued_token_with_id(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let session_id = insert_session(
+        &db,
+        token_id,
+        media_item_id,
+        PlaybackSessionStatus::Idle,
+        "2026-01-01T00:00:00Z".parse()?,
+    )
+    .await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 100).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    let (status, last_seen_at): (String, Timestamp) =
+        sqlx::query_as("SELECT status, last_seen_at FROM playback_sessions WHERE id = ?1")
+            .bind(session_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(
+        PlaybackSessionStatus::parse(&status),
+        Some(PlaybackSessionStatus::Active)
+    );
+    assert!(last_seen_at > "2026-01-01T00:00:00Z".parse()?);
 
     Ok(())
 }
@@ -614,7 +650,23 @@ async fn insert_active_session(
     token_id: Id,
     media_item_id: Id,
 ) -> Result<Id, Box<dyn std::error::Error>> {
-    let started_at: Timestamp = "2026-01-01T00:00:00Z".parse()?;
+    insert_session(
+        db,
+        token_id,
+        media_item_id,
+        PlaybackSessionStatus::Active,
+        "2026-01-01T00:00:00Z".parse()?,
+    )
+    .await
+}
+
+async fn insert_session(
+    db: &kino_db::Db,
+    token_id: Id,
+    media_item_id: Id,
+    status: PlaybackSessionStatus,
+    started_at: Timestamp,
+) -> Result<Id, Box<dyn std::error::Error>> {
     let session = PlaybackSession::active(
         Id::new(),
         SEEDED_USER_ID,
@@ -648,7 +700,7 @@ async fn insert_active_session(
     .bind(session.started_at)
     .bind(session.last_seen_at)
     .bind(session.ended_at)
-    .bind(session.status.as_str())
+    .bind(status.as_str())
     .execute(db.write_pool())
     .await?;
 
