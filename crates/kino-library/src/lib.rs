@@ -519,6 +519,11 @@ impl MetadataService {
     }
 }
 
+const MOVIES_DIRECTORY: &str = "Movies";
+const TV_DIRECTORY: &str = "TV";
+const METADATA_DIRECTORY: &str = "Metadata";
+const SEASON_PREFIX: &str = "Season ";
+
 /// Library media target for canonical layout placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalMediaTarget {
@@ -564,6 +569,66 @@ impl CanonicalMediaTarget {
     }
 }
 
+/// Shared storage layout rules for Kino-owned library directories.
+#[derive(Debug, Clone)]
+pub struct StorageLayoutPolicy {
+    library_root: PathBuf,
+}
+
+impl StorageLayoutPolicy {
+    /// Construct storage layout policy for a library root.
+    pub fn new(library_root: impl Into<PathBuf>) -> Self {
+        Self {
+            library_root: library_root.into(),
+        }
+    }
+
+    /// Construct storage layout policy from process configuration.
+    pub fn from_config(config: &Config) -> Self {
+        Self::new(config.library_root.clone())
+    }
+
+    /// Return the canonical path for an input without touching the filesystem.
+    pub fn canonical_path(&self, input: &CanonicalLayoutInput) -> Result<PathBuf> {
+        let extension = source_extension(&input.source_path)?;
+        match &input.target {
+            CanonicalMediaTarget::Movie { title, year } => {
+                let title = normalize_path_segment(title);
+                let title = require_path_segment("title", title)?;
+                let title_year = format!("{title} ({year})");
+
+                Ok(self
+                    .library_root
+                    .join(MOVIES_DIRECTORY)
+                    .join(&title_year)
+                    .join(format!("{title_year}.{extension}")))
+            }
+            CanonicalMediaTarget::TvEpisode {
+                show_title,
+                season_number,
+                episode_number,
+            } => {
+                let show_title = normalize_path_segment(show_title);
+                let show_title = require_path_segment("show_title", show_title)?;
+                let season = format!("{season_number:02}");
+                let episode = format!("{episode_number:02}");
+
+                Ok(self
+                    .library_root
+                    .join(TV_DIRECTORY)
+                    .join(&show_title)
+                    .join(format!("{SEASON_PREFIX}{season}"))
+                    .join(format!("{show_title} - S{season}E{episode}.{extension}")))
+            }
+        }
+    }
+
+    /// Return the root path governed by this policy.
+    pub fn library_root(&self) -> &Path {
+        &self.library_root
+    }
+}
+
 /// Input for canonical layout placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalLayoutInput {
@@ -597,7 +662,7 @@ pub struct CanonicalLayoutResult {
 /// Writer that places accepted source files into Kino's canonical layout.
 #[derive(Debug, Clone)]
 pub struct CanonicalLayoutWriter {
-    library_root: PathBuf,
+    policy: StorageLayoutPolicy,
     transfer: CanonicalLayoutTransfer,
 }
 
@@ -605,7 +670,7 @@ impl CanonicalLayoutWriter {
     /// Construct a canonical layout writer.
     pub fn new(library_root: impl Into<PathBuf>, transfer: CanonicalLayoutTransfer) -> Self {
         Self {
-            library_root: library_root.into(),
+            policy: StorageLayoutPolicy::new(library_root),
             transfer,
         }
     }
@@ -620,37 +685,7 @@ impl CanonicalLayoutWriter {
 
     /// Return the canonical path for an input without touching the filesystem.
     pub fn canonical_path(&self, input: &CanonicalLayoutInput) -> Result<PathBuf> {
-        let extension = source_extension(&input.source_path)?;
-        match &input.target {
-            CanonicalMediaTarget::Movie { title, year } => {
-                let title = normalize_path_segment(title);
-                let title = require_path_segment("title", title)?;
-                let title_year = format!("{title} ({year})");
-
-                Ok(self
-                    .library_root
-                    .join("Movies")
-                    .join(&title_year)
-                    .join(format!("{title_year}.{extension}")))
-            }
-            CanonicalMediaTarget::TvEpisode {
-                show_title,
-                season_number,
-                episode_number,
-            } => {
-                let show_title = normalize_path_segment(show_title);
-                let show_title = require_path_segment("show_title", show_title)?;
-                let season = format!("{season_number:02}");
-                let episode = format!("{episode_number:02}");
-
-                Ok(self
-                    .library_root
-                    .join("TV")
-                    .join(&show_title)
-                    .join(format!("Season {season}"))
-                    .join(format!("{show_title} - S{season}E{episode}.{extension}")))
-            }
-        }
+        self.policy.canonical_path(input)
     }
 
     /// Place a source file at its canonical path.
@@ -691,6 +726,248 @@ impl CanonicalLayoutWriter {
             transfer: self.transfer,
         })
     }
+}
+
+/// Scanner that accepts only Kino's canonical library layout.
+#[derive(Debug, Clone)]
+pub struct StorageLayoutScanner {
+    policy: StorageLayoutPolicy,
+}
+
+impl StorageLayoutScanner {
+    /// Construct a scanner for a library root.
+    pub fn new(library_root: impl Into<PathBuf>) -> Self {
+        Self {
+            policy: StorageLayoutPolicy::new(library_root),
+        }
+    }
+
+    /// Construct a scanner from process configuration.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            policy: StorageLayoutPolicy::from_config(config),
+        }
+    }
+
+    /// Scan the library root for canonical media files and layout violations.
+    pub async fn scan(&self) -> Result<StorageLayoutScan> {
+        let mut scan = StorageLayoutScan::default();
+        let mut entries = read_dir(self.policy.library_root()).await?;
+
+        while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Io {
+            path: self.policy.library_root().to_path_buf(),
+            source,
+        })? {
+            let path = entry.path();
+            let name = path_file_name(&path)?;
+            match name {
+                MOVIES_DIRECTORY => self.scan_movies_root(&path, &mut scan).await?,
+                TV_DIRECTORY => self.scan_tv_root(&path, &mut scan).await?,
+                METADATA_DIRECTORY => {}
+                _ => scan.violate(path, StorageLayoutViolationKind::UnknownTopLevelEntry),
+            }
+        }
+
+        Ok(scan)
+    }
+
+    async fn scan_movies_root(&self, path: &Path, scan: &mut StorageLayoutScan) -> Result<()> {
+        let mut entries = read_dir(path).await?;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !file_type.is_dir() {
+                scan.violate(path, StorageLayoutViolationKind::NonCanonicalMoviePath);
+                continue;
+            }
+
+            self.scan_movie_directory(&path, scan).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn scan_movie_directory(
+        &self,
+        directory: &Path,
+        scan: &mut StorageLayoutScan,
+    ) -> Result<()> {
+        let movie_name = path_file_name(directory)?.to_owned();
+        let mut entries = read_dir(directory).await?;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Io {
+            path: directory.to_path_buf(),
+            source,
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_file() && movie_file_matches(&path, &movie_name)? {
+                scan.media_files.push(CanonicalLayoutFile {
+                    path,
+                    kind: CanonicalLayoutFileKind::Movie,
+                });
+            } else {
+                scan.violate(path, StorageLayoutViolationKind::NonCanonicalMoviePath);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn scan_tv_root(&self, path: &Path, scan: &mut StorageLayoutScan) -> Result<()> {
+        let mut entries = read_dir(path).await?;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !file_type.is_dir() {
+                scan.violate(path, StorageLayoutViolationKind::NonCanonicalTvPath);
+                continue;
+            }
+
+            self.scan_show_directory(&path, scan).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn scan_show_directory(
+        &self,
+        directory: &Path,
+        scan: &mut StorageLayoutScan,
+    ) -> Result<()> {
+        let show_name = path_file_name(directory)?.to_owned();
+        let mut entries = read_dir(directory).await?;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Io {
+            path: directory.to_path_buf(),
+            source,
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !file_type.is_dir() {
+                scan.violate(path, StorageLayoutViolationKind::NonCanonicalTvPath);
+                continue;
+            }
+
+            self.scan_season_directory(&show_name, &path, scan).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn scan_season_directory(
+        &self,
+        show_name: &str,
+        directory: &Path,
+        scan: &mut StorageLayoutScan,
+    ) -> Result<()> {
+        let season_name = path_file_name(directory)?;
+        let Some(season) = season_name.strip_prefix(SEASON_PREFIX) else {
+            scan.violate(
+                directory.to_path_buf(),
+                StorageLayoutViolationKind::NonCanonicalTvPath,
+            );
+            return Ok(());
+        };
+        if season.is_empty() || !season.bytes().all(|b| b.is_ascii_digit()) {
+            scan.violate(
+                directory.to_path_buf(),
+                StorageLayoutViolationKind::NonCanonicalTvPath,
+            );
+            return Ok(());
+        }
+
+        let mut entries = read_dir(directory).await?;
+        while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Io {
+            path: directory.to_path_buf(),
+            source,
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_file() && tv_episode_file_matches(&path, show_name, season)? {
+                scan.media_files.push(CanonicalLayoutFile {
+                    path,
+                    kind: CanonicalLayoutFileKind::TvEpisode,
+                });
+            } else {
+                scan.violate(path, StorageLayoutViolationKind::NonCanonicalTvPath);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Result of scanning a Kino-owned library directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageLayoutScan {
+    /// Canonical media files found under the owned layout.
+    pub media_files: Vec<CanonicalLayoutFile>,
+    /// Filesystem entries that do not follow Kino's storage policy.
+    pub violations: Vec<StorageLayoutViolation>,
+}
+
+impl StorageLayoutScan {
+    fn violate(&mut self, path: PathBuf, kind: StorageLayoutViolationKind) {
+        self.violations.push(StorageLayoutViolation { path, kind });
+    }
+}
+
+/// A media file that follows Kino's canonical library layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalLayoutFile {
+    /// Filesystem path to the canonical media file.
+    pub path: PathBuf,
+    /// Media path family matched by the scanner.
+    pub kind: CanonicalLayoutFileKind,
+}
+
+/// Media path family matched by the scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalLayoutFileKind {
+    /// Movie path under `Movies/Title (Year)/Title (Year).ext`.
+    Movie,
+    /// TV episode path like `TV/Show/Season 02/Show - S02E03.ext`.
+    TvEpisode,
+}
+
+/// A filesystem entry that does not follow Kino's storage policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageLayoutViolation {
+    /// Filesystem path that violated the policy.
+    pub path: PathBuf,
+    /// Stable reason for the violation.
+    pub kind: StorageLayoutViolationKind,
+}
+
+/// Stable reason a filesystem entry violated the storage policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageLayoutViolationKind {
+    /// Entry is not one of Kino's owned top-level directories.
+    UnknownTopLevelEntry,
+    /// Entry under `Movies` does not match the movie layout.
+    NonCanonicalMoviePath,
+    /// Entry under `TV` does not match the TV layout.
+    NonCanonicalTvPath,
 }
 
 /// Subtitle formats discovered by the probe step.
@@ -971,6 +1248,13 @@ async fn try_exists(path: &Path) -> Result<bool> {
         })
 }
 
+async fn read_dir(path: &Path) -> Result<tokio::fs::ReadDir> {
+    tokio::fs::read_dir(path).await.map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 async fn hard_link(source: &Path, destination: &Path) -> Result<()> {
     tokio::fs::hard_link(source, destination)
         .await
@@ -1066,6 +1350,43 @@ fn source_extension(path: &Path) -> Result<&str> {
     extension.to_str().ok_or_else(|| Error::NonUtf8Path {
         path: path.to_path_buf(),
     })
+}
+
+fn path_file_name(path: &Path) -> Result<&str> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::NonUtf8Path {
+            path: path.to_path_buf(),
+        })
+}
+
+fn path_file_stem(path: &Path) -> Result<&str> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::NonUtf8Path {
+            path: path.to_path_buf(),
+        })
+}
+
+fn movie_file_matches(path: &Path, movie_name: &str) -> Result<bool> {
+    if path.extension().is_none() {
+        return Ok(false);
+    }
+
+    Ok(path_file_stem(path)? == movie_name)
+}
+
+fn tv_episode_file_matches(path: &Path, show_name: &str, season: &str) -> Result<bool> {
+    if path.extension().is_none() {
+        return Ok(false);
+    }
+
+    let stem = path_file_stem(path)?;
+    let Some(episode) = stem.strip_prefix(&format!("{show_name} - S{season}E")) else {
+        return Ok(false);
+    };
+
+    Ok(!episode.is_empty() && episode.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn validate_tmdb_metadata(mut metadata: TmdbMetadata) -> Result<TmdbMetadata> {
@@ -1400,6 +1721,106 @@ mod tests {
         assert!(matches!(err, Error::DestinationExists { .. }));
         assert_eq!(tokio::fs::read(&source).await?, b"new bytes");
         assert_eq!(tokio::fs::read(&destination).await?, b"existing");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scans_only_canonical_layout_media_files()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let library_root = tempfile::tempdir()?;
+        let movie = library_root
+            .path()
+            .join(MOVIES_DIRECTORY)
+            .join("The Matrix (1999)")
+            .join("The Matrix (1999).mkv");
+        let episode = library_root
+            .path()
+            .join(TV_DIRECTORY)
+            .join("Twin Peaks")
+            .join("Season 02")
+            .join("Twin Peaks - S02E03.mkv");
+        let metadata = library_root.path().join(METADATA_DIRECTORY).join("tmdb");
+
+        let movie_parent = movie.parent().ok_or("movie path should have parent")?;
+        let episode_parent = episode.parent().ok_or("episode path should have parent")?;
+        tokio::fs::create_dir_all(movie_parent).await?;
+        tokio::fs::create_dir_all(episode_parent).await?;
+        tokio::fs::create_dir_all(metadata).await?;
+        tokio::fs::write(&movie, b"movie").await?;
+        tokio::fs::write(&episode, b"episode").await?;
+
+        let scanner = StorageLayoutScanner::new(library_root.path());
+        let mut scan = scanner.scan().await?;
+        scan.media_files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+
+        assert_eq!(scan.violations, Vec::new());
+        assert_eq!(
+            scan.media_files,
+            vec![
+                CanonicalLayoutFile {
+                    path: movie,
+                    kind: CanonicalLayoutFileKind::Movie,
+                },
+                CanonicalLayoutFile {
+                    path: episode,
+                    kind: CanonicalLayoutFileKind::TvEpisode,
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_storage_layout_violations()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let library_root = tempfile::tempdir()?;
+        let unknown = library_root.path().join("Alien (1979).mkv");
+        let movie = library_root
+            .path()
+            .join(MOVIES_DIRECTORY)
+            .join("Alien (1979)")
+            .join("wrong-name.mkv");
+        let episode = library_root
+            .path()
+            .join(TV_DIRECTORY)
+            .join("Twin Peaks")
+            .join("Season Two")
+            .join("Twin Peaks - S02E03.mkv");
+
+        let movie_parent = movie.parent().ok_or("movie path should have parent")?;
+        let episode_parent = episode.parent().ok_or("episode path should have parent")?;
+        tokio::fs::create_dir_all(movie_parent).await?;
+        tokio::fs::create_dir_all(episode_parent).await?;
+        tokio::fs::write(&unknown, b"loose").await?;
+        tokio::fs::write(&movie, b"movie").await?;
+        tokio::fs::write(&episode, b"episode").await?;
+
+        let scanner = StorageLayoutScanner::new(library_root.path());
+        let mut scan = scanner.scan().await?;
+        scan.violations
+            .sort_by(|left, right| left.path.cmp(&right.path));
+
+        assert_eq!(scan.media_files, Vec::new());
+        assert_eq!(
+            scan.violations,
+            vec![
+                StorageLayoutViolation {
+                    path: unknown,
+                    kind: StorageLayoutViolationKind::UnknownTopLevelEntry,
+                },
+                StorageLayoutViolation {
+                    path: movie,
+                    kind: StorageLayoutViolationKind::NonCanonicalMoviePath,
+                },
+                StorageLayoutViolation {
+                    path: episode_parent.to_path_buf(),
+                    kind: StorageLayoutViolationKind::NonCanonicalTvPath,
+                },
+            ]
+        );
 
         Ok(())
     }

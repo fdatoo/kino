@@ -1,7 +1,13 @@
-use std::{error::Error as StdError, process::ExitCode};
+use std::{
+    error::Error as StdError,
+    io,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use kino_core::Config;
 use kino_db::Db;
+use tracing::warn;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -17,6 +23,7 @@ async fn main() -> ExitCode {
 async fn start() -> Result<(), Error> {
     let config = Config::load()?;
     kino_core::tracing::init(&config)?;
+    warn_if_library_root_non_empty(&config.library_root)?;
     run(config).await
 }
 
@@ -36,6 +43,33 @@ fn report_error(err: &Error) {
     }
 }
 
+fn warn_if_library_root_non_empty(path: &Path) -> Result<(), Error> {
+    if library_root_contains_entries(path)? {
+        warn!(
+            library_root = %path.display(),
+            "this directory will be owned by Kino; existing contents will be treated as Kino-managed storage"
+        );
+    }
+
+    Ok(())
+}
+
+fn library_root_contains_entries(path: &Path) -> Result<bool, Error> {
+    let mut entries = std::fs::read_dir(path).map_err(|source| Error::LibraryRootRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    match entries.next() {
+        Some(Ok(_)) => Ok(true),
+        Some(Err(source)) => Err(Error::LibraryRootRead {
+            path: path.to_path_buf(),
+            source,
+        }),
+        None => Ok(false),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error(transparent)]
@@ -49,6 +83,13 @@ enum Error {
 
     #[error(transparent)]
     Server(#[from] kino_server::Error),
+
+    #[error("reading library_root {path}: {source}", path = .path.display())]
+    LibraryRootRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[cfg(test)]
@@ -111,6 +152,18 @@ mod tests {
         );
 
         db.close().await;
+        Ok(())
+    }
+
+    #[test]
+    fn library_root_entry_check_reports_non_empty_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        assert!(!library_root_contains_entries(dir.path())?);
+
+        std::fs::write(dir.path().join("existing.mkv"), b"existing")?;
+
+        assert!(library_root_contains_entries(dir.path())?);
         Ok(())
     }
 }
