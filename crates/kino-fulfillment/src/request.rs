@@ -47,6 +47,14 @@ pub enum Error {
     #[error("transcode handoff failed: {0}")]
     Transcode(#[from] kino_transcode::Error),
 
+    /// Library filesystem placement failed during ingestion.
+    #[error("library placement failed: {0}")]
+    Library(#[from] kino_library::Error),
+
+    /// Canonical ingestion was requested without a layout writer.
+    #[error("canonical layout writer is not configured")]
+    CanonicalLayoutNotConfigured,
+
     /// A requested entity does not exist.
     #[error("request {id} was not found")]
     RequestNotFound {

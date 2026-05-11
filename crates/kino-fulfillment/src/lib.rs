@@ -12,7 +12,10 @@ pub mod tv;
 pub mod watch_folder;
 
 pub use disc_rip::{DISC_RIP_PROVIDER_ID, DiscRipProvider};
-pub use ingestion::{IngestSourceFile, IngestedSourceFile, IngestionPipeline};
+pub use ingestion::{
+    IngestCanonicalSourceFile, IngestSourceFile, IngestedCanonicalSourceFile, IngestedSourceFile,
+    IngestionPipeline,
+};
 pub use kino_core::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use manual_import::{MANUAL_IMPORT_PROVIDER_ID, ManualImportProvider};
 pub use planning::{

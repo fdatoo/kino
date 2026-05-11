@@ -899,10 +899,12 @@ version = "0.1.0"
 dependencies = [
  "kino-core",
  "kino-db",
+ "kino-library",
  "kino-transcode",
  "reqwest",
  "serde",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "url",

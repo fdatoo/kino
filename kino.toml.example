@@ -13,6 +13,13 @@ log_level = "info"
 # Use "json" for newline-delimited production logs.
 log_format = "pretty"
 
+[library]
+# How canonical layout placement handles source files. Optional. Defaults to
+# "hard_link" to preserve the original source path. Use "move" to rename the
+# source into the library.
+# Runtime override: KINO_LIBRARY__CANONICAL_TRANSFER.
+canonical_transfer = "hard_link"
+
 [server]
 # Address the server binds to. Optional. Defaults to 127.0.0.1:7777.
 listen = "127.0.0.1:7777"
