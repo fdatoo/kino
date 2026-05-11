@@ -7,7 +7,9 @@ use utoipa::openapi::server::Server;
     paths(
         crate::admin_config::get_config,
         crate::playback::get_progress,
+        crate::playback::mark_watched,
         crate::playback::record_progress,
+        crate::playback::unmark_watched,
         crate::request::list_catalog_items,
         crate::request::get_catalog_item,
         crate::session_admin::list_sessions,

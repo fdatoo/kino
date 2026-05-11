@@ -119,6 +119,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert!(body["paths"].get("/api/v1/admin/sessions").is_some());
     assert!(body["paths"].get("/api/v1/playback/progress").is_some());
     assert!(
+        body["paths"]
+            .get("/api/v1/playback/watched/{media_item_id}")
+            .is_some()
+    );
+    assert!(
         body["paths"]["/api/v1/admin/tokens/{token_id}"]
             .get("delete")
             .is_some()
