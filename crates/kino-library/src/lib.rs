@@ -22,6 +22,7 @@ use kino_core::{
 };
 use kino_db::Db;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 pub use subtitle_image_extraction::{
@@ -321,6 +322,8 @@ pub trait TmdbMetadataProvider: Send + Sync {
 /// Image bytes returned by the TMDB metadata provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataAsset {
+    /// TMDB source URL for debugging and cache provenance.
+    pub source_url: Option<String>,
     /// File extension to use when storing the image sidecar.
     pub extension: String,
     /// Raw asset bytes.
@@ -331,9 +334,16 @@ impl MetadataAsset {
     /// Construct a metadata asset from an extension and bytes.
     pub fn new(extension: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
         Self {
+            source_url: None,
             extension: extension.into(),
             bytes: bytes.into(),
         }
+    }
+
+    /// Attach the original provider URL for this asset.
+    pub fn with_source_url(mut self, source_url: impl Into<String>) -> Self {
+        self.source_url = Some(source_url.into());
+        self
     }
 }
 
@@ -422,12 +432,24 @@ pub struct CachedMediaMetadata {
     pub description: String,
     /// Release or first-air date, when known.
     pub release_date: Option<String>,
-    /// Local poster sidecar path.
+    /// Provider poster image URL, when known.
+    pub poster_source_url: Option<String>,
+    /// Local poster cache path.
     pub poster_path: PathBuf,
-    /// Local backdrop sidecar path.
+    /// Relative poster path inside the artwork cache.
+    pub poster_local_path: PathBuf,
+    /// Provider backdrop image URL, when known.
+    pub backdrop_source_url: Option<String>,
+    /// Local backdrop cache path.
     pub backdrop_path: PathBuf,
-    /// Local logo sidecar path, when present.
+    /// Relative backdrop path inside the artwork cache.
+    pub backdrop_local_path: PathBuf,
+    /// Provider logo image URL, when known.
+    pub logo_source_url: Option<String>,
+    /// Local logo cache path, when present.
     pub logo_path: Option<PathBuf>,
+    /// Relative logo path inside the artwork cache, when present.
+    pub logo_local_path: Option<PathBuf>,
     /// Local JSON metadata sidecar path.
     pub metadata_path: PathBuf,
     /// Ordered cast members.
@@ -443,20 +465,40 @@ pub struct CachedMediaMetadata {
 pub struct MetadataService {
     db: Db,
     metadata_root: PathBuf,
+    artwork_cache_root: PathBuf,
 }
 
 impl MetadataService {
     /// Construct a metadata service with an explicit metadata root.
     pub fn new(db: Db, metadata_root: impl Into<PathBuf>) -> Self {
+        let metadata_root = metadata_root.into();
+        Self {
+            db,
+            artwork_cache_root: metadata_root.clone(),
+            metadata_root,
+        }
+    }
+
+    /// Construct a metadata service with explicit metadata and artwork roots.
+    pub fn with_artwork_cache_dir(
+        db: Db,
+        metadata_root: impl Into<PathBuf>,
+        artwork_cache_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             db,
             metadata_root: metadata_root.into(),
+            artwork_cache_root: artwork_cache_root.into(),
         }
     }
 
     /// Construct a metadata service from process configuration.
     pub fn from_config(db: Db, config: &Config) -> Self {
-        Self::new(db, config.library_root.join("Metadata"))
+        Self::with_artwork_cache_dir(
+            db,
+            config.library_root.join("Metadata"),
+            config.artwork_cache_dir(),
+        )
     }
 
     /// Enrich a media item from TMDB, returning the local cache projection.
@@ -488,12 +530,20 @@ impl MetadataService {
         let directory = self.metadata_directory(canonical_identity_id);
         create_dir_all(&directory).await?;
 
-        let poster_path = write_metadata_asset(&directory, "poster", &metadata.poster).await?;
-        let backdrop_path =
-            write_metadata_asset(&directory, "backdrop", &metadata.backdrop).await?;
-        let logo_path = match &metadata.logo {
-            Some(asset) => Some(write_metadata_asset(&directory, "logo", asset).await?),
-            None => None,
+        let poster_local_path =
+            write_artwork_asset(&self.artwork_cache_root, "poster", &metadata.poster).await?;
+        let poster_path = self.artwork_cache_root.join(&poster_local_path);
+        let backdrop_local_path =
+            write_artwork_asset(&self.artwork_cache_root, "backdrop", &metadata.backdrop).await?;
+        let backdrop_path = self.artwork_cache_root.join(&backdrop_local_path);
+        let (logo_local_path, logo_path) = match &metadata.logo {
+            Some(asset) => {
+                let local_path =
+                    write_artwork_asset(&self.artwork_cache_root, "logo", asset).await?;
+                let path = self.artwork_cache_root.join(&local_path);
+                (Some(local_path), Some(path))
+            }
+            None => (None, None),
         };
         let metadata_path = directory.join("metadata.json");
         write_metadata_sidecar(
@@ -513,9 +563,15 @@ impl MetadataService {
             title: metadata.title,
             description: metadata.description,
             release_date: metadata.release_date,
+            poster_source_url: metadata.poster.source_url,
             poster_path,
+            poster_local_path,
+            backdrop_source_url: metadata.backdrop.source_url,
             backdrop_path,
+            backdrop_local_path,
+            logo_source_url: metadata.logo.and_then(|asset| asset.source_url),
             logo_path,
+            logo_local_path,
             metadata_path,
             cast: metadata.cast,
             created_at: now,
@@ -537,8 +593,11 @@ impl MetadataService {
                 description,
                 release_date,
                 poster_path,
+                poster_local_path,
                 backdrop_path,
+                backdrop_local_path,
                 logo_path,
+                logo_local_path,
                 metadata_path,
                 created_at,
                 updated_at
@@ -570,7 +629,11 @@ impl MetadataService {
             .map(cast_member_from_row)
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Some(metadata_from_row(&row, cast)?))
+        Ok(Some(metadata_from_row(
+            &row,
+            cast,
+            &self.artwork_cache_root,
+        )?))
     }
 
     async fn ensure_media_item_identity(
@@ -614,13 +677,16 @@ impl MetadataService {
                 description,
                 release_date,
                 poster_path,
+                poster_local_path,
                 backdrop_path,
+                backdrop_local_path,
                 logo_path,
+                logo_local_path,
                 metadata_path,
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             "#,
         )
         .bind(cached.media_item_id)
@@ -629,9 +695,12 @@ impl MetadataService {
         .bind(&cached.title)
         .bind(&cached.description)
         .bind(&cached.release_date)
-        .bind(path_to_db_text(&cached.poster_path)?)
-        .bind(path_to_db_text(&cached.backdrop_path)?)
-        .bind(path_option_to_db_text(cached.logo_path.as_deref())?)
+        .bind(cached.poster_source_url.as_deref().unwrap_or_default())
+        .bind(path_to_db_text(&cached.poster_local_path)?)
+        .bind(cached.backdrop_source_url.as_deref().unwrap_or_default())
+        .bind(path_to_db_text(&cached.backdrop_local_path)?)
+        .bind(cached.logo_source_url.as_deref().unwrap_or_default())
+        .bind(path_option_to_db_text(cached.logo_local_path.as_deref())?)
         .bind(path_to_db_text(&cached.metadata_path)?)
         .bind(cached.created_at)
         .bind(cached.updated_at)
@@ -756,6 +825,8 @@ pub struct CatalogMediaItem {
     pub episode_number: Option<u32>,
     /// Cached display title, when metadata has been enriched.
     pub title: Option<String>,
+    /// Cached artwork URLs for this item.
+    pub artwork: CatalogArtwork,
     /// Source files attached to this media item.
     pub source_files: Vec<LibrarySourceFile>,
     /// Subtitle tracks attached to this media item.
@@ -781,6 +852,58 @@ pub struct CatalogSubtitleTrack {
     pub provenance: SubtitleProvenance,
     /// Probed subtitle stream index in the source file.
     pub track_index: u32,
+}
+
+/// Catalog artwork URLs for one media item.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct CatalogArtwork {
+    /// Poster artwork, when cached.
+    pub poster: Option<CatalogArtworkImage>,
+    /// Backdrop artwork, when cached.
+    pub backdrop: Option<CatalogArtworkImage>,
+    /// Logo artwork, when cached.
+    pub logo: Option<CatalogArtworkImage>,
+}
+
+/// Catalog artwork image URLs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct CatalogArtworkImage {
+    /// Provider URL used as the original image source.
+    pub source_url: Option<String>,
+    /// Kino-owned URL clients should prefer.
+    pub internal_url: Option<String>,
+}
+
+/// Cached artwork image kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogArtworkKind {
+    /// Poster artwork.
+    Poster,
+    /// Backdrop artwork.
+    Backdrop,
+    /// Logo artwork.
+    Logo,
+}
+
+impl CatalogArtworkKind {
+    /// Parse a route image kind.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "poster" => Some(Self::Poster),
+            "backdrop" => Some(Self::Backdrop),
+            "logo" => Some(Self::Logo),
+            _ => None,
+        }
+    }
+
+    /// Return the route path segment for this image kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Poster => "poster",
+            Self::Backdrop => "backdrop",
+            Self::Logo => "logo",
+        }
+    }
 }
 
 /// Capability hints describing a registered transcode output.
@@ -883,7 +1006,13 @@ impl CatalogService {
                 media_items.episode_number,
                 media_items.created_at,
                 media_items.updated_at,
-                media_metadata_cache.title
+                media_metadata_cache.title,
+                media_metadata_cache.poster_path AS poster_source_url,
+                media_metadata_cache.poster_local_path,
+                media_metadata_cache.backdrop_path AS backdrop_source_url,
+                media_metadata_cache.backdrop_local_path,
+                media_metadata_cache.logo_path AS logo_source_url,
+                media_metadata_cache.logo_local_path
             FROM media_items
             LEFT JOIN media_metadata_cache
                 ON media_metadata_cache.media_item_id = media_items.id
@@ -906,6 +1035,36 @@ impl CatalogService {
         Ok(item)
     }
 
+    /// Return the cached relative artwork path for a media item and kind.
+    pub async fn artwork_local_path(
+        &self,
+        media_item_id: Id,
+        kind: CatalogArtworkKind,
+    ) -> Result<Option<PathBuf>> {
+        let row = sqlx::query(
+            r#"
+            SELECT poster_local_path, backdrop_local_path, logo_local_path
+            FROM media_metadata_cache
+            WHERE media_item_id = ?1
+            "#,
+        )
+        .bind(media_item_id)
+        .fetch_optional(self.db.read_pool())
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let value: Option<String> = match kind {
+            CatalogArtworkKind::Poster => row.try_get("poster_local_path")?,
+            CatalogArtworkKind::Backdrop => row.try_get("backdrop_local_path")?,
+            CatalogArtworkKind::Logo => row.try_get("logo_local_path")?,
+        };
+
+        Ok(value.filter(|path| !path.is_empty()).map(PathBuf::from))
+    }
+
     async fn fetch_media_items(
         &self,
         query: &CatalogListQuery,
@@ -924,7 +1083,13 @@ impl CatalogService {
                 media_items.episode_number,
                 media_items.created_at,
                 media_items.updated_at,
-                media_metadata_cache.title
+                media_metadata_cache.title,
+                media_metadata_cache.poster_path AS poster_source_url,
+                media_metadata_cache.poster_local_path,
+                media_metadata_cache.backdrop_path AS backdrop_source_url,
+                media_metadata_cache.backdrop_local_path,
+                media_metadata_cache.logo_path AS logo_source_url,
+                media_metadata_cache.logo_local_path
             FROM media_items
             "#,
         );
@@ -2249,20 +2414,32 @@ async fn rename(source: &Path, destination: &Path) -> Result<()> {
         })
 }
 
-async fn write_metadata_asset(
-    directory: &Path,
+async fn write_artwork_asset(
+    cache_root: &Path,
     asset: &'static str,
     metadata_asset: &MetadataAsset,
 ) -> Result<PathBuf> {
     let extension = validate_asset_extension(asset, &metadata_asset.extension)?;
-    let path = directory.join(format!("{asset}.{extension}"));
-    tokio::fs::write(&path, &metadata_asset.bytes)
-        .await
-        .map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
-    Ok(path)
+    let digest = Sha256::digest(&metadata_asset.bytes);
+    let hash = format!("{digest:x}");
+    let local_path =
+        PathBuf::from(&hash[0..2])
+            .join(&hash[2..4])
+            .join(format!("{}.{}", &hash[4..], extension));
+    let path = cache_root.join(&local_path);
+    let parent = path.parent().unwrap_or(cache_root);
+    create_dir_all(parent).await?;
+
+    if !try_exists(&path).await? {
+        tokio::fs::write(&path, &metadata_asset.bytes)
+            .await
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+    }
+
+    Ok(local_path)
 }
 
 async fn write_metadata_sidecar(
@@ -2280,8 +2457,14 @@ async fn write_metadata_sidecar(
         title: &metadata.title,
         description: &metadata.description,
         release_date: metadata.release_date.as_deref(),
+        poster_source_url: metadata.poster.source_url.as_deref(),
         poster_path: path_to_db_text(poster_path)?,
+        backdrop_source_url: metadata.backdrop.source_url.as_deref(),
         backdrop_path: path_to_db_text(backdrop_path)?,
+        logo_source_url: metadata
+            .logo
+            .as_ref()
+            .and_then(|asset| asset.source_url.as_deref()),
         logo_path: path_option_to_db_text(logo_path)?,
         cast: &metadata.cast,
     };
@@ -2327,8 +2510,11 @@ struct MetadataSidecar<'a> {
     title: &'a str,
     description: &'a str,
     release_date: Option<&'a str>,
+    poster_source_url: Option<&'a str>,
     poster_path: String,
+    backdrop_source_url: Option<&'a str>,
     backdrop_path: String,
+    logo_source_url: Option<&'a str>,
     logo_path: Option<String>,
     cast: &'a [MetadataCastMember],
 }
@@ -2602,18 +2788,72 @@ fn fts_prefix_query(value: &str) -> Option<String> {
 
 fn catalog_media_item_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogMediaItem> {
     let media_kind: String = row.try_get("media_kind")?;
+    let id = row.try_get("id")?;
     Ok(CatalogMediaItem {
-        id: row.try_get("id")?,
+        id,
         media_kind: MediaItemKind::parse(&media_kind)
             .ok_or(Error::InvalidMediaItemKind { value: media_kind })?,
         canonical_identity_id: row.try_get("canonical_identity_id")?,
         season_number: optional_u32_from_row(row, "season_number")?,
         episode_number: optional_u32_from_row(row, "episode_number")?,
         title: row.try_get("title")?,
+        artwork: catalog_artwork_from_row(row, id)?,
         source_files: Vec::new(),
         subtitle_tracks: Vec::new(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn catalog_artwork_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    media_item_id: Id,
+) -> Result<CatalogArtwork> {
+    Ok(CatalogArtwork {
+        poster: catalog_artwork_image_from_row(row, media_item_id, CatalogArtworkKind::Poster)?,
+        backdrop: catalog_artwork_image_from_row(row, media_item_id, CatalogArtworkKind::Backdrop)?,
+        logo: catalog_artwork_image_from_row(row, media_item_id, CatalogArtworkKind::Logo)?,
+    })
+}
+
+fn catalog_artwork_image_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    media_item_id: Id,
+    kind: CatalogArtworkKind,
+) -> Result<Option<CatalogArtworkImage>> {
+    let (source_field, local_field) = match kind {
+        CatalogArtworkKind::Poster => ("poster_source_url", "poster_local_path"),
+        CatalogArtworkKind::Backdrop => ("backdrop_source_url", "backdrop_local_path"),
+        CatalogArtworkKind::Logo => ("logo_source_url", "logo_local_path"),
+    };
+    let source_url: Option<String> = source_url_from_db(row.try_get(source_field)?);
+    let local_path: Option<String> = row.try_get(local_field)?;
+    let internal_url = local_path.filter(|path| !path.is_empty()).map(|_| {
+        format!(
+            "/api/v1/library/items/{media_item_id}/images/{}",
+            kind.as_str()
+        )
+    });
+
+    if source_url.is_none() && internal_url.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(CatalogArtworkImage {
+        source_url,
+        internal_url,
+    }))
+}
+
+fn source_url_from_db(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+}
+
+fn local_path_from_db(local_path: Option<String>, legacy_path: Option<String>) -> Option<String> {
+    local_path.filter(|path| !path.is_empty()).or_else(|| {
+        legacy_path.filter(|path| !path.starts_with("http://") && !path.starts_with("https://"))
     })
 }
 
@@ -2705,11 +2945,23 @@ fn transcode_output_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranscodeO
 fn metadata_from_row(
     row: &sqlx::sqlite::SqliteRow,
     cast: Vec<MetadataCastMember>,
+    artwork_cache_root: &Path,
 ) -> Result<CachedMediaMetadata> {
-    let poster_path: String = row.try_get("poster_path")?;
-    let backdrop_path: String = row.try_get("backdrop_path")?;
+    let poster_path: Option<String> = row.try_get("poster_path")?;
+    let poster_source_url = source_url_from_db(poster_path.clone());
+    let poster_local_path =
+        local_path_from_db(row.try_get("poster_local_path")?, poster_path).unwrap_or_default();
+    let backdrop_path: Option<String> = row.try_get("backdrop_path")?;
+    let backdrop_source_url = source_url_from_db(backdrop_path.clone());
+    let backdrop_local_path =
+        local_path_from_db(row.try_get("backdrop_local_path")?, backdrop_path).unwrap_or_default();
     let logo_path: Option<String> = row.try_get("logo_path")?;
+    let logo_source_url = source_url_from_db(logo_path.clone());
+    let logo_local_path = local_path_from_db(row.try_get("logo_local_path")?, logo_path);
     let metadata_path: String = row.try_get("metadata_path")?;
+    let poster_local_path = PathBuf::from(poster_local_path);
+    let backdrop_local_path = PathBuf::from(backdrop_local_path);
+    let logo_local_path = logo_local_path.map(PathBuf::from);
 
     Ok(CachedMediaMetadata {
         media_item_id: row.try_get("media_item_id")?,
@@ -2717,9 +2969,17 @@ fn metadata_from_row(
         title: row.try_get("title")?,
         description: row.try_get("description")?,
         release_date: row.try_get("release_date")?,
-        poster_path: PathBuf::from(poster_path),
-        backdrop_path: PathBuf::from(backdrop_path),
-        logo_path: logo_path.map(PathBuf::from),
+        poster_source_url,
+        poster_path: artwork_cache_root.join(&poster_local_path),
+        poster_local_path,
+        backdrop_source_url,
+        backdrop_path: artwork_cache_root.join(&backdrop_local_path),
+        backdrop_local_path,
+        logo_source_url,
+        logo_path: logo_local_path
+            .as_ref()
+            .map(|local_path| artwork_cache_root.join(local_path)),
+        logo_local_path,
         metadata_path: PathBuf::from(metadata_path),
         cast,
         created_at: row.try_get("created_at")?,
@@ -3194,6 +3454,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_get_returns_internal_artwork_url()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let identity_id = movie_identity(550);
+        let media_item_id = insert_tmdb_media_item(&db, identity_id).await?;
+        insert_catalog_artwork(
+            &db,
+            media_item_id,
+            identity_id,
+            "Fight Club",
+            "https://image.tmdb.org/t/p/original/poster.jpg",
+            "ab/cd/poster.jpg",
+        )
+        .await?;
+        let service = CatalogService::new(db);
+
+        let item = service.get(media_item_id).await?;
+        let poster = item.artwork.poster.ok_or("poster should be present")?;
+
+        assert_eq!(
+            poster.source_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/poster.jpg")
+        );
+        assert_eq!(
+            poster.internal_url.as_deref(),
+            Some(format!("/api/v1/library/items/{media_item_id}/images/poster").as_str())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn catalog_search_matches_titles_and_cast_with_prefix_and_diacritics()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
@@ -3390,19 +3682,68 @@ mod tests {
                 description,
                 release_date,
                 poster_path,
+                poster_local_path,
                 backdrop_path,
+                backdrop_local_path,
                 logo_path,
+                logo_local_path,
                 metadata_path,
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, 'description', NULL, 'poster.jpg', 'backdrop.jpg', NULL, 'metadata.json', ?5, ?6)
+            VALUES (?1, ?2, ?3, ?4, 'description', NULL, '', 'poster.jpg', '', 'backdrop.jpg', NULL, NULL, 'metadata.json', ?5, ?6)
             "#,
         )
         .bind(media_item_id)
         .bind(canonical_identity_id)
         .bind(canonical_identity_id.provider().as_str())
         .bind(title)
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(())
+    }
+
+    async fn insert_catalog_artwork(
+        db: &Db,
+        media_item_id: Id,
+        canonical_identity_id: CanonicalIdentityId,
+        title: &str,
+        poster_source_url: &str,
+        poster_local_path: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let now = Timestamp::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_metadata_cache (
+                media_item_id,
+                canonical_identity_id,
+                provider,
+                title,
+                description,
+                release_date,
+                poster_path,
+                poster_local_path,
+                backdrop_path,
+                backdrop_local_path,
+                logo_path,
+                logo_local_path,
+                metadata_path,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'description', NULL, ?5, ?6, '', NULL, '', NULL, 'metadata.json', ?7, ?8)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(canonical_identity_id)
+        .bind(canonical_identity_id.provider().as_str())
+        .bind(title)
+        .bind(poster_source_url)
+        .bind(poster_local_path)
         .bind(now)
         .bind(now)
         .execute(db.write_pool())

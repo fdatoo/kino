@@ -5,7 +5,9 @@ use utoipa::openapi::server::Server;
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(
+        crate::playback::record_progress,
         crate::request::list_catalog_items,
+        crate::request::get_catalog_item_image,
         crate::token::create_token,
         crate::token::list_tokens,
         crate::token::revoke_token
@@ -14,6 +16,7 @@ use utoipa::openapi::server::Server;
     tags(
         (name = "requests", description = "Request lifecycle operations"),
         (name = "library", description = "Library catalog operations"),
+        (name = "playback", description = "Playback state operations"),
         (name = "admin", description = "Administrative operations")
     )
 )]
