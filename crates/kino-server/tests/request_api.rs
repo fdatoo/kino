@@ -747,6 +747,20 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     );
     assert_eq!(listed["next_offset"], Value::Null);
 
+    let search_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?search=matr")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let searched: Value = response_json(search_response).await?;
+    assert_eq!(searched["items"][0]["id"], matrix.to_string());
+
     let paged_response = app
         .clone()
         .oneshot(
