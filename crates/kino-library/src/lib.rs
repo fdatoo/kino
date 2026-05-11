@@ -276,6 +276,27 @@ pub enum Error {
         /// Persisted value.
         value: i64,
     },
+
+    /// A subtitle format read from storage is not recognized.
+    #[error("invalid subtitle format: {value}")]
+    InvalidSubtitleFormat {
+        /// Persisted subtitle format value.
+        value: String,
+    },
+
+    /// A subtitle provenance read from storage is not recognized.
+    #[error("invalid subtitle provenance: {value}")]
+    InvalidSubtitleProvenance {
+        /// Persisted subtitle provenance value.
+        value: String,
+    },
+
+    /// A subtitle track index could not fit into the public type.
+    #[error("invalid subtitle track index: {value}")]
+    InvalidSubtitleTrackIndex {
+        /// Persisted track index.
+        value: i64,
+    },
 }
 
 /// Crate-local `Result` alias.
@@ -729,10 +750,29 @@ pub struct CatalogMediaItem {
     pub title: Option<String>,
     /// Source files attached to this media item.
     pub source_files: Vec<LibrarySourceFile>,
+    /// Subtitle tracks attached to this media item.
+    pub subtitle_tracks: Vec<CatalogSubtitleTrack>,
     /// Creation timestamp.
     pub created_at: Timestamp,
     /// Last update timestamp.
     pub updated_at: Timestamp,
+}
+
+/// Catalog projection for one subtitle track.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct CatalogSubtitleTrack {
+    /// Subtitle sidecar id.
+    pub id: Id,
+    /// Normalized subtitle language.
+    pub language: String,
+    /// Display label for client subtitle menus.
+    pub label: String,
+    /// Persisted subtitle format.
+    pub format: SubtitleFormat,
+    /// How the subtitle text was derived.
+    pub provenance: SubtitleProvenance,
+    /// Probed subtitle stream index in the source file.
+    pub track_index: u32,
 }
 
 /// Capability hints describing a registered transcode output.
@@ -812,6 +852,7 @@ impl CatalogService {
             items.truncate(limit as usize);
         }
         self.attach_source_files(&mut items).await?;
+        self.attach_subtitle_tracks(&mut items).await?;
 
         let next_offset = if has_next {
             Some(offset + u64::from(limit))
@@ -851,6 +892,8 @@ impl CatalogService {
 
         let mut item = catalog_media_item_from_row(&row)?;
         self.attach_source_files(std::slice::from_mut(&mut item))
+            .await?;
+        self.attach_subtitle_tracks(std::slice::from_mut(&mut item))
             .await?;
         Ok(item)
     }
@@ -967,6 +1010,48 @@ impl CatalogService {
 
         for item in items {
             item.source_files = by_media_item.remove(&item.id).unwrap_or_default();
+        }
+
+        Ok(())
+    }
+
+    async fn attach_subtitle_tracks(&self, items: &mut [CatalogMediaItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = sqlx::QueryBuilder::new(
+            r#"
+            SELECT
+                id,
+                media_item_id,
+                language,
+                format,
+                provenance,
+                track_index
+            FROM subtitle_sidecars
+            WHERE media_item_id IN (
+            "#,
+        );
+        let mut separated = builder.separated(", ");
+        for item in items.iter() {
+            separated.push_bind(item.id);
+        }
+        separated
+            .push_unseparated(") ORDER BY media_item_id, language, track_index, provenance, id");
+
+        let rows = builder.build().fetch_all(self.db.read_pool()).await?;
+        let mut by_media_item = HashMap::<Id, Vec<CatalogSubtitleTrack>>::new();
+        for row in &rows {
+            let media_item_id = row.try_get("media_item_id")?;
+            by_media_item
+                .entry(media_item_id)
+                .or_default()
+                .push(catalog_subtitle_track_from_row(row)?);
+        }
+
+        for item in items {
+            item.subtitle_tracks = by_media_item.remove(&item.id).unwrap_or_default();
         }
 
         Ok(())
@@ -1635,7 +1720,9 @@ impl ProbedSubtitleFormat {
 }
 
 /// Subtitle formats persisted as sidecars.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(rename_all = "snake_case")]
 pub enum SubtitleFormat {
     /// SubRip text subtitles.
     Srt,
@@ -1659,6 +1746,16 @@ impl SubtitleFormat {
     pub fn extension(self) -> &'static str {
         self.as_str()
     }
+
+    /// Parse a persisted subtitle format.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "srt" => Some(Self::Srt),
+            "ass" => Some(Self::Ass),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SubtitleFormat {
@@ -1668,7 +1765,9 @@ impl fmt::Display for SubtitleFormat {
 }
 
 /// How a subtitle sidecar's text was derived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(rename_all = "snake_case")]
 pub enum SubtitleProvenance {
     /// Text came directly from a text subtitle stream.
     Text,
@@ -1682,6 +1781,15 @@ impl SubtitleProvenance {
         match self {
             Self::Text => "text",
             Self::Ocr => "ocr",
+        }
+    }
+
+    /// Parse a persisted subtitle provenance.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "ocr" => Some(Self::Ocr),
+            _ => None,
         }
     }
 }
@@ -2036,6 +2144,32 @@ impl SubtitleService {
         rows.iter()
             .map(|row| row.try_get("language").map_err(Error::Sqlx))
             .collect()
+    }
+
+    /// Return indexed subtitle sidecars for a media item.
+    pub async fn sidecars(&self, media_item_id: Id) -> Result<Vec<SubtitleSidecar>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                media_item_id,
+                language,
+                format,
+                provenance,
+                track_index,
+                path,
+                created_at,
+                updated_at
+            FROM subtitle_sidecars
+            WHERE media_item_id = ?1
+            ORDER BY language, track_index, provenance, id
+            "#,
+        )
+        .bind(media_item_id)
+        .fetch_all(self.db.read_pool())
+        .await?;
+
+        rows.iter().map(subtitle_sidecar_from_row).collect()
     }
 }
 
@@ -2427,6 +2561,7 @@ fn catalog_media_item_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogM
         episode_number: optional_u32_from_row(row, "episode_number")?,
         title: row.try_get("title")?,
         source_files: Vec::new(),
+        subtitle_tracks: Vec::new(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -2442,6 +2577,11 @@ fn optional_u32_from_row(
         .transpose()
 }
 
+fn subtitle_track_index_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<u32> {
+    let value: i64 = row.try_get("track_index")?;
+    u32::try_from(value).map_err(|_| Error::InvalidSubtitleTrackIndex { value })
+}
+
 fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<LibrarySourceFile> {
     let path: String = row.try_get("path")?;
     Ok(LibrarySourceFile {
@@ -2450,6 +2590,55 @@ fn library_source_file_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Library
         path: PathBuf::from(path),
         transcode_outputs: Vec::new(),
     })
+}
+
+fn catalog_subtitle_track_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogSubtitleTrack> {
+    let format = subtitle_format_from_row(row)?;
+    let provenance = subtitle_provenance_from_row(row)?;
+    let language: String = row.try_get("language")?;
+
+    Ok(CatalogSubtitleTrack {
+        id: row.try_get("id")?,
+        language: language.clone(),
+        label: subtitle_track_label(&language, provenance),
+        format,
+        provenance,
+        track_index: subtitle_track_index_from_row(row)?,
+    })
+}
+
+fn subtitle_sidecar_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SubtitleSidecar> {
+    let path: String = row.try_get("path")?;
+
+    Ok(SubtitleSidecar {
+        id: row.try_get("id")?,
+        media_item_id: row.try_get("media_item_id")?,
+        language: row.try_get("language")?,
+        format: subtitle_format_from_row(row)?,
+        provenance: subtitle_provenance_from_row(row)?,
+        track_index: subtitle_track_index_from_row(row)?,
+        path: PathBuf::from(path),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn subtitle_format_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SubtitleFormat> {
+    let value: String = row.try_get("format")?;
+    SubtitleFormat::parse(&value).ok_or(Error::InvalidSubtitleFormat { value })
+}
+
+fn subtitle_provenance_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SubtitleProvenance> {
+    let value: String = row.try_get("provenance")?;
+    SubtitleProvenance::parse(&value).ok_or(Error::InvalidSubtitleProvenance { value })
+}
+
+fn subtitle_track_label(language: &str, provenance: SubtitleProvenance) -> String {
+    let language = language.to_ascii_uppercase();
+    match provenance {
+        SubtitleProvenance::Text => language,
+        SubtitleProvenance::Ocr => format!("{language} (OCR)"),
+    }
 }
 
 fn transcode_output_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranscodeOutput> {
@@ -2866,6 +3055,36 @@ mod tests {
         insert_catalog_title(&db, breaking_bad, breaking_bad_identity, "Breaking Bad").await?;
         let matrix_path = PathBuf::from("/library/Movies/The Matrix (1999)/The Matrix (1999).mkv");
         insert_source_file(&db, matrix, &matrix_path).await?;
+        let sidecar_dir = tempfile::tempdir()?;
+        let subtitle_service = SubtitleService::new(db.clone());
+        let text_subtitles = subtitle_service
+            .extract_text_subtitles(SubtitleExtractionInput::new(
+                matrix,
+                sidecar_dir.path(),
+                vec![ProbedSubtitleTrack::new(
+                    2,
+                    "ENG",
+                    ProbedSubtitleFormat::Srt,
+                    "1\n00:00:01,000 --> 00:00:02,000\nWake up\n",
+                )],
+            ))
+            .await?;
+        let ocr_subtitles = subtitle_service
+            .extract_ocr_subtitles(OcrSubtitleExtractionInput::new(
+                matrix,
+                sidecar_dir.path(),
+                vec![OcrSubtitleTrack::new(
+                    4,
+                    "JPN",
+                    vec![subtitle_ocr::OcrCue {
+                        start: Duration::from_millis(1_250),
+                        end: Duration::from_millis(2_750),
+                        text: String::from("KONNICHIWA"),
+                        confidence: 91.25,
+                    }],
+                )],
+            ))
+            .await?;
         let service = CatalogService::new(db);
 
         let movies = service
@@ -2899,6 +3118,27 @@ mod tests {
         assert_eq!(fetched.id, matrix);
         assert_eq!(fetched.title.as_deref(), Some("The Matrix"));
         assert_eq!(fetched.source_files.len(), 1);
+        assert_eq!(
+            fetched.subtitle_tracks,
+            vec![
+                CatalogSubtitleTrack {
+                    id: text_subtitles.sidecars[0].id,
+                    language: String::from("eng"),
+                    label: String::from("ENG"),
+                    format: SubtitleFormat::Srt,
+                    provenance: SubtitleProvenance::Text,
+                    track_index: 2,
+                },
+                CatalogSubtitleTrack {
+                    id: ocr_subtitles.sidecars[0].id,
+                    language: String::from("jpn"),
+                    label: String::from("JPN (OCR)"),
+                    format: SubtitleFormat::Json,
+                    provenance: SubtitleProvenance::Ocr,
+                    track_index: 4,
+                },
+            ]
+        );
 
         Ok(())
     }
@@ -3271,6 +3511,60 @@ mod tests {
         .fetch_one(db.read_pool())
         .await?;
         assert_eq!(row, (String::from("json"), String::from("ocr")));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_mixed_text_and_ocr_sidecars_with_provenance()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let sidecar_dir = tempfile::tempdir()?;
+        let service = SubtitleService::new(db);
+
+        service
+            .extract_text_subtitles(SubtitleExtractionInput::new(
+                media_item_id,
+                sidecar_dir.path(),
+                vec![ProbedSubtitleTrack::new(
+                    2,
+                    "ENG",
+                    ProbedSubtitleFormat::Srt,
+                    "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+                )],
+            ))
+            .await?;
+        service
+            .extract_ocr_subtitles(OcrSubtitleExtractionInput::new(
+                media_item_id,
+                sidecar_dir.path(),
+                vec![OcrSubtitleTrack::new(
+                    4,
+                    "SPA",
+                    vec![subtitle_ocr::OcrCue {
+                        start: Duration::from_millis(3_500),
+                        end: Duration::from_millis(4_250),
+                        text: String::from("HOLA KINO"),
+                        confidence: 88.75,
+                    }],
+                )],
+            ))
+            .await?;
+
+        let sidecars = service.sidecars(media_item_id).await?;
+
+        assert_eq!(sidecars.len(), 2);
+        assert_eq!(sidecars[0].language, "eng");
+        assert_eq!(sidecars[0].format, SubtitleFormat::Srt);
+        assert_eq!(sidecars[0].provenance, SubtitleProvenance::Text);
+        assert_eq!(sidecars[1].language, "spa");
+        assert_eq!(sidecars[1].format, SubtitleFormat::Json);
+        assert_eq!(sidecars[1].provenance, SubtitleProvenance::Ocr);
+
+        let json = tokio::fs::read_to_string(&sidecars[1].path).await?;
+        let sidecar: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(sidecar["cues"][0]["confidence"], 88.75);
 
         Ok(())
     }
