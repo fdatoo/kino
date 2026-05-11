@@ -300,7 +300,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
         let config = SessionReaperConfig {
-            tick_interval: Duration::from_secs(1),
+            tick_interval: Duration::from_millis(10),
             active_to_idle: Duration::from_secs(60),
             idle_to_ended: Duration::from_secs(300),
         };
@@ -313,7 +313,6 @@ mod tests {
             None,
         )
         .await?;
-        tokio::time::pause();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let clock = Arc::new(Mutex::new(first_tick));
         let handle = spawn_with_shutdown_and_clock(db.clone(), config, shutdown_rx, {
@@ -331,7 +330,7 @@ mod tests {
         *clock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = second_tick;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         yield_reaper().await;
         wait_for_status(&db, active_session.id, PlaybackSessionStatus::Ended).await?;
         assert!(session_status(&db, active_session.id).await?.1.is_some());
@@ -449,12 +448,12 @@ mod tests {
         id: Id,
         status: PlaybackSessionStatus,
     ) -> std::result::Result<(), sqlx::Error> {
-        for _ in 0..10 {
+        for _ in 0..100 {
             let actual = session_status(db, id).await?;
             if PlaybackSessionStatus::parse(&actual.0) == Some(status) {
                 return Ok(());
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         let actual = session_status(db, id).await?;
