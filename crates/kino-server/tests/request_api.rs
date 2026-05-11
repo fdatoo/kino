@@ -880,10 +880,177 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     assert_eq!(fetched["subtitle_tracks"][0]["label"], "ENG");
     assert_eq!(fetched["subtitle_tracks"][0]["format"], "srt");
     assert_eq!(fetched["subtitle_tracks"][0]["provenance"], "text");
+    assert_eq!(fetched["subtitle_tracks"][0]["forced"], false);
     assert_eq!(fetched["subtitle_tracks"][1]["language"], "jpn");
     assert_eq!(fetched["subtitle_tracks"][1]["label"], "JPN (OCR)");
     assert_eq!(fetched["subtitle_tracks"][1]["format"], "json");
     assert_eq!(fetched["subtitle_tracks"][1]["provenance"], "ocr");
+    assert_eq!(fetched["subtitle_tracks"][1]["forced"], false);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_item_detail_includes_multiple_source_file_probe_tracks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let identity_id = identity(603);
+    let media_item_id = insert_tmdb_media_item(&db, identity_id).await?;
+    insert_catalog_title(&db, media_item_id, identity_id, "The Matrix").await?;
+    update_catalog_release_date(&db, media_item_id, "1999-03-31").await?;
+    insert_catalog_cast_member(&db, media_item_id, 0, "Keanu Reeves", "Neo").await?;
+    let main_path = std::path::PathBuf::from("/library/Movies/The Matrix/01-main.mkv");
+    let bonus_path = std::path::PathBuf::from("/library/Movies/The Matrix/02-bonus.mp4");
+    let main_source_file = insert_source_file(&db, media_item_id, &main_path).await?;
+    let bonus_source_file = insert_source_file(&db, media_item_id, &bonus_path).await?;
+    insert_source_file_probe(
+        &db,
+        main_source_file,
+        SourceFileProbeSeed {
+            container: "matroska",
+            video_codec: "h265",
+            video_width: 3840,
+            video_height: 2160,
+            video_hdr: Some("hdr10"),
+        },
+    )
+    .await?;
+    insert_source_file_audio_track(&db, main_source_file, 1, "truehd", Some("eng"), Some(8))
+        .await?;
+    insert_source_file_audio_track(&db, main_source_file, 2, "aac", Some("jpn"), Some(2)).await?;
+    insert_source_file_subtitle_track(&db, main_source_file, 3, "srt", "text", "eng", false)
+        .await?;
+    insert_source_file_subtitle_track(&db, main_source_file, 4, "json", "ocr", "jpn", true).await?;
+    insert_source_file_probe(
+        &db,
+        bonus_source_file,
+        SourceFileProbeSeed {
+            container: "mp4",
+            video_codec: "h264",
+            video_width: 1920,
+            video_height: 1080,
+            video_hdr: None,
+        },
+    )
+    .await?;
+    insert_source_file_audio_track(&db, bonus_source_file, 1, "aac", Some("eng"), Some(2)).await?;
+    insert_source_file_subtitle_track(&db, bonus_source_file, 2, "ass", "text", "spa", false)
+        .await?;
+    insert_subtitle_sidecar(
+        &db,
+        media_item_id,
+        "eng",
+        "srt",
+        "text",
+        3,
+        "/subtitles/matrix.eng.srt",
+    )
+    .await?;
+    let forced_sidecar = insert_subtitle_sidecar(
+        &db,
+        media_item_id,
+        "jpn",
+        "json",
+        "ocr",
+        4,
+        "/subtitles/matrix.jpn.json",
+    )
+    .await?;
+    mark_subtitle_sidecar_forced(&db, forced_sidecar).await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/v1/library/items/{media_item_id}"))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched: Value = response_json(response).await?;
+
+    assert_eq!(fetched["title"], "The Matrix");
+    assert_eq!(fetched["description"], "description");
+    assert_eq!(fetched["release_date"], "1999-03-31");
+    assert_eq!(fetched["year"], 1999);
+    assert_eq!(fetched["cast"][0]["name"], "Keanu Reeves");
+    assert_eq!(fetched["source_files"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        fetched["source_files"][0]["id"],
+        main_source_file.to_string()
+    );
+    assert_eq!(
+        fetched["source_files"][0]["path"],
+        main_path.display().to_string()
+    );
+    assert_eq!(fetched["source_files"][0]["probe"]["container"], "matroska");
+    assert_eq!(
+        fetched["source_files"][0]["probe"]["video"]["codec"],
+        "h265"
+    );
+    assert_eq!(
+        fetched["source_files"][0]["probe"]["video"]["resolution"],
+        "2160p"
+    );
+    assert_eq!(fetched["source_files"][0]["probe"]["video"]["hdr"], "hdr10");
+    assert_eq!(
+        fetched["source_files"][0]["audio_tracks"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        fetched["source_files"][0]["audio_tracks"][0]["language"],
+        "eng"
+    );
+    assert_eq!(fetched["source_files"][0]["audio_tracks"][0]["channels"], 8);
+    assert_eq!(
+        fetched["source_files"][0]["subtitle_tracks"][1]["provenance"],
+        "ocr"
+    );
+    assert_eq!(
+        fetched["source_files"][0]["subtitle_tracks"][1]["forced"],
+        true
+    );
+    assert_eq!(
+        fetched["source_files"][1]["id"],
+        bonus_source_file.to_string()
+    );
+    assert_eq!(
+        fetched["source_files"][1]["probe"]["video"]["resolution"],
+        "1080p"
+    );
+    assert_eq!(
+        fetched["source_files"][1]["subtitle_tracks"][0]["format"],
+        "ass"
+    );
+    assert_eq!(fetched["variants"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        fetched["variants"][0]["variant_id"],
+        main_source_file.to_string()
+    );
+    assert_eq!(fetched["variants"][0]["capabilities"]["codec"], "h265");
+    assert_eq!(
+        fetched["variants"][0]["capabilities"]["container"],
+        "matroska"
+    );
+    assert_eq!(
+        fetched["variants"][0]["capabilities"]["resolution"],
+        "2160p"
+    );
+    assert_eq!(fetched["variants"][0]["capabilities"]["hdr"], "hdr10");
+    assert_eq!(
+        fetched["variants"][0]["stream_url"],
+        format!("/api/v1/stream/sourcefile/{main_source_file}")
+    );
+    assert_eq!(fetched["variants"][1]["capabilities"]["codec"], "h264");
+    assert_eq!(fetched["variants"][1]["capabilities"]["container"], "mp4");
+    assert_eq!(fetched["subtitle_tracks"][0]["forced"], false);
+    assert_eq!(fetched["subtitle_tracks"][1]["provenance"], "ocr");
+    assert_eq!(fetched["subtitle_tracks"][1]["forced"], true);
 
     Ok(())
 }
@@ -1214,6 +1381,115 @@ async fn insert_source_file(
     Ok(id)
 }
 
+struct SourceFileProbeSeed<'a> {
+    container: &'a str,
+    video_codec: &'a str,
+    video_width: u32,
+    video_height: u32,
+    video_hdr: Option<&'a str>,
+}
+
+async fn insert_source_file_probe(
+    db: &kino_db::Db,
+    source_file_id: Id,
+    probe: SourceFileProbeSeed<'_>,
+) -> Result<(), sqlx::Error> {
+    let now = Timestamp::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO source_file_probes (
+            source_file_id,
+            container,
+            video_codec,
+            video_width,
+            video_height,
+            video_hdr,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(source_file_id)
+    .bind(probe.container)
+    .bind(probe.video_codec)
+    .bind(i64::from(probe.video_width))
+    .bind(i64::from(probe.video_height))
+    .bind(probe.video_hdr)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_source_file_audio_track(
+    db: &kino_db::Db,
+    source_file_id: Id,
+    track_index: u32,
+    codec: &str,
+    language: Option<&str>,
+    channels: Option<u32>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO source_file_audio_tracks (
+            source_file_id,
+            track_index,
+            codec,
+            language,
+            channels
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(source_file_id)
+    .bind(i64::from(track_index))
+    .bind(codec)
+    .bind(language)
+    .bind(channels.map(i64::from))
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_source_file_subtitle_track(
+    db: &kino_db::Db,
+    source_file_id: Id,
+    track_index: u32,
+    format: &str,
+    provenance: &str,
+    language: &str,
+    forced: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO source_file_subtitle_tracks (
+            source_file_id,
+            track_index,
+            format,
+            provenance,
+            language,
+            forced
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(source_file_id)
+    .bind(i64::from(track_index))
+    .bind(format)
+    .bind(provenance)
+    .bind(language)
+    .bind(if forced { 1_i64 } else { 0_i64 })
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
 async fn insert_subtitle_sidecar(
     db: &kino_db::Db,
     media_item_id: Id,
@@ -1255,6 +1531,15 @@ async fn insert_subtitle_sidecar(
     .await?;
 
     Ok(id)
+}
+
+async fn mark_subtitle_sidecar_forced(db: &kino_db::Db, id: Id) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE subtitle_sidecars SET forced = 1 WHERE id = ?1")
+        .bind(id)
+        .execute(db.write_pool())
+        .await?;
+
+    Ok(())
 }
 
 async fn insert_tmdb_media_item(
@@ -1350,6 +1635,49 @@ async fn insert_catalog_title(
     .bind(title)
     .bind(now)
     .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(())
+}
+
+async fn update_catalog_release_date(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    release_date: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE media_metadata_cache SET release_date = ?1 WHERE media_item_id = ?2")
+        .bind(release_date)
+        .bind(media_item_id)
+        .execute(db.write_pool())
+        .await?;
+
+    Ok(())
+}
+
+async fn insert_catalog_cast_member(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    position: u32,
+    name: &str,
+    character: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO media_metadata_cast_members (
+            media_item_id,
+            position,
+            name,
+            character,
+            profile_path
+        )
+        VALUES (?1, ?2, ?3, ?4, NULL)
+        "#,
+    )
+    .bind(media_item_id)
+    .bind(i64::from(position))
+    .bind(name)
+    .bind(character)
     .execute(db.write_pool())
     .await?;
 
