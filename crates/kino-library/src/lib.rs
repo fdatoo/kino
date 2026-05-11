@@ -652,7 +652,7 @@ impl CatalogListQuery {
 }
 
 /// One page of catalog media items.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct CatalogListPage {
     /// Media items in this page.
     pub items: Vec<CatalogMediaItem>,
@@ -661,7 +661,7 @@ pub struct CatalogListPage {
 }
 
 /// Catalog projection for one media item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct CatalogMediaItem {
     /// Media item id.
     pub id: Id,
@@ -1431,13 +1431,14 @@ pub struct LibraryScanMissingFile {
 }
 
 /// Persisted source-file row used for library reconciliation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct LibrarySourceFile {
     /// Source-file id.
     pub id: Id,
     /// Media item that owns this source file.
     pub media_item_id: Id,
     /// Canonical source path stored in the catalog.
+    #[schema(value_type = String)]
     pub path: PathBuf,
 }
 

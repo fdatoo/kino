@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CanonicalIdentityId, Id, Timestamp};
 
 /// User-facing media item kind stored in the catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaItemKind {
     /// A movie identified directly by a canonical identity.

@@ -29,6 +29,11 @@ canonical_transfer = "hard_link"
 # Address the server binds to. Optional. Defaults to 127.0.0.1:7777.
 listen = "127.0.0.1:7777"
 
+# Public base URL advertised in generated OpenAPI documents. Optional.
+# Defaults to http://127.0.0.1:8080.
+# Runtime override: KINO_SERVER__PUBLIC_BASE_URL.
+public_base_url = "http://127.0.0.1:8080"
+
 [tmdb]
 # TMDB v3 API key. Optional until request resolution is enabled.
 # Runtime override: KINO_TMDB__API_KEY.

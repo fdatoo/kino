@@ -103,6 +103,11 @@ pub struct ServerConfig {
     /// Address the server binds to. Defaults to `127.0.0.1:7777`.
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
+
+    /// Public base URL advertised in generated OpenAPI documents. Defaults to
+    /// `http://127.0.0.1:8080`.
+    #[serde(default = "default_public_base_url")]
+    pub public_base_url: String,
 }
 
 /// TMDB API client settings.
@@ -163,6 +168,10 @@ fn default_listen() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7777)
 }
 
+fn default_public_base_url() -> String {
+    "http://127.0.0.1:8080".into()
+}
+
 fn default_tmdb_max_requests_per_second() -> u32 {
     20
 }
@@ -179,6 +188,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+            public_base_url: default_public_base_url(),
         }
     }
 }
@@ -224,6 +234,16 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: io::Error,
+    },
+
+    /// The configured server settings are invalid.
+    #[error("invalid server config {field}: {source}")]
+    InvalidServerConfig {
+        /// Server config field.
+        field: &'static str,
+        /// Underlying parse error.
+        #[source]
+        source: url::ParseError,
     },
 
     /// The configured TMDB client settings are invalid.
@@ -315,10 +335,21 @@ impl Config {
     fn validate(self) -> Result<Self, ConfigError> {
         validate_library_root(&self.library_root)?;
         validate_database_path(&self.database_path)?;
+        validate_server_config(&self.server)?;
         validate_tmdb_config(&self.tmdb)?;
         validate_provider_configs(&self.providers)?;
         Ok(self)
     }
+}
+
+fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigError> {
+    url::Url::parse(&config.public_base_url).map_err(|source| {
+        ConfigError::InvalidServerConfig {
+            field: "public_base_url",
+            source,
+        }
+    })?;
+    Ok(())
 }
 
 fn validate_tmdb_config(config: &TmdbConfig) -> Result<(), ConfigError> {
@@ -516,6 +547,7 @@ mod tests {
 
                 [server]
                 listen = "0.0.0.0:9000"
+                public_base_url = "https://kino.example.test"
 
                 [tmdb]
                 api_key = "test-api-key"
@@ -576,6 +608,7 @@ mod tests {
                 cfg.server.listen,
                 "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
             );
+            assert_eq!(cfg.server.public_base_url, "https://kino.example.test");
             Ok(())
         });
     }
@@ -593,6 +626,7 @@ mod tests {
                 cfg.server.listen,
                 "127.0.0.1:7777".parse::<SocketAddr>().unwrap()
             );
+            assert_eq!(cfg.server.public_base_url, "http://127.0.0.1:8080");
             assert_eq!(cfg.tmdb.api_key, None);
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
             assert_eq!(
@@ -671,6 +705,47 @@ mod tests {
             assert_eq!(
                 cfg.server.listen,
                 "0.0.0.0:8080".parse::<SocketAddr>().unwrap()
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_server_public_base_url() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_SERVER__PUBLIC_BASE_URL", "https://kino.example.test");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.server.public_base_url, "https://kino.example.test");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn invalid_server_public_base_url_is_rejected() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [server]
+                        public_base_url = "not a url"
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidServerConfig { .. }),
+                "got: {err:?}"
             );
             Ok(())
         });

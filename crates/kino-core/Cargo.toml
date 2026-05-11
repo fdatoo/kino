@@ -16,6 +16,8 @@ figment = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sqlx = { workspace = true }
+url = { workspace = true }
+utoipa = { workspace = true }
 
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
