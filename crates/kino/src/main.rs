@@ -110,6 +110,7 @@ mod tests {
             library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
@@ -124,6 +125,7 @@ mod tests {
             library: Default::default(),
             server: ServerConfig::default(),
             tmdb: Default::default(),
+            ocr: Default::default(),
             providers: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
@@ -152,6 +154,7 @@ mod tests {
                 (13, String::from("core catalog schemas")),
                 (14, String::from("users")),
                 (15, String::from("device tokens")),
+                (18, String::from("subtitle provenance")),
             ]
         );
 

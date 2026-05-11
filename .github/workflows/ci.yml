@@ -18,10 +18,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg tesseract-ocr
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4

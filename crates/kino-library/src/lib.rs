@@ -9,6 +9,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    time::Duration,
 };
 
 use kino_core::{
@@ -18,6 +19,9 @@ use kino_core::{
 use kino_db::Db;
 use serde::Serialize;
 use sqlx::Row;
+
+pub mod subtitle_image_extraction;
+pub mod subtitle_ocr;
 
 /// Errors produced by `kino-library`.
 #[derive(Debug, thiserror::Error)]
@@ -144,10 +148,53 @@ pub enum Error {
     DuplicateSubtitleTrack {
         /// Normalized language.
         language: String,
-        /// Text subtitle format.
+        /// Persisted subtitle format.
         format: SubtitleFormat,
         /// Probed subtitle stream index.
         track_index: u32,
+    },
+
+    /// An OCR command could not be started or waited on.
+    #[error("ocr command {binary_path} failed to run: {source}", binary_path = .binary_path.display())]
+    OcrCommandIo {
+        /// Tesseract binary path.
+        binary_path: PathBuf,
+        /// Underlying process error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// An OCR command exited unsuccessfully.
+    #[error("ocr command {binary_path} exited with status {status}: {stderr}", binary_path = .binary_path.display())]
+    OcrCommandFailed {
+        /// Tesseract binary path.
+        binary_path: PathBuf,
+        /// Process exit status.
+        status: String,
+        /// Standard error output.
+        stderr: String,
+    },
+
+    /// OCR output was not valid UTF-8.
+    #[error("ocr output is not utf-8: {0}")]
+    OcrUtf8(#[from] std::string::FromUtf8Error),
+
+    /// OCR TSV output was malformed.
+    #[error("ocr tsv is invalid: {reason}")]
+    InvalidOcrTsv {
+        /// Human-readable parse failure.
+        reason: String,
+    },
+
+    /// OCR TSV output contained an invalid scalar field.
+    #[error("ocr tsv field {field} has invalid value {value}: {reason}")]
+    InvalidOcrTsvField {
+        /// TSV field name.
+        field: &'static str,
+        /// Invalid field value.
+        value: String,
+        /// Underlying parse error.
+        reason: String,
     },
 
     /// A media item kind read from storage is not recognized.
@@ -1431,13 +1478,15 @@ impl ProbedSubtitleFormat {
     }
 }
 
-/// Text subtitle formats persisted as sidecars.
+/// Subtitle formats persisted as sidecars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubtitleFormat {
     /// SubRip text subtitles.
     Srt,
     /// Advanced SubStation Alpha text subtitles.
     Ass,
+    /// JSON sidecar containing OCR cues and confidence metadata.
+    Json,
 }
 
 impl SubtitleFormat {
@@ -1446,6 +1495,7 @@ impl SubtitleFormat {
         match self {
             Self::Srt => "srt",
             Self::Ass => "ass",
+            Self::Json => "json",
         }
     }
 
@@ -1456,6 +1506,31 @@ impl SubtitleFormat {
 }
 
 impl fmt::Display for SubtitleFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a subtitle sidecar's text was derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubtitleProvenance {
+    /// Text came directly from a text subtitle stream.
+    Text,
+    /// Text was derived from image subtitle frames through OCR.
+    Ocr,
+}
+
+impl SubtitleProvenance {
+    /// Database representation for this sidecar provenance.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Ocr => "ocr",
+        }
+    }
+}
+
+impl fmt::Display for SubtitleProvenance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -1502,6 +1577,58 @@ pub struct SubtitleExtractionInput {
     pub tracks: Vec<ProbedSubtitleTrack>,
 }
 
+/// OCR-derived subtitle stream data ready for sidecar persistence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrSubtitleTrack {
+    /// Probed subtitle stream index in the source file.
+    pub track_index: u32,
+    /// Language reported for the subtitle stream.
+    pub language: String,
+    /// Time-coded cues recognized from extracted image subtitle frames.
+    pub cues: Vec<subtitle_ocr::OcrCue>,
+}
+
+impl OcrSubtitleTrack {
+    /// Construct an OCR-derived subtitle track.
+    pub fn new(
+        track_index: u32,
+        language: impl Into<String>,
+        cues: Vec<subtitle_ocr::OcrCue>,
+    ) -> Self {
+        Self {
+            track_index,
+            language: language.into(),
+            cues,
+        }
+    }
+}
+
+/// Input for persisting OCR-derived subtitle sidecars for one media item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrSubtitleExtractionInput {
+    /// Media item that owns the subtitle sidecars.
+    pub media_item_id: Id,
+    /// Directory where sidecars should be written.
+    pub sidecar_dir: PathBuf,
+    /// OCR-derived subtitle tracks.
+    pub tracks: Vec<OcrSubtitleTrack>,
+}
+
+impl OcrSubtitleExtractionInput {
+    /// Construct OCR-derived subtitle extraction input.
+    pub fn new(
+        media_item_id: Id,
+        sidecar_dir: impl Into<PathBuf>,
+        tracks: Vec<OcrSubtitleTrack>,
+    ) -> Self {
+        Self {
+            media_item_id,
+            sidecar_dir: sidecar_dir.into(),
+            tracks,
+        }
+    }
+}
+
 impl SubtitleExtractionInput {
     /// Construct subtitle extraction input.
     pub fn new(
@@ -1526,8 +1653,10 @@ pub struct SubtitleSidecar {
     pub media_item_id: Id,
     /// Normalized language for query and display.
     pub language: String,
-    /// Text subtitle format.
+    /// Persisted subtitle format.
     pub format: SubtitleFormat,
+    /// How the subtitle text was derived.
+    pub provenance: SubtitleProvenance,
     /// Probed subtitle stream index in the source file.
     pub track_index: u32,
     /// Filesystem path to the sidecar file.
@@ -1604,6 +1733,7 @@ impl SubtitleService {
                 media_item_id: input.media_item_id,
                 language,
                 format,
+                provenance: SubtitleProvenance::Text,
                 track_index: track.track_index,
                 path,
                 created_at: now,
@@ -1617,18 +1747,103 @@ impl SubtitleService {
                     media_item_id,
                     language,
                     format,
+                    provenance,
                     track_index,
                     path,
                     created_at,
                     updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 "#,
             )
             .bind(sidecar.id)
             .bind(sidecar.media_item_id)
             .bind(&sidecar.language)
             .bind(sidecar.format.as_str())
+            .bind(sidecar.provenance.as_str())
+            .bind(i64::from(sidecar.track_index))
+            .bind(path_text)
+            .bind(sidecar.created_at)
+            .bind(sidecar.updated_at)
+            .execute(&mut *tx)
+            .await?;
+
+            sidecars.push(sidecar);
+        }
+
+        tx.commit().await?;
+        let languages = self.subtitle_languages(input.media_item_id).await?;
+
+        Ok(SubtitleExtractionResult {
+            sidecars,
+            languages,
+        })
+    }
+
+    /// Write OCR-derived subtitle tracks to JSON sidecars and index them by language.
+    pub async fn extract_ocr_subtitles(
+        &self,
+        input: OcrSubtitleExtractionInput,
+    ) -> Result<SubtitleExtractionResult> {
+        create_dir_all(&input.sidecar_dir).await?;
+
+        let mut seen = HashSet::new();
+        let mut sidecars = Vec::new();
+        let now = Timestamp::now();
+        let mut tx = self.db.write_pool().begin().await?;
+
+        for track in input.tracks {
+            let language = normalize_language(&track.language, track.track_index)?;
+            let format = SubtitleFormat::Json;
+            if !seen.insert((language.clone(), format, track.track_index)) {
+                return Err(Error::DuplicateSubtitleTrack {
+                    language,
+                    format,
+                    track_index: track.track_index,
+                });
+            }
+
+            let path = input.sidecar_dir.join(sidecar_file_name(
+                input.media_item_id,
+                &language,
+                track.track_index,
+                format,
+            ));
+            write_ocr_sidecar(&path, &track.cues).await?;
+            let path_text = path_to_db_text(&path)?;
+            let sidecar = SubtitleSidecar {
+                id: Id::new(),
+                media_item_id: input.media_item_id,
+                language,
+                format,
+                provenance: SubtitleProvenance::Ocr,
+                track_index: track.track_index,
+                path,
+                created_at: now,
+                updated_at: now,
+            };
+
+            sqlx::query(
+                r#"
+                INSERT INTO subtitle_sidecars (
+                    id,
+                    media_item_id,
+                    language,
+                    format,
+                    provenance,
+                    track_index,
+                    path,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )
+            .bind(sidecar.id)
+            .bind(sidecar.media_item_id)
+            .bind(&sidecar.language)
+            .bind(sidecar.format.as_str())
+            .bind(sidecar.provenance.as_str())
             .bind(i64::from(sidecar.track_index))
             .bind(path_text)
             .bind(sidecar.created_at)
@@ -1766,6 +1981,21 @@ async fn write_sidecar(path: &Path, text: &str) -> Result<()> {
         })
 }
 
+async fn write_ocr_sidecar(path: &Path, cues: &[subtitle_ocr::OcrCue]) -> Result<()> {
+    let sidecar = OcrSubtitleSidecar {
+        provenance: SubtitleProvenance::Ocr.as_str(),
+        cues: cues.iter().map(OcrSubtitleCue::from).collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar)?;
+
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 #[derive(Serialize)]
 struct MetadataSidecar<'a> {
     provider: &'static str,
@@ -1778,6 +2008,31 @@ struct MetadataSidecar<'a> {
     backdrop_path: String,
     logo_path: Option<String>,
     cast: &'a [MetadataCastMember],
+}
+
+#[derive(Serialize)]
+struct OcrSubtitleSidecar {
+    provenance: &'static str,
+    cues: Vec<OcrSubtitleCue>,
+}
+
+#[derive(Serialize)]
+struct OcrSubtitleCue {
+    start: String,
+    end: String,
+    text: String,
+    confidence: f32,
+}
+
+impl From<&subtitle_ocr::OcrCue> for OcrSubtitleCue {
+    fn from(cue: &subtitle_ocr::OcrCue) -> Self {
+        Self {
+            start: format_duration(cue.start),
+            end: format_duration(cue.end),
+            text: cue.text.clone(),
+            confidence: cue.confidence,
+        }
+    }
 }
 
 fn source_extension(path: &Path) -> Result<&str> {
@@ -1941,6 +2196,16 @@ fn sidecar_file_name(
         "{media_item_id}.{language}.{track_index}.{}",
         format.extension()
     )
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_millis = duration.as_millis();
+    let hours = total_millis / 3_600_000;
+    let minutes = (total_millis % 3_600_000) / 60_000;
+    let seconds = (total_millis % 60_000) / 1_000;
+    let millis = total_millis % 1_000;
+
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 fn path_to_db_text(path: &Path) -> Result<String> {
@@ -2748,13 +3013,64 @@ mod tests {
         assert_eq!(result.sidecars.len(), 2);
         assert_eq!(result.sidecars[0].language, "eng");
         assert_eq!(result.sidecars[0].format, SubtitleFormat::Srt);
+        assert_eq!(result.sidecars[0].provenance, SubtitleProvenance::Text);
         assert_eq!(result.sidecars[1].language, "jpn");
         assert_eq!(result.sidecars[1].format, SubtitleFormat::Ass);
+        assert_eq!(result.sidecars[1].provenance, SubtitleProvenance::Text);
 
         let srt = tokio::fs::read_to_string(&result.sidecars[0].path).await?;
         let ass = tokio::fs::read_to_string(&result.sidecars[1].path).await?;
         assert_eq!(srt, "1\n00:00:01,000 --> 00:00:02,000\nHello\n");
         assert_eq!(ass, "[Script Info]\nTitle: Kino\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extracts_ocr_subtitles_to_json_and_indexes_provenance()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let media_item_id = insert_personal_media_item(&db).await?;
+        let sidecar_dir = tempfile::tempdir()?;
+        let service = SubtitleService::new(db.clone());
+
+        let result = service
+            .extract_ocr_subtitles(OcrSubtitleExtractionInput::new(
+                media_item_id,
+                sidecar_dir.path(),
+                vec![OcrSubtitleTrack::new(
+                    4,
+                    "ENG",
+                    vec![subtitle_ocr::OcrCue {
+                        start: Duration::from_millis(1_250),
+                        end: Duration::from_millis(2_750),
+                        text: String::from("HELLO KINO"),
+                        confidence: 93.5,
+                    }],
+                )],
+            ))
+            .await?;
+
+        assert_eq!(result.languages, vec!["eng"]);
+        assert_eq!(result.sidecars.len(), 1);
+        assert_eq!(result.sidecars[0].format, SubtitleFormat::Json);
+        assert_eq!(result.sidecars[0].provenance, SubtitleProvenance::Ocr);
+
+        let json = tokio::fs::read_to_string(&result.sidecars[0].path).await?;
+        let sidecar: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(sidecar["provenance"], "ocr");
+        assert_eq!(sidecar["cues"][0]["start"], "00:00:01.250");
+        assert_eq!(sidecar["cues"][0]["end"], "00:00:02.750");
+        assert_eq!(sidecar["cues"][0]["text"], "HELLO KINO");
+        assert_eq!(sidecar["cues"][0]["confidence"], 93.5);
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT format, provenance FROM subtitle_sidecars WHERE media_item_id = ?1",
+        )
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+        assert_eq!(row, (String::from("json"), String::from("ocr")));
 
         Ok(())
     }
