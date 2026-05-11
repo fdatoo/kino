@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[allow(dead_code)]
 pub(crate) async fn issued_token(db: &kino_db::Db) -> Result<String, sqlx::Error> {
     let (plaintext, _) = issued_token_with_id(db).await?;
     Ok(plaintext)

@@ -98,10 +98,11 @@ pub(crate) async fn record_progress(
     sqlx::query(
         r#"
         UPDATE playback_sessions
-        SET last_seen_at = ?1
+        SET last_seen_at = ?1,
+            status = 'active'
         WHERE user_id = ?2
             AND media_item_id = ?3
-            AND status = 'active'
+            AND status IN ('active', 'idle')
         "#,
     )
     .bind(updated_at)

@@ -16,6 +16,7 @@ mod openapi;
 mod playback;
 mod request;
 pub mod session_reaper;
+pub mod session_service;
 mod stream;
 mod token;
 
