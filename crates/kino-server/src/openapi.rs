@@ -6,7 +6,9 @@ use utoipa::openapi::server::Server;
 #[openapi(
     paths(
         crate::admin_config::get_config,
+        crate::playback::mark_watched,
         crate::playback::record_progress,
+        crate::playback::unmark_watched,
         crate::request::list_catalog_items,
         crate::stream::source_file,
         crate::request::get_catalog_item_image,

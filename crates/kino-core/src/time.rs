@@ -19,6 +19,9 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 pub struct Timestamp(OffsetDateTime);
 
 impl Timestamp {
+    /// Unix epoch timestamp in UTC.
+    pub const UNIX_EPOCH: Self = Self(OffsetDateTime::UNIX_EPOCH);
+
     /// The current UTC time.
     pub fn now() -> Self {
         Self(OffsetDateTime::now_utc())

@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{Request as HttpRequest, StatusCode, header},
 };
-use kino_core::{Id, PlaybackSession, Timestamp, user::SEEDED_USER_ID};
+use kino_core::{Id, PlaybackSession, Timestamp, WatchedSource, user::SEEDED_USER_ID};
 use tower::util::ServiceExt;
 
 mod common;
@@ -142,6 +142,189 @@ async fn playback_progress_heartbeat_requires_auth() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[tokio::test]
+async fn playback_progress_heartbeat_at_half_does_not_mark_watched()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    insert_source_file(&db, media_item_id, 1_000).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 500).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    assert!(watched_row(&db, media_item_id).await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_heartbeat_at_90_percent_marks_watched_auto()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    insert_source_file(&db, media_item_id, 1_000).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 900).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    let row = watched_row(&db, media_item_id)
+        .await?
+        .unwrap_or_else(|| panic!("watched row should exist"));
+    assert_eq!(row.source, WatchedSource::Auto);
+    assert!(!row.unmarked);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_heartbeat_below_90_percent_does_not_mark_watched()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    insert_source_file(&db, media_item_id, 1_000).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 899).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    assert!(watched_row(&db, media_item_id).await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_heartbeat_uses_max_source_file_duration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    insert_source_file(&db, media_item_id, 100).await?;
+    insert_source_file(&db, media_item_id, 1_000).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 500).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    assert!(watched_row(&db, media_item_id).await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_auto_mark_fires_once_across_repeated_playthrough_heartbeats()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    insert_source_file(&db, media_item_id, 1_000).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 901).await?,
+        StatusCode::NO_CONTENT
+    );
+    let first = watched_row(&db, media_item_id)
+        .await?
+        .unwrap_or_else(|| panic!("watched row should exist"));
+
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 100).await?,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 950).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    let second = watched_row(&db, media_item_id)
+        .await?
+        .unwrap_or_else(|| panic!("watched row should still exist"));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
+    )
+    .bind(SEEDED_USER_ID)
+    .bind(media_item_id)
+    .fetch_one(db.read_pool())
+    .await?;
+    assert_eq!(count, 1);
+    assert_eq!(second.watched_at, first.watched_at);
+    assert_eq!(second.source, WatchedSource::Auto);
+    assert!(!second.unmarked);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_watched_post_marks_manual_and_clears_tombstone()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        delete_watched(&app, &token, media_item_id).await?,
+        StatusCode::NO_CONTENT
+    );
+    let tombstone = watched_row(&db, media_item_id)
+        .await?
+        .unwrap_or_else(|| panic!("manual unmark tombstone should exist"));
+    assert!(tombstone.unmarked);
+
+    assert_eq!(
+        post_watched(&app, &token, media_item_id).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    let row = watched_row(&db, media_item_id)
+        .await?
+        .unwrap_or_else(|| panic!("watched row should exist"));
+    assert_eq!(row.source, WatchedSource::Manual);
+    assert!(!row.unmarked);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_heartbeat_after_manual_unmark_does_not_mark_watched()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let token = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    insert_source_file(&db, media_item_id, 1_000).await?;
+    let app = kino_server::router(db.clone());
+
+    assert_eq!(
+        delete_watched(&app, &token, media_item_id).await?,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post_progress(&app, &token, media_item_id, 950).await?,
+        StatusCode::NO_CONTENT
+    );
+
+    let row = watched_row(&db, media_item_id)
+        .await?
+        .unwrap_or_else(|| panic!("manual unmark tombstone should remain"));
+    assert_eq!(row.source, WatchedSource::Manual);
+    assert!(row.unmarked);
+
+    Ok(())
+}
+
 async fn post_progress(
     app: &axum::Router,
     auth_token: &str,
@@ -157,6 +340,44 @@ async fn post_progress(
                 .bearer(auth_token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(progress_body(media_item_id, position_seconds))?,
+        )
+        .await?;
+
+    Ok(response.status())
+}
+
+async fn post_watched(
+    app: &axum::Router,
+    auth_token: &str,
+    media_item_id: Id,
+) -> Result<StatusCode, Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/playback/watched/{media_item_id}"))
+                .bearer(auth_token)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    Ok(response.status())
+}
+
+async fn delete_watched(
+    app: &axum::Router,
+    auth_token: &str,
+    media_item_id: Id,
+) -> Result<StatusCode, Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/playback/watched/{media_item_id}"))
+                .bearer(auth_token)
+                .body(Body::empty())?,
         )
         .await?;
 
@@ -186,6 +407,40 @@ async fn insert_personal_media_item(db: &kino_db::Db) -> Result<Id, sqlx::Error>
         "#,
     )
     .bind(id)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
+}
+
+async fn insert_source_file(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    probe_duration_seconds: i64,
+) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+    let path = format!("/srv/media/{id}.mkv");
+
+    sqlx::query(
+        r#"
+        INSERT INTO source_files (
+            id,
+            media_item_id,
+            path,
+            probe_duration_seconds,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(id)
+    .bind(media_item_id)
+    .bind(path)
+    .bind(probe_duration_seconds)
     .bind(now)
     .bind(now)
     .execute(db.write_pool())
@@ -240,6 +495,35 @@ async fn insert_active_session(
     Ok(session.id)
 }
 
+async fn watched_row(
+    db: &kino_db::Db,
+    media_item_id: Id,
+) -> Result<Option<WatchedRow>, sqlx::Error> {
+    let row: Option<(Timestamp, String, bool)> = sqlx::query_as(
+        r#"
+        SELECT watched_at, source, unmarked
+        FROM watched
+        WHERE user_id = ?1 AND media_item_id = ?2
+        "#,
+    )
+    .bind(SEEDED_USER_ID)
+    .bind(media_item_id)
+    .fetch_optional(db.read_pool())
+    .await?;
+
+    Ok(row.map(|(watched_at, source, unmarked)| {
+        let Some(source) = WatchedSource::parse(&source) else {
+            panic!("invalid watched source in test database");
+        };
+
+        WatchedRow {
+            watched_at,
+            source,
+            unmarked,
+        }
+    }))
+}
+
 async fn playback_progress(
     db: &kino_db::Db,
     media_item_id: Id,
@@ -267,4 +551,10 @@ struct PlaybackProgressRow {
     position_seconds: i64,
     updated_at: Timestamp,
     source_device_token_id: Option<Id>,
+}
+
+struct WatchedRow {
+    watched_at: Timestamp,
+    source: WatchedSource,
+    unmarked: bool,
 }

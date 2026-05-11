@@ -469,6 +469,7 @@ mod tests {
                 (18, String::from("subtitle provenance")),
                 (19, String::from("catalog fts")),
                 (20, String::from("metadata artwork")),
+                (21, String::from("watched transitions")),
             ]
         );
 
@@ -878,47 +879,48 @@ mod tests {
                 user_id,
                 media_item_id,
                 watched_at,
-                source
+                source,
+                unmarked
             )
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES (?1, ?2, ?3, ?4, ?5)
             "#,
         )
         .bind(watched.user_id)
         .bind(watched.media_item_id)
         .bind(watched.watched_at)
         .bind(watched.source.as_str())
+        .bind(watched.unmarked)
         .execute(db.write_pool())
         .await?;
 
-        let inserted_source: String = sqlx::query_scalar(
-            "SELECT source FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
+        let inserted: (String, bool) = sqlx::query_as(
+            "SELECT source, unmarked FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
         )
         .bind(SEEDED_USER_ID)
         .bind(media_item_id)
         .fetch_one(db.read_pool())
         .await?;
-        assert_eq!(
-            WatchedSource::parse(&inserted_source),
-            Some(WatchedSource::Auto)
-        );
+        assert_eq!(WatchedSource::parse(&inserted.0), Some(WatchedSource::Auto));
+        assert!(!inserted.1);
 
         let watched_at = Timestamp::now();
         sqlx::query(
             r#"
             UPDATE watched
-            SET watched_at = ?1, source = ?2
-            WHERE user_id = ?3 AND media_item_id = ?4
+            SET watched_at = ?1, source = ?2, unmarked = ?3
+            WHERE user_id = ?4 AND media_item_id = ?5
             "#,
         )
         .bind(watched_at)
         .bind(WatchedSource::Manual.as_str())
+        .bind(false)
         .bind(SEEDED_USER_ID)
         .bind(media_item_id)
         .execute(db.write_pool())
         .await?;
 
-        let updated: (Timestamp, String) = sqlx::query_as(
-            "SELECT watched_at, source FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
+        let updated: (Timestamp, String, bool) = sqlx::query_as(
+            "SELECT watched_at, source, unmarked FROM watched WHERE user_id = ?1 AND media_item_id = ?2",
         )
         .bind(SEEDED_USER_ID)
         .bind(media_item_id)
@@ -929,6 +931,7 @@ mod tests {
             WatchedSource::parse(&updated.1),
             Some(WatchedSource::Manual)
         );
+        assert!(!updated.2);
 
         sqlx::query("DELETE FROM watched WHERE user_id = ?1 AND media_item_id = ?2")
             .bind(SEEDED_USER_ID)
@@ -978,7 +981,7 @@ mod tests {
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
         let migrator = test_migrator_with_embedded(
-            21,
+            22,
             "test migration",
             "CREATE TABLE migration_runner_test (id INTEGER PRIMARY KEY)",
         );
@@ -993,7 +996,7 @@ mod tests {
         assert_eq!(table_name, "migration_runner_test");
 
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 21")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 22")
                 .fetch_one(db.write_pool())
                 .await?;
         assert_eq!(recorded, 1);
@@ -1008,22 +1011,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let config = config(dir.path().join("kino.db"));
         let db = super::Db::open(&config).await?;
-        let migrator = test_migrator_with_embedded(21, "broken", "CREATE TABLE");
+        let migrator = test_migrator_with_embedded(22, "broken", "CREATE TABLE");
 
         let err = match super::run_migrations(db.write_pool(), &migrator).await {
             Ok(()) => panic!("broken migration was accepted"),
             Err(err) => err,
         };
         let recorded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 21")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 22")
                 .fetch_one(db.write_pool())
                 .await?;
 
         assert!(matches!(
             err,
-            super::Error::MigrationFailed { version: 21, .. }
+            super::Error::MigrationFailed { version: 22, .. }
         ));
-        assert!(err.to_string().contains("database migration 21 failed"));
+        assert!(err.to_string().contains("database migration 22 failed"));
         assert_eq!(recorded, 0);
 
         db.close().await;
@@ -1063,6 +1066,7 @@ mod tests {
                 (18, String::from("subtitle provenance")),
                 (19, String::from("catalog fts")),
                 (20, String::from("metadata artwork")),
+                (21, String::from("watched transitions")),
             ]
         );
 
