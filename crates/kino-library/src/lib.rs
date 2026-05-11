@@ -7,9 +7,12 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
+    io,
     path::{Path, PathBuf},
     pin::Pin,
 };
+
+pub mod subtitle_image_extraction;
 
 use kino_core::{
     CanonicalIdentityId, CanonicalIdentityProvider, CanonicalLayoutTransfer, Config, Id,
@@ -18,6 +21,13 @@ use kino_core::{
 use kino_db::Db;
 use serde::Serialize;
 use sqlx::Row;
+
+pub use subtitle_image_extraction::{
+    DEFAULT_FFMPEG_PROGRAM, DEFAULT_FFPROBE_PROGRAM, FfmpegImageSubtitleExtractor,
+    ImageSubtitleExtraction, ImageSubtitleExtractionFuture, ImageSubtitleExtractionInput,
+    ImageSubtitleFrame, ProbeSubtitleKind, default_subtitle_staging_dir,
+    image_subtitle_track_output_dir,
+};
 
 /// Errors produced by `kino-library`.
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +147,30 @@ pub enum Error {
     EmptySubtitleText {
         /// Probed subtitle stream index.
         track_index: u32,
+    },
+
+    /// A requested image subtitle stream is not present in the source file.
+    #[error("subtitle track {stream_index} is missing")]
+    SubtitleTrackMissing {
+        /// Probed subtitle stream index.
+        stream_index: u32,
+    },
+
+    /// Image subtitle extraction failed while running ffmpeg or reading its output.
+    #[error("subtitle extraction failed for track {stream_index}: {source}")]
+    SubtitleExtractionFailed {
+        /// Probed subtitle stream index.
+        stream_index: u32,
+        /// Underlying process or output error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Image subtitle extraction was requested for a non-image subtitle format.
+    #[error("subtitle extraction unsupported for format {kind}")]
+    SubtitleExtractionUnsupportedFormat {
+        /// Unsupported subtitle classification.
+        kind: ProbeSubtitleKind,
     },
 
     /// A single extraction request included the same text track more than once.

@@ -28,6 +28,7 @@ time = { version = "0.3", features = ["serde-well-known", "macros"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
+sha2 = "0.10"
 tempfile = "3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "sqlite", "migrate"] }
 url = "2"
