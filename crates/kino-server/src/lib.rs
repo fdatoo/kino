@@ -8,7 +8,9 @@ use kino_db::Db;
 
 pub mod auth;
 mod openapi;
+mod playback;
 mod request;
+pub mod session_reaper;
 mod stream;
 mod token;
 
@@ -52,7 +54,8 @@ pub fn router_with_library_root_and_public_base_url(
     let protected_api = Router::new()
         .merge(request::router(db.clone(), library_root.into()))
         .merge(stream::router(db.clone()))
-        .merge(token::router(db))
+        .merge(token::router(db.clone()))
+        .merge(playback::router(db))
         .route_layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_auth,

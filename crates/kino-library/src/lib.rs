@@ -656,6 +656,8 @@ impl MetadataService {
 pub struct CatalogListQuery {
     /// Optional media kind filter.
     pub media_kind: Option<MediaItemKind>,
+    /// Optional full-text search across metadata title and cast names.
+    pub search: Option<String>,
     /// Optional case-insensitive metadata title substring filter.
     pub title_contains: Option<String>,
     /// Optional filter for items with or without at least one source file.
@@ -675,6 +677,12 @@ impl CatalogListQuery {
     /// Filter by media item kind.
     pub const fn with_media_kind(mut self, media_kind: MediaItemKind) -> Self {
         self.media_kind = Some(media_kind);
+        self
+    }
+
+    /// Search cached metadata title and cast names.
+    pub fn with_search(mut self, search: impl Into<String>) -> Self {
+        self.search = Some(search.into());
         self
     }
 
@@ -861,6 +869,8 @@ impl CatalogService {
         limit: u32,
         offset: u64,
     ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        let search = query.search.as_deref().and_then(fts_prefix_query);
+        let has_search = search.is_some();
         let mut builder = sqlx::QueryBuilder::new(
             r#"
             SELECT
@@ -873,6 +883,20 @@ impl CatalogService {
                 media_items.updated_at,
                 media_metadata_cache.title
             FROM media_items
+            "#,
+        );
+
+        if has_search {
+            builder.push(
+                r#"
+                JOIN media_items_fts
+                    ON media_items_fts.rowid = media_items.rowid
+                "#,
+            );
+        }
+
+        builder.push(
+            r#"
             LEFT JOIN media_metadata_cache
                 ON media_metadata_cache.media_item_id = media_items.id
             WHERE 1 = 1
@@ -882,6 +906,11 @@ impl CatalogService {
         if let Some(media_kind) = query.media_kind {
             builder.push(" AND media_items.media_kind = ");
             builder.push_bind(media_kind.as_str());
+        }
+
+        if let Some(search) = search {
+            builder.push(" AND media_items_fts MATCH ");
+            builder.push_bind(search);
         }
 
         if let Some(title_contains) = query
@@ -919,7 +948,11 @@ impl CatalogService {
             }
         }
 
-        builder.push(" ORDER BY media_items.created_at, media_items.id LIMIT ");
+        if has_search {
+            builder.push(" ORDER BY bm25(media_items_fts, 8.0, 1.0), media_items.created_at, media_items.id LIMIT ");
+        } else {
+            builder.push(" ORDER BY media_items.created_at, media_items.id LIMIT ");
+        }
         builder.push_bind(i64::from(limit));
         builder.push(" OFFSET ");
         builder.push_bind(
@@ -2416,6 +2449,23 @@ fn like_contains_pattern(value: &str) -> String {
     pattern
 }
 
+fn fts_prefix_query(value: &str) -> Option<String> {
+    let mut query = String::new();
+    for token in value
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push('"');
+        query.push_str(token);
+        query.push_str("\"*");
+    }
+
+    if query.is_empty() { None } else { Some(query) }
+}
+
 fn catalog_media_item_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogMediaItem> {
     let media_kind: String = row.try_get("media_kind")?;
     Ok(CatalogMediaItem {
@@ -2904,6 +2954,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_search_matches_titles_and_cast_with_prefix_and_diacritics()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let matrix_identity = movie_identity(603);
+        let cafe_identity = movie_identity(110);
+        let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
+        let cafe = insert_tmdb_media_item(&db, cafe_identity).await?;
+        insert_catalog_title(&db, matrix, matrix_identity, "The Matrix").await?;
+        insert_catalog_title(&db, cafe, cafe_identity, "Café Society").await?;
+        insert_catalog_cast_member(&db, matrix, 0, "Keanu Reeves").await?;
+        insert_catalog_cast_member(&db, cafe, 0, "Matrix Runner").await?;
+        let service = CatalogService::new(db);
+
+        let partial_title = service
+            .list(CatalogListQuery::new().with_search("matr"))
+            .await?;
+        assert_eq!(partial_title.items.len(), 2);
+        assert_eq!(partial_title.items[0].id, matrix);
+
+        let folded = service
+            .list(CatalogListQuery::new().with_search("cafe"))
+            .await?;
+        assert_eq!(folded.items.len(), 1);
+        assert_eq!(folded.items[0].id, cafe);
+
+        let empty = service
+            .list(CatalogListQuery::new().with_search("zzzz"))
+            .await?;
+        assert!(empty.items.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_search_tracks_metadata_updates()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let identity = movie_identity(111);
+        let item = insert_tmdb_media_item(&db, identity).await?;
+        insert_catalog_title(&db, item, identity, "Old Title").await?;
+        insert_catalog_cast_member(&db, item, 0, "Old Actor").await?;
+        let service = CatalogService::new(db.clone());
+
+        sqlx::query("UPDATE media_metadata_cache SET title = 'New Title' WHERE media_item_id = ?1")
+            .bind(item)
+            .execute(db.write_pool())
+            .await?;
+        sqlx::query(
+            "UPDATE media_metadata_cast_members SET name = 'New Actor' WHERE media_item_id = ?1",
+        )
+        .bind(item)
+        .execute(db.write_pool())
+        .await?;
+
+        let stale = service
+            .list(CatalogListQuery::new().with_search("old"))
+            .await?;
+        assert!(stale.items.is_empty());
+
+        let title = service
+            .list(CatalogListQuery::new().with_search("new tit"))
+            .await?;
+        assert_eq!(
+            title.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![item]
+        );
+
+        let cast = service
+            .list(CatalogListQuery::new().with_search("actor"))
+            .await?;
+        assert_eq!(
+            cast.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![item]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn register_transcode_output_persists_row_visible_in_catalog_read()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
@@ -3036,6 +3165,33 @@ mod tests {
         .bind(title)
         .bind(now)
         .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(())
+    }
+
+    async fn insert_catalog_cast_member(
+        db: &Db,
+        media_item_id: Id,
+        position: u32,
+        name: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO media_metadata_cast_members (
+                media_item_id,
+                position,
+                name,
+                character,
+                profile_path
+            )
+            VALUES (?1, ?2, ?3, 'character', NULL)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(i64::from(position))
+        .bind(name)
         .execute(db.write_pool())
         .await?;
 

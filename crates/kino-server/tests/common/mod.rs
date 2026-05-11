@@ -6,11 +6,17 @@ use sha2::{Digest, Sha256};
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) async fn issued_token(db: &kino_db::Db) -> Result<String, sqlx::Error> {
+    let (plaintext, _) = issued_token_with_id(db).await?;
+    Ok(plaintext)
+}
+
+pub(crate) async fn issued_token_with_id(db: &kino_db::Db) -> Result<(String, Id), sqlx::Error> {
     let sequence = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let plaintext = format!("kino-test-token-{}-{sequence}", Id::new());
     let hash = format!("{:x}", Sha256::digest(plaintext.as_bytes()));
+    let id = Id::new();
     let token = DeviceToken::new(
-        Id::new(),
+        id,
         SEEDED_USER_ID,
         format!("Test auth token {sequence}"),
         hash,
@@ -41,7 +47,7 @@ pub(crate) async fn issued_token(db: &kino_db::Db) -> Result<String, sqlx::Error
     .execute(db.write_pool())
     .await?;
 
-    Ok(plaintext)
+    Ok((plaintext, token.id))
 }
 
 pub(crate) fn bearer(token: &str) -> String {
