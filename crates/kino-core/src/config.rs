@@ -5,13 +5,14 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use figment::{
     Figment,
     providers::{Env, Format, Toml},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// Kino's startup configuration.
 ///
@@ -108,6 +109,40 @@ pub struct ServerConfig {
     /// `http://127.0.0.1:8080`.
     #[serde(default = "default_public_base_url")]
     pub public_base_url: String,
+
+    /// Playback session background reaper settings. Defaults documented on
+    /// [`SessionReaperConfig`].
+    #[serde(default)]
+    pub session_reaper: SessionReaperConfig,
+}
+
+/// Playback session background reaper settings.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReaperConfig {
+    /// Interval between reaper sweeps. Defaults to 30 seconds.
+    #[serde(
+        default = "default_session_reaper_tick_interval",
+        rename = "tick_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub tick_interval: Duration,
+
+    /// Age after which active sessions become idle. Defaults to 60 seconds.
+    #[serde(
+        default = "default_session_reaper_active_to_idle",
+        rename = "active_to_idle_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub active_to_idle: Duration,
+
+    /// Age after which idle sessions become ended. Defaults to 300 seconds.
+    #[serde(
+        default = "default_session_reaper_idle_to_ended",
+        rename = "idle_to_ended_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub idle_to_ended: Duration,
 }
 
 /// TMDB API client settings.
@@ -180,6 +215,18 @@ fn default_watch_folder_stability_seconds() -> u64 {
     5
 }
 
+fn default_session_reaper_tick_interval() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_session_reaper_active_to_idle() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_session_reaper_idle_to_ended() -> Duration {
+    Duration::from_secs(300)
+}
+
 fn default_log_level() -> String {
     "info".into()
 }
@@ -189,6 +236,17 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             public_base_url: default_public_base_url(),
+            session_reaper: SessionReaperConfig::default(),
+        }
+    }
+}
+
+impl Default for SessionReaperConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval: default_session_reaper_tick_interval(),
+            active_to_idle: default_session_reaper_active_to_idle(),
+            idle_to_ended: default_session_reaper_idle_to_ended(),
         }
     }
 }
@@ -244,6 +302,15 @@ pub enum ConfigError {
         /// Underlying parse error.
         #[source]
         source: url::ParseError,
+    },
+
+    /// The configured session reaper settings are invalid.
+    #[error("invalid session reaper config {field}: {reason}")]
+    InvalidSessionReaperConfig {
+        /// Session reaper config field.
+        field: &'static str,
+        /// Human-readable validation failure.
+        reason: &'static str,
     },
 
     /// The configured TMDB client settings are invalid.
@@ -349,7 +416,41 @@ fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigError> {
             source,
         }
     })?;
+    validate_session_reaper_config(&config.session_reaper)?;
     Ok(())
+}
+
+fn validate_session_reaper_config(config: &SessionReaperConfig) -> Result<(), ConfigError> {
+    if config.tick_interval.is_zero() {
+        return Err(ConfigError::InvalidSessionReaperConfig {
+            field: "tick_seconds",
+            reason: "must be positive",
+        });
+    }
+
+    if config.active_to_idle.is_zero() {
+        return Err(ConfigError::InvalidSessionReaperConfig {
+            field: "active_to_idle_seconds",
+            reason: "must be positive",
+        });
+    }
+
+    if config.idle_to_ended.is_zero() {
+        return Err(ConfigError::InvalidSessionReaperConfig {
+            field: "idle_to_ended_seconds",
+            reason: "must be positive",
+        });
+    }
+
+    Ok(())
+}
+
+fn duration_seconds<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let seconds = u64::deserialize(deserializer)?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn validate_tmdb_config(config: &TmdbConfig) -> Result<(), ConfigError> {
@@ -549,6 +650,11 @@ mod tests {
                 listen = "0.0.0.0:9000"
                 public_base_url = "https://kino.example.test"
 
+                [server.session_reaper]
+                tick_seconds = 5
+                active_to_idle_seconds = 10
+                idle_to_ended_seconds = 20
+
                 [tmdb]
                 api_key = "test-api-key"
                 max_requests_per_second = 10
@@ -609,6 +715,18 @@ mod tests {
                 "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
             );
             assert_eq!(cfg.server.public_base_url, "https://kino.example.test");
+            assert_eq!(
+                cfg.server.session_reaper.tick_interval,
+                Duration::from_secs(5)
+            );
+            assert_eq!(
+                cfg.server.session_reaper.active_to_idle,
+                Duration::from_secs(10)
+            );
+            assert_eq!(
+                cfg.server.session_reaper.idle_to_ended,
+                Duration::from_secs(20)
+            );
             Ok(())
         });
     }
@@ -627,6 +745,18 @@ mod tests {
                 "127.0.0.1:7777".parse::<SocketAddr>().unwrap()
             );
             assert_eq!(cfg.server.public_base_url, "http://127.0.0.1:8080");
+            assert_eq!(
+                cfg.server.session_reaper.tick_interval,
+                Duration::from_secs(30)
+            );
+            assert_eq!(
+                cfg.server.session_reaper.active_to_idle,
+                Duration::from_secs(60)
+            );
+            assert_eq!(
+                cfg.server.session_reaper.idle_to_ended,
+                Duration::from_secs(300)
+            );
             assert_eq!(cfg.tmdb.api_key, None);
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
             assert_eq!(
@@ -724,6 +854,32 @@ mod tests {
     }
 
     #[test]
+    fn nested_env_override_for_session_reaper() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_SERVER__SESSION_REAPER__TICK_SECONDS", "2");
+            jail.set_env("KINO_SERVER__SESSION_REAPER__ACTIVE_TO_IDLE_SECONDS", "3");
+            jail.set_env("KINO_SERVER__SESSION_REAPER__IDLE_TO_ENDED_SECONDS", "4");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(
+                cfg.server.session_reaper.tick_interval,
+                Duration::from_secs(2)
+            );
+            assert_eq!(
+                cfg.server.session_reaper.active_to_idle,
+                Duration::from_secs(3)
+            );
+            assert_eq!(
+                cfg.server.session_reaper.idle_to_ended,
+                Duration::from_secs(4)
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
     fn invalid_server_public_base_url_is_rejected() {
         Jail::expect_with(|jail| {
             let fixture = ConfigFixture::new()?;
@@ -745,6 +901,34 @@ mod tests {
             let err = Config::load().unwrap_err();
             assert!(
                 matches!(err, ConfigError::InvalidServerConfig { .. }),
+                "got: {err:?}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn invalid_session_reaper_zero_interval_is_rejected() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [server.session_reaper]
+                        tick_seconds = 0
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidSessionReaperConfig { .. }),
                 "got: {err:?}"
             );
             Ok(())

@@ -33,6 +33,8 @@ async fn start() -> Result<(), Error> {
 async fn run(config: Config) -> Result<(), Error> {
     let db = Db::open(&config).await?;
     ensure_bootstrap_device_token(&db).await?;
+    let _session_reaper =
+        kino_server::session_reaper::spawn(db.clone(), config.server.session_reaper.into());
     kino_server::serve(&config, db).await?;
     Ok(())
 }

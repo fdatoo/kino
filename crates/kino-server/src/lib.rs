@@ -9,6 +9,7 @@ use kino_db::Db;
 pub mod auth;
 mod openapi;
 mod request;
+pub mod session_reaper;
 mod token;
 
 /// Errors produced by `kino-server`.
