@@ -6,6 +6,7 @@ use axum::Router;
 use kino_core::Config;
 use kino_db::Db;
 
+pub mod auth;
 mod openapi;
 mod request;
 mod token;
