@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Id, Timestamp};
 
 /// Lifecycle state for an observed playback session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackSessionStatus {
     /// Playback is currently active.
