@@ -35,6 +35,7 @@ mod stream;
 mod token;
 mod transcode_admin;
 pub mod variant_select;
+pub mod watch_folder_intake;
 
 /// Errors produced by `kino-server`.
 #[derive(Debug, thiserror::Error)]
@@ -241,8 +242,23 @@ pub async fn serve(config: &Config, db: Db) -> Result<()> {
     let transcode = build_transcode_service(db.clone(), config).await?;
     let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &config.library_root);
     let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
+    let intake = config.providers.watch_folder.as_ref().map(|provider| {
+        watch_folder_intake::spawn(
+            watch_folder_intake::WatchFolderIntakeDeps {
+                db: db.clone(),
+                library_root: config.library_root.clone(),
+                artwork_cache_dir: config.artwork_cache_dir(),
+                canonical_transfer: config.library.canonical_transfer,
+                subtitle_reocr: subtitle_reocr.clone(),
+                tmdb_client: tmdb_client.clone(),
+                transcode: transcode.service.clone(),
+            },
+            provider.clone(),
+        )
+    });
+
     tracing::info!(listen = %local_addr, "server listening");
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         router_with_config_reocr_tmdb_and_transcode(
             db,
@@ -252,7 +268,12 @@ pub async fn serve(config: &Config, db: Db) -> Result<()> {
             transcode,
         ),
     )
-    .await?;
+    .await;
+
+    if let Some(intake) = intake {
+        intake.shutdown().await;
+    }
+    serve_result?;
     Ok(())
 }
 
