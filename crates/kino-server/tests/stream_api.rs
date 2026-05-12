@@ -385,8 +385,8 @@ async fn stream_master_playlist_describes_source_variant() -> Result<(), Box<dyn
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/v1/stream/items/{}/{}/master.m3u8",
-                    fixture.media_item_id, fixture.source_file_id
+                    "/api/v1/stream/items/{}/master.m3u8",
+                    fixture.media_item_id
                 ))
                 .bearer(&fixture.auth)
                 .body(Body::empty())?,
@@ -420,6 +420,7 @@ async fn stream_master_playlist_describes_source_variant() -> Result<(), Box<dyn
     assert!(playlist_text.contains("#EXT-X-STREAM-INF:"));
     assert!(playlist_text.contains("CODECS=\"avc1,fLaC\""));
     assert!(playlist_text.contains("RESOLUTION=16x16"));
+    assert!(!playlist_text.contains("VIDEO-RANGE="));
     assert!(playlist_text.ends_with(&format!(
         "/api/v1/stream/items/{}/{}/media.m3u8\n",
         fixture.media_item_id, fixture.source_file_id
@@ -470,8 +471,8 @@ async fn stream_master_playlist_preserves_forced_subtitle_flag()
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/v1/stream/items/{}/{}/master.m3u8",
-                    fixture.media_item_id, fixture.source_file_id
+                    "/api/v1/stream/items/{}/master.m3u8",
+                    fixture.media_item_id
                 ))
                 .bearer(&fixture.auth)
                 .body(Body::empty())?,
@@ -493,6 +494,155 @@ async fn stream_master_playlist_preserves_forced_subtitle_flag()
         .find(|media| media.media_type == AlternativeMediaType::Subtitles)
         .expect("missing subtitle rendition");
     assert!(subtitles.forced);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_master_playlist_describes_packaged_transcode_outputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = packaged_hls_fixture().await?;
+
+    let response = fixture
+        .app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/items/{}/master.m3u8",
+                    fixture.media_item_id
+                ))
+                .bearer(&fixture.auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let playlist_text = String::from_utf8(body.to_vec())?;
+    assert!(playlist_text.contains("CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\""));
+    assert!(playlist_text.contains("CODECS=\"avc1.640028,mp4a.40.2\""));
+    assert!(playlist_text.contains("RESOLUTION=3840x2160"));
+    assert!(playlist_text.contains("RESOLUTION=1920x1080"));
+    assert!(playlist_text.contains("VIDEO-RANGE=PQ"));
+    assert!(playlist_text.contains("VIDEO-RANGE=SDR"));
+    assert!(playlist_text.contains(&format!(
+        "/api/v1/stream/transcodes/{}/media.m3u8\n",
+        fixture.transcode_output_ids[0]
+    )));
+    assert!(playlist_text.contains(&format!(
+        "/api/v1/stream/transcodes/{}/media.m3u8\n",
+        fixture.transcode_output_ids[1]
+    )));
+    assert!(!playlist_text.contains(&format!(
+        "/api/v1/stream/items/{}/{}/media.m3u8\n",
+        fixture.media_item_id, fixture.source_file_id
+    )));
+
+    let parsed = match m3u8_rs::parse_master_playlist_res(playlist_text.as_bytes()) {
+        Ok(playlist) => playlist,
+        Err(error) => panic!("master playlist did not parse: {error:?}\n{playlist_text}"),
+    };
+    assert_eq!(parsed.variants.len(), 2);
+    assert_eq!(
+        parsed.variants[0].uri,
+        format!(
+            "/api/v1/stream/transcodes/{}/media.m3u8",
+            fixture.transcode_output_ids[0]
+        )
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transcode_media_playlist_rewrites_init_and_segment_uris()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = packaged_hls_fixture().await?;
+    let transcode_output_id = fixture.transcode_output_ids[0];
+
+    let response = fixture
+        .app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/transcodes/{transcode_output_id}/media.m3u8"
+                ))
+                .bearer(&fixture.auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static(
+            "application/vnd.apple.mpegurl"
+        ))
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let playlist_text = String::from_utf8(body.to_vec())?;
+    assert!(playlist_text.contains(&format!(
+        "#EXT-X-MAP:URI=\"/api/v1/stream/transcodes/{transcode_output_id}/init.mp4\""
+    )));
+    assert!(playlist_text.contains(&format!(
+        "/api/v1/stream/transcodes/{transcode_output_id}/seg-00000.m4s"
+    )));
+    assert!(playlist_text.contains(&format!(
+        "/api/v1/stream/transcodes/{transcode_output_id}/seg-00001.m4s"
+    )));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transcode_init_and_segments_support_ranges() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = packaged_hls_fixture().await?;
+    let transcode_output_id = fixture.transcode_output_ids[0];
+
+    let init_response = fixture
+        .app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/transcodes/{transcode_output_id}/init.mp4"
+                ))
+                .bearer(&fixture.auth)
+                .header(header::RANGE, "bytes=0-3")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(init_response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        init_response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static("video/mp4"))
+    );
+    let init_body = to_bytes(init_response.into_body(), usize::MAX).await?;
+    assert_eq!(init_body.as_ref(), b"init");
+
+    let segment_response = fixture
+        .app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/transcodes/{transcode_output_id}/seg-00000.m4s"
+                ))
+                .bearer(&fixture.auth)
+                .header(header::RANGE, "bytes=4-8")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(segment_response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        segment_response.headers().get(header::CONTENT_RANGE),
+        Some(&header::HeaderValue::from_static("bytes 4-8/17"))
+    );
+    let segment_body = to_bytes(segment_response.into_body(), usize::MAX).await?;
+    assert_eq!(segment_body.as_ref(), b"ent-h");
 
     Ok(())
 }
@@ -709,6 +859,15 @@ struct HlsFixture {
     source_file_id: Id,
 }
 
+struct PackagedHlsFixture {
+    app: axum::Router,
+    auth: String,
+    media_item_id: Id,
+    source_file_id: Id,
+    transcode_output_ids: Vec<Id>,
+    _temp_dir: TempDir,
+}
+
 struct MediaPlaylistFixture {
     app: axum::Router,
     auth: String,
@@ -733,6 +892,73 @@ async fn hls_fixture(forced_subtitle: bool) -> Result<HlsFixture, Box<dyn std::e
         media_item_id,
         source_file_id,
     })
+}
+
+async fn packaged_hls_fixture() -> Result<PackagedHlsFixture, Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let source_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../kino-fulfillment/tests/fixtures/probe_sample.mkv");
+    let high_dir = temp_dir.path().join("high");
+    let compatibility_dir = temp_dir.path().join("compatibility");
+    std::fs::create_dir(&high_dir)?;
+    std::fs::create_dir(&compatibility_dir)?;
+    write_packaged_hls_output(
+        &high_dir,
+        b"init-high",
+        b"segment-high-0000",
+        b"segment-high-0001",
+    )?;
+    write_packaged_hls_output(
+        &compatibility_dir,
+        b"init-compatibility",
+        b"segment-compat-0000",
+        b"segment-compat-0001",
+    )?;
+
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let source_file_id = insert_source_file(&db, media_item_id, &source_path).await?;
+    let high_id = insert_packaged_transcode_output(
+        &db,
+        source_file_id,
+        &high_dir,
+        r#"{"codecs":"hvc1.2.4.L153.B0,mp4a.40.2","resolution":"3840x2160","video_range":"PQ"}"#,
+    )
+    .await?;
+    let compatibility_id = insert_packaged_transcode_output(
+        &db,
+        source_file_id,
+        &compatibility_dir,
+        r#"{"codecs":"avc1.640028,mp4a.40.2","width":1920,"height":1080,"video_range":"SDR"}"#,
+    )
+    .await?;
+    let app = kino_server::router(db);
+
+    Ok(PackagedHlsFixture {
+        app,
+        auth,
+        media_item_id,
+        source_file_id,
+        transcode_output_ids: vec![high_id, compatibility_id],
+        _temp_dir: temp_dir,
+    })
+}
+
+fn write_packaged_hls_output(
+    directory: &std::path::Path,
+    init: &[u8],
+    segment_0: &[u8],
+    segment_1: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::write(directory.join("init.mp4"), init)?;
+    std::fs::write(directory.join("seg-00000.m4s"), segment_0)?;
+    std::fs::write(directory.join("seg-00001.m4s"), segment_1)?;
+    std::fs::write(
+        directory.join("media.m3u8"),
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.000,\nseg-00000.m4s\n#EXTINF:4.000,\nseg-00001.m4s\n#EXT-X-ENDLIST\n",
+    )?;
+    Ok(())
 }
 
 async fn media_playlist_fixture(
@@ -1052,6 +1278,49 @@ async fn insert_transcode_output(
     .bind(id)
     .bind(source_file_id)
     .bind(path)
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
+}
+
+async fn insert_packaged_transcode_output(
+    db: &kino_db::Db,
+    source_file_id: Id,
+    directory_path: &std::path::Path,
+    encode_metadata_json: &str,
+) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+    let path = directory_path
+        .join("legacy.mp4")
+        .to_string_lossy()
+        .into_owned();
+    let directory_path = directory_path.to_string_lossy().into_owned();
+
+    sqlx::query(
+        r#"
+        INSERT INTO transcode_outputs (
+            id,
+            source_file_id,
+            path,
+            directory_path,
+            playlist_filename,
+            init_filename,
+            encode_metadata_json,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, 'media.m3u8', 'init.mp4', ?5, ?6, ?7)
+        "#,
+    )
+    .bind(id)
+    .bind(source_file_id)
+    .bind(path)
+    .bind(directory_path)
+    .bind(encode_metadata_json)
     .bind(now)
     .bind(now)
     .execute(db.write_pool())
