@@ -473,6 +473,7 @@ mod tests {
                 (22, String::from("watched transitions")),
                 (23, String::from("source file probe data")),
                 (24, String::from("subtitle forced flag")),
+                (25, String::from("transcode jobs")),
             ]
         );
 
@@ -1073,6 +1074,7 @@ mod tests {
                 (22, String::from("watched transitions")),
                 (23, String::from("source file probe data")),
                 (24, String::from("subtitle forced flag")),
+                (25, String::from("transcode jobs")),
             ]
         );
 
