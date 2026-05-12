@@ -8,6 +8,7 @@ use crate::Error;
 
 /// Video codec requested by the transcode planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
     /// HEVC/H.265 encode or copy target, including 10-bit and HDR10-capable variants.
     Hevc,

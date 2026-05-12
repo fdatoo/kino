@@ -77,6 +77,37 @@ tesseract_path = "tesseract"
 # Runtime override: KINO_OCR__LANGUAGE.
 language = "eng"
 
+[transcode]
+
+[transcode.policy]
+# High-quality variant codec. Optional. Defaults to "hevc".
+# Runtime override: KINO_TRANSCODE__POLICY__HIGH__CODEC.
+high.codec = "hevc"
+
+# High-quality variant bit depth. Optional. Defaults to 10.
+# Runtime override: KINO_TRANSCODE__POLICY__HIGH__BIT_DEPTH.
+high.bit_depth = 10
+
+# High-quality variant VMAF target. Optional. Defaults to 95.
+# Runtime override: KINO_TRANSCODE__POLICY__HIGH__VMAF_TARGET.
+high.vmaf_target = 95
+
+# High-quality variant encoder preset key. Optional. Defaults to "medium".
+# Runtime override: KINO_TRANSCODE__POLICY__HIGH__PRESET.
+high.preset = "medium"
+
+# Compatibility variant codec. Optional. Defaults to "h264".
+# Runtime override: KINO_TRANSCODE__POLICY__COMPAT__CODEC.
+compat.codec = "h264"
+
+# Compatibility variant VMAF target. Optional. Defaults to 90.
+# Runtime override: KINO_TRANSCODE__POLICY__COMPAT__VMAF_TARGET.
+compat.vmaf_target = 90
+
+# Compatibility variant maximum height. Optional. Defaults to 1080.
+# Runtime override: KINO_TRANSCODE__POLICY__COMPAT__MAX_HEIGHT.
+compat.max_height = 1080
+
 [providers.disc_rip]
 # Directory scanned for MakeMKV-style output files. Required when this provider
 # section is present, and validated at startup.

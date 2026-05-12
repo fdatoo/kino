@@ -118,7 +118,14 @@ plan in `docs/agents/plans/`.
   `KINO_PROVIDERS__DISC_RIP__PREFERENCE`,
   `KINO_PROVIDERS__WATCH_FOLDER__PATH`,
   `KINO_PROVIDERS__WATCH_FOLDER__PREFERENCE`,
-  `KINO_PROVIDERS__WATCH_FOLDER__STABILITY_SECONDS`. The reference TOML lives
+  `KINO_PROVIDERS__WATCH_FOLDER__STABILITY_SECONDS`,
+  `KINO_TRANSCODE__POLICY__HIGH__CODEC`,
+  `KINO_TRANSCODE__POLICY__HIGH__BIT_DEPTH`,
+  `KINO_TRANSCODE__POLICY__HIGH__VMAF_TARGET`,
+  `KINO_TRANSCODE__POLICY__HIGH__PRESET`,
+  `KINO_TRANSCODE__POLICY__COMPAT__CODEC`,
+  `KINO_TRANSCODE__POLICY__COMPAT__VMAF_TARGET`,
+  `KINO_TRANSCODE__POLICY__COMPAT__MAX_HEIGHT`. The reference TOML lives
   at `kino.toml.example` in the repo root.
 - **Tests:** colocated with the code (`#[cfg(test)] mod tests`) or under a crate's
   `tests/` directory for integration. A change isn't done until tests pass.

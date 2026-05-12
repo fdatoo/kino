@@ -38,6 +38,7 @@ async fn config_api_returns_resolved_config_with_masked_secrets() -> TestResult 
             },
             ocr: kino_core::OcrConfig::default(),
             providers: kino_core::config::ProvidersConfig::default(),
+            transcode: kino_core::TranscodeConfig::default(),
             log_level: "debug,kino=trace".to_owned(),
             log_format: LogFormat::Json,
         },

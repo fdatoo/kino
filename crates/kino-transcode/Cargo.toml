@@ -10,6 +10,8 @@ workspace = true
 [dependencies]
 kino-core = { path = "../kino-core" }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 shell-words = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
