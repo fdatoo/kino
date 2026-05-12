@@ -92,8 +92,16 @@ fn render_max_cll(cll: &MaxCll) -> String {
 pub enum VideoFilter {
     /// Render `scale=width:height` to resize video to fixed dimensions.
     Scale(u32, u32),
+    /// Render `scale_vaapi=w=width:h=height` for VA-API hardware frames.
+    VaapiScale(u32, u32),
+    /// Render `vpp_qsv=w=width:h=height` for QSV hardware frames.
+    QsvScale(u32, u32),
     /// Render the HDR-to-SDR zscale/tonemap chain used for compatibility variants.
     HdrToSdrTonemap,
+    /// Render the VA-API HDR-to-SDR chain that downloads, tone-maps, and uploads frames.
+    VaapiHdrToSdrTonemap,
+    /// Render QSV VPP tone-mapping to SDR NV12 frames.
+    QsvHdrToSdrTonemap,
     /// Render `hwdownload,format=...` to move hardware frames into system memory.
     HwDownload {
         /// Software pixel format requested after `hwdownload`.
@@ -108,12 +116,22 @@ impl VideoFilter {
     pub fn as_ffmpeg(&self) -> String {
         match self {
             Self::Scale(width, height) => format!("scale={width}:{height}"),
+            Self::VaapiScale(width, height) => format!("scale_vaapi=w={width}:h={height}"),
+            Self::QsvScale(width, height) => format!("vpp_qsv=w={width}:h={height}"),
             Self::HdrToSdrTonemap => concat!(
                 "zscale=t=linear:npl=100,format=gbrpf32le,",
                 "zscale=p=bt709,tonemap=tonemap=hable:desat=0,",
                 "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
             )
             .to_owned(),
+            Self::VaapiHdrToSdrTonemap => concat!(
+                "hwdownload,format=p010le,",
+                "zscale=t=linear:npl=100,format=gbrpf32le,",
+                "zscale=p=bt709,tonemap=tonemap=hable:desat=0,",
+                "zscale=t=bt709:m=bt709:r=tv,format=nv12,hwupload"
+            )
+            .to_owned(),
+            Self::QsvHdrToSdrTonemap => "vpp_qsv=tonemap=1:format=nv12".to_owned(),
             Self::HwDownload { format } => format!("hwdownload,format={format}"),
             Self::Format(format) => format!("format={format}"),
         }
@@ -205,6 +223,31 @@ impl InputSpec {
     }
 }
 
+/// Hardware input acceleration rendered before FFmpeg input arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardwareAccel {
+    /// Render Intel Quick Sync decode flags.
+    Qsv,
+    /// Render VA-API decode flags bound to a Linux DRM render node.
+    Vaapi {
+        /// DRM render node used to initialize FFmpeg's VA-API device.
+        render_node: PathBuf,
+    },
+}
+
+/// Video quality option used for the value carried in [`VideoOutputSpec::crf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoQualityArg {
+    /// Render `-crf N`.
+    Crf,
+    /// Render `-global_quality N`.
+    GlobalQuality,
+    /// Render `-qp N`.
+    Qp,
+    /// Omit quality flags.
+    None,
+}
+
 /// Video output settings rendered as FFmpeg video codec, quality, pixel, and color flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoOutputSpec {
@@ -251,6 +294,11 @@ pub struct FfmpegEncodeCommand {
     input: InputSpec,
     video: VideoOutputSpec,
     audio: AudioPolicy,
+    hardware_accel: Option<HardwareAccel>,
+    video_encoder: Option<String>,
+    video_quality_arg: VideoQualityArg,
+    video_pixel_format: Option<String>,
+    render_preset: bool,
     filters: Vec<VideoFilter>,
     hls: Option<HlsOutputSpec>,
     file_output: Option<PathBuf>,
@@ -273,6 +321,11 @@ impl FfmpegEncodeCommand {
                 max_resolution: None,
             },
             audio: AudioPolicy::Copy,
+            hardware_accel: None,
+            video_encoder: None,
+            video_quality_arg: VideoQualityArg::Crf,
+            video_pixel_format: None,
+            render_preset: true,
             filters: Vec::new(),
             hls: None,
             file_output: None,
@@ -290,6 +343,36 @@ impl FfmpegEncodeCommand {
     /// Replace the audio output policy rendered by this command.
     pub fn audio(mut self, spec: AudioPolicy) -> Self {
         self.audio = spec;
+        self
+    }
+
+    /// Set hardware acceleration flags rendered before the input.
+    pub fn hardware_accel(mut self, accel: HardwareAccel) -> Self {
+        self.hardware_accel = Some(accel);
+        self
+    }
+
+    /// Override the concrete FFmpeg video encoder rendered after `-c:v`.
+    pub fn video_encoder(mut self, encoder: impl Into<String>) -> Self {
+        self.video_encoder = Some(encoder.into());
+        self
+    }
+
+    /// Set the quality flag used for [`VideoOutputSpec::crf`].
+    pub fn video_quality_arg(mut self, arg: VideoQualityArg) -> Self {
+        self.video_quality_arg = arg;
+        self
+    }
+
+    /// Override the rendered FFmpeg output pixel format.
+    pub fn video_pixel_format(mut self, format: impl Into<String>) -> Self {
+        self.video_pixel_format = Some(format.into());
+        self
+    }
+
+    /// Omit `-preset` for encoders that do not expose FFmpeg's preset option.
+    pub fn without_video_preset(mut self) -> Self {
+        self.render_preset = false;
         self
     }
 
@@ -346,6 +429,9 @@ impl FfmpegEncodeCommand {
             push_arg(&mut args, "pipe:1");
         }
 
+        if let Some(accel) = &self.hardware_accel {
+            render_hardware_accel_args(accel, &mut args);
+        }
         args.extend(self.input.to_args());
 
         if self.video.codec == VideoCodec::Copy {
@@ -356,7 +442,14 @@ impl FfmpegEncodeCommand {
         } else {
             push_arg(&mut args, "-map");
             push_arg(&mut args, "0:v:0");
-            render_video_args(&self.video, &mut args);
+            render_video_args(
+                &self.video,
+                self.video_encoder.as_deref(),
+                self.video_quality_arg,
+                self.video_pixel_format.as_deref(),
+                self.render_preset,
+                &mut args,
+            );
 
             if !self.filters.is_empty() {
                 push_arg(&mut args, "-vf");
@@ -390,25 +483,78 @@ impl fmt::Display for FfmpegEncodeCommand {
     }
 }
 
-fn render_video_args(video: &VideoOutputSpec, args: &mut Vec<OsString>) {
+fn render_hardware_accel_args(accel: &HardwareAccel, args: &mut Vec<OsString>) {
+    match accel {
+        HardwareAccel::Qsv => {
+            push_arg(args, "-hwaccel");
+            push_arg(args, "qsv");
+            push_arg(args, "-hwaccel_output_format");
+            push_arg(args, "qsv");
+        }
+        HardwareAccel::Vaapi { render_node } => {
+            push_arg(args, "-init_hw_device");
+            push_arg(args, format!("vaapi=hw:{}", render_node.display()));
+            push_arg(args, "-filter_hw_device");
+            push_arg(args, "hw");
+            push_arg(args, "-hwaccel");
+            push_arg(args, "vaapi");
+            push_arg(args, "-hwaccel_output_format");
+            push_arg(args, "vaapi");
+        }
+    }
+}
+
+fn render_video_args(
+    video: &VideoOutputSpec,
+    video_encoder: Option<&str>,
+    quality_arg: VideoQualityArg,
+    pixel_format_override: Option<&str>,
+    render_preset: bool,
+    args: &mut Vec<OsString>,
+) {
     push_arg(args, "-c:v");
-    push_arg(args, video_codec_arg(video.codec));
+    push_arg(
+        args,
+        video_encoder.unwrap_or_else(|| video_codec_arg(video.codec)),
+    );
 
     if video.codec != VideoCodec::Copy {
         if let Some(crf) = video.crf {
-            push_arg(args, "-crf");
-            push_arg(args, crf.to_string());
+            match quality_arg {
+                VideoQualityArg::Crf => {
+                    push_arg(args, "-crf");
+                    push_arg(args, crf.to_string());
+                }
+                VideoQualityArg::GlobalQuality => {
+                    push_arg(args, "-global_quality");
+                    push_arg(args, crf.to_string());
+                }
+                VideoQualityArg::Qp => {
+                    push_arg(args, "-qp");
+                    push_arg(args, crf.to_string());
+                }
+                VideoQualityArg::None => {}
+            }
         }
-        push_arg(args, "-preset");
-        push_arg(args, video.preset.as_ffmpeg());
+        if render_preset {
+            push_arg(args, "-preset");
+            push_arg(args, video.preset.as_ffmpeg());
+        }
         push_arg(args, "-pix_fmt");
-        push_arg(args, pixel_format(video.bit_depth));
+        push_arg(
+            args,
+            pixel_format_override.unwrap_or_else(|| pixel_format(video.bit_depth)),
+        );
     }
 
-    render_color_args(video, args);
+    render_color_args(video, video_encoder, args);
 }
 
-fn render_color_args(video: &VideoOutputSpec, args: &mut Vec<OsString>) {
+fn render_color_args(
+    video: &VideoOutputSpec,
+    video_encoder: Option<&str>,
+    args: &mut Vec<OsString>,
+) {
     match &video.color {
         ColorOutput::CopyFromInput => {}
         ColorOutput::SdrBt709 => {
@@ -429,7 +575,9 @@ fn render_color_args(video: &VideoOutputSpec, args: &mut Vec<OsString>) {
             push_arg(args, "smpte2084");
             push_arg(args, "-colorspace");
             push_arg(args, "bt2020nc");
-            if video.codec == VideoCodec::Hevc {
+            if video.codec == VideoCodec::Hevc
+                && video_encoder.is_none_or(|encoder| encoder == "libx265")
+            {
                 push_arg(args, "-x265-params");
                 push_arg(
                     args,

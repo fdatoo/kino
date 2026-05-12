@@ -18,8 +18,8 @@ use std::{
 
 pub use downgrade::DowngradeStore;
 pub use encoder::{
-    Capabilities, DetectionConfig, Encoder, EncoderKind, EncoderRegistry, LaneId, VideoCodec,
-    available_encoders,
+    Capabilities, DetectionConfig, Encoder, EncoderKind, EncoderRegistry, LaneId, QsvEncoder,
+    VaapiEncoder, VideoCodec, available_encoders,
 };
 pub use ephemeral::{
     ActiveEncode, ActiveEncodeLease, ActiveEncodeRequest, ActiveEncodes, EphemeralOutput,
@@ -31,9 +31,9 @@ pub use job::{
 };
 use kino_core::{Id, ProbeResult};
 pub use pipeline::{
-    AudioPolicy, ColorOutput, FfmpegEncodeCommand, FfmpegVmafCommand, HlsOutputSpec, InputSpec,
-    LogLevel, PipelineRunner, Preset, Progress, RunOutcome, VideoFilter, VideoOutputSpec,
-    verify_outputs,
+    AudioPolicy, ColorOutput, FfmpegEncodeCommand, FfmpegVmafCommand, HardwareAccel, HlsOutputSpec,
+    InputSpec, LogLevel, PipelineRunner, Preset, Progress, RunOutcome, VideoFilter,
+    VideoOutputSpec, VideoQualityArg, verify_outputs,
 };
 pub use plan::VariantKind;
 pub use plan::{

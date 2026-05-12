@@ -23,6 +23,10 @@ A clean clone also needs a working Rust toolchain and `just`. Standard commands:
 | Format check | `just fmt-check`                                      |
 | Lint        | `just lint`                                            |
 
+Hardware encoder integration tests for `kino-transcode` are opt-in because
+they require a real Linux Intel iGPU. Run them on a suitable host with
+`cargo test -p kino-transcode --features hwaccel-tests`.
+
 Run all four (`just build`, `just test`, `just fmt-check`, `just lint`) before
 claiming work is done — they are what CI runs.
 
