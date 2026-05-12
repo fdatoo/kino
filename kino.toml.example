@@ -108,6 +108,27 @@ compat.vmaf_target = 90
 # Runtime override: KINO_TRANSCODE__POLICY__COMPAT__MAX_HEIGHT.
 compat.max_height = 1080
 
+[transcode.scheduler]
+# Scheduler dispatch tick interval in milliseconds. Optional. Defaults to 250.
+# Runtime override: KINO_TRANSCODE__SCHEDULER__TICK_MILLIS.
+tick_millis = 250
+
+# Maximum job attempts before terminal failure. Optional. Defaults to 3.
+# Runtime override: KINO_TRANSCODE__SCHEDULER__MAX_ATTEMPTS.
+max_attempts = 3
+
+# Retry backoff for transient failures in seconds. Optional. Defaults to 60.
+# Runtime override: KINO_TRANSCODE__SCHEDULER__BACKOFF_SECONDS.
+backoff_seconds = 60
+
+# Lane reserved for live transcodes. Optional. Defaults to "cpu".
+# Runtime override: KINO_TRANSCODE__SCHEDULER__RESERVE_LIVE_LANE.
+reserve_live_lane = "cpu"
+
+# Reset running jobs to planned on startup. Optional. Defaults to true.
+# Runtime override: KINO_TRANSCODE__SCHEDULER__RECOVERY_ON_BOOT.
+recovery_on_boot = true
+
 [providers.disc_rip]
 # Directory scanned for MakeMKV-style output files. Required when this provider
 # section is present, and validated at startup.

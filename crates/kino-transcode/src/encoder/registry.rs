@@ -117,6 +117,19 @@ mod tests {
                 && height <= self.capabilities.max_height()
                 && (bit_depth <= 8 || self.capabilities.ten_bit())
         }
+
+        fn build_command(
+            &self,
+            ctx: &crate::encoder::SoftwareEncodeContext,
+        ) -> crate::Result<crate::FfmpegEncodeCommand> {
+            Ok(crate::FfmpegEncodeCommand::new(
+                "ffmpeg",
+                crate::InputSpec::file(ctx.input_path.clone()),
+            )
+            .video(ctx.video.clone())
+            .audio(ctx.audio.clone())
+            .hls(ctx.hls.clone()))
+        }
     }
 
     fn fake_encoder(

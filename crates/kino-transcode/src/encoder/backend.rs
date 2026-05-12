@@ -1,9 +1,8 @@
 //! Encoder backend trait.
 
-use super::{Capabilities, EncoderKind, LaneId, VideoCodec};
+use super::{Capabilities, EncoderKind, LaneId, SoftwareEncodeContext, VideoCodec};
+use crate::{FfmpegEncodeCommand, Result};
 
-// Planned extensions: add supports(&PlannedVariant) and
-// build_command(&EncodeContext) once planner and FFmpeg command types exist.
 /// Encoder backend interface used by the transcode planner and scheduler.
 pub trait Encoder: Send + Sync {
     /// Return this encoder's backend family.
@@ -18,4 +17,7 @@ pub trait Encoder: Send + Sync {
     /// Whether this encoder can produce an output for the given codec at the
     /// requested resolution and bit depth.
     fn supports_codec(&self, codec: VideoCodec, width: u32, height: u32, bit_depth: u8) -> bool;
+
+    /// Build the FFmpeg command for a resolved encode context.
+    fn build_command(&self, ctx: &SoftwareEncodeContext) -> Result<FfmpegEncodeCommand>;
 }

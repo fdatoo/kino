@@ -98,6 +98,10 @@ impl Encoder for SoftwareEncoder {
                 VideoCodec::Av1 => false,
             }
     }
+
+    fn build_command(&self, ctx: &SoftwareEncodeContext) -> crate::Result<FfmpegEncodeCommand> {
+        Ok(SoftwareEncoder::build_command(self, ctx))
+    }
 }
 
 impl VmafSampleEncoder for SoftwareEncoder {
