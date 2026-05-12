@@ -9,7 +9,9 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
 figment = { workspace = true }
@@ -21,6 +23,4 @@ utoipa = { workspace = true }
 
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
