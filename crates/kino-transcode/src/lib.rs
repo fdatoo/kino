@@ -1,5 +1,7 @@
 //! Transcode handoff interface.
 
+pub mod encoder;
+
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -7,11 +9,21 @@ use std::{
     sync::Mutex,
 };
 
+pub use encoder::{Capabilities, Encoder, EncoderKind, LaneId, VideoCodec};
 use kino_core::Id;
 
 /// Errors produced by `kino-transcode`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Encoder kind string is not recognized.
+    #[error("invalid encoder kind: {0}")]
+    InvalidEncoderKind(String),
+    /// Encoder lane id string is not recognized.
+    #[error("invalid lane id: {0}")]
+    InvalidLaneId(String),
+    /// Video codec string is not recognized.
+    #[error("invalid video codec: {0}")]
+    InvalidVideoCodec(String),
     /// Internal no-op recorder state could not be accessed.
     #[error("transcode recorder lock failed: {0}")]
     RecorderLock(String),
