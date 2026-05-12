@@ -1127,13 +1127,16 @@ version = "0.1.0"
 dependencies = [
  "insta",
  "kino-core",
+ "kino-db",
  "nix",
  "serde",
  "serde_json",
  "sha2",
  "shell-words",
+ "sqlx",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
 ]
 
