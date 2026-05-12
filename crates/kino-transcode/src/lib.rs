@@ -100,6 +100,9 @@ impl Error {
             | Self::InvalidTransition { .. }
             | Self::InvalidLaneId(_)
             | Self::InvalidVideoCodec(_)
+            | Self::InvalidVariantKind(_)
+            | Self::InvalidColorTarget(_)
+            | Self::InvalidAudioPolicyKind(_)
             | Self::RecorderLock(_)
             | Self::Cancelled
             | Self::IntegrityFailed(_) => false,
