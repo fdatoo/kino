@@ -319,7 +319,7 @@ longer alive) to `Planned`, incrementing `attempt`.
 Pipeline execution order for a single job:
 
 ```
-probe (kino-fulfillment::FfprobeFileProbe; reused, not duplicated)
+probe (kino_core::FfprobeFileProbe; shared with kino-fulfillment)
   -> plan already resolved at submit-time, no re-plan during run
   -> if vmaf_target: sample-based VMAF curve fit -> chosen CRF
   -> main encode (FfmpegEncodeCommand)
@@ -327,6 +327,12 @@ probe (kino-fulfillment::FfprobeFileProbe; reused, not duplicated)
   -> persist transcode_outputs row
   -> Verifying -> Completed
 ```
+
+`FfprobeFileProbe` and `ProbeResult` live in `kino-core` as shared
+primitives (lifted from `kino-fulfillment` as a Phase 3 prerequisite);
+`kino-core` gains `tokio` as a regular dependency. `kino-fulfillment` and
+`kino-transcode` both consume probe from `kino-core`. Phase 3 extends
+`ProbeResult` with HDR metadata (master display, max CLL, DV profile).
 
 ## VMAF sampling
 
@@ -514,9 +520,12 @@ User-Agent sniffing. Live profile URLs are the explicit per-client opt-in.
 
 **API change.** Phase 2's `{variant_id}` path segment in
 `/api/v1/stream/items/{id}/{variant_id}/master.m3u8` is removed; the master
-manifest itself enumerates variants. Per ADR-0004 this is a v1 change
-requiring either an `Accept-Version` bump or a deprecation window — to be
-decided at implementation time.
+manifest itself enumerates variants. ADR-0004 normally requires a
+deprecation window or `/api/v2` bump for a removal, but Kino has zero
+external consumers today and Phase 3 is the first real v1 contract worth
+honoring. This change rolls in v1 without a deprecation window as a strict
+pre-v1-public exception; once Phase 4 native clients ship, ADR-0004 applies
+fully and any later breaking change requires `/api/v2`.
 
 ## Admin and operational surface
 
@@ -684,6 +693,11 @@ No `anyhow`. Library crate, per CLAUDE.md.
 Each epic is sized to a small handful of issues. Order is roughly
 dependency order; some pairs can run in parallel.
 
+0. **Prerequisite refactor: lift `FfprobeFileProbe` into `kino-core`** —
+   moves probe from `kino-fulfillment` to `kino-core` so both fulfillment
+   and transcode consume from the same place. Adds `tokio` as a
+   `kino-core` regular dependency. Blocks epic 7 (HDR extraction extends
+   `ProbeResult`).
 1. **Core: job model + scheduler** — `transcode_jobs` migration, `JobState`
    transitions, scheduler dispatch loop with resource lanes, recovery on
    boot. In-memory fake encoder for testing. Replaces `NoopTranscodeHandOff`
@@ -720,16 +734,23 @@ dependency order; some pairs can run in parallel.
 13. **Phase 3 acceptance** — end-to-end ingest → transcode → playback
     validation against an HDR10 source on a target machine.
 
+## Resolved decisions
+
+- **ADR-0004 variant_id removal (F-491):** rolled in v1 without a
+  deprecation window as a strict pre-v1-public exception. ADR-0004 applies
+  fully once Phase 4 native clients ship.
+- **Probe location (F-492):** `FfprobeFileProbe` lifts from
+  `kino-fulfillment` into `kino-core`. `kino-core` gains `tokio`. Both
+  fulfillment and transcode consume from `kino-core`. Tracked as a
+  prerequisite refactor under epic 4.
+- **AV1 (F-493):** `VideoCodec::Av1` enum variant ships in Phase 3 for
+  forward compatibility. libsvtav1 software backend, hardware AV1
+  capability declarations, and the `high.codec = "av1"` config toggle all
+  defer to Phase 5, gated on Apple client AV1-decode coverage and server
+  AV1-encode hardware.
+
 ## Open questions (for implementation phase)
 
-- ADR-0004 API change: bump `Accept-Version` or deprecation window for the
-  variant-id path-segment removal? Resolve before epic 10.
-- Whether `kino-fulfillment::FfprobeFileProbe` is reused as-is by
-  `kino-transcode` or lifted into `kino-core`. Decide when epic 4 lands.
-- AV1 software encoding (`libsvtav1`) is supported by the abstraction but
-  not in the default policy. Worth shipping behind a config toggle in
-  Phase 3 or strictly Phase 5? Default: not in policy, but the
-  `VideoCodec::Av1` enum variant ships so backends can declare support.
 - Per-encoder lane reservation when GPU is at thermal/power limit — leave
   to user via `[transcode.encoders] allow = …` for Phase 3.
 
