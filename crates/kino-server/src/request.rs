@@ -15,7 +15,7 @@ use kino_core::{
 };
 use kino_db::Db;
 use kino_fulfillment::{
-    FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
+    FfprobeFileProbe, FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
     FulfillmentProviderError, ManualImportProvider, NewFulfillmentPlan, NewRequest, RequestDetail,
     RequestEventActor, RequestListPage, RequestListQuery, RequestMatchCandidate,
     RequestMatchCandidateInput, RequestService, RequestState, RequestTransition,
@@ -32,7 +32,7 @@ use kino_library::{
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthenticatedUser;
-use crate::ingestion_orchestrator::ingest_request;
+use crate::ingestion_orchestrator::{ingest_request, source_file_probe};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -143,6 +143,14 @@ pub(crate) struct ReocrTrackResponse {
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ReprobeSourceFileResponse {
+    /// Source file that was reprobed.
+    source_file_id: Id,
+    /// Persisted duration in whole seconds, when ffprobe reported one.
+    probe_duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct ResolveRequestResponse {
     /// Ranked resolver candidates returned by TMDB-backed scoring.
     candidates: Vec<RequestMatchCandidate>,
@@ -196,6 +204,10 @@ pub(crate) fn router_with_canonical_transfer(
             get(get_catalog_item_image),
         )
         .route("/api/v1/admin/library/scan", get(scan_library))
+        .route(
+            "/api/v1/admin/source-files/{id}/reprobe",
+            post(reprobe_source_file),
+        )
         .route(
             "/api/v1/admin/items/{id}/subtitles/{track}/re-ocr",
             post(reocr_subtitle_track),
@@ -569,6 +581,41 @@ pub(crate) async fn scan_library(
 
 #[utoipa::path(
     post,
+    path = "/api/v1/admin/source-files/{id}/reprobe",
+    tag = "admin",
+    params(
+        ("id" = Id, Path, description = "Source file id")
+    ),
+    responses(
+        (status = 200, description = "Source-file probe data refreshed", body = ReprobeSourceFileResponse),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Source file not found", body = ErrorResponse),
+        (status = 503, description = "ffprobe unavailable or rejected the source file", body = ErrorResponse),
+        (status = 500, description = "Source-file reprobe failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn reprobe_source_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ReprobeSourceFileResponse>> {
+    let id = parse_id(id)?;
+    let source_file = state.catalog.source_file(id).await?;
+    let probe = FfprobeFileProbe::new().probe(&source_file.path).await?;
+    let probe_input = source_file_probe(&probe);
+    let duration_seconds = probe_input.duration_seconds;
+    state
+        .catalog
+        .update_source_file_probe(id, probe_input)
+        .await?;
+
+    Ok(Json(ReprobeSourceFileResponse {
+        source_file_id: id,
+        probe_duration_seconds: duration_seconds,
+    }))
+}
+
+#[utoipa::path(
+    post,
     path = "/api/v1/admin/items/{id}/subtitles/{track}/re-ocr",
     tag = "admin",
     params(
@@ -736,6 +783,9 @@ pub(crate) enum ApiError {
     ManualImport(FulfillmentProviderError),
 
     #[error(transparent)]
+    Probe(#[from] kino_fulfillment::ProbeError),
+
+    #[error(transparent)]
     Library(#[from] kino_library::Error),
 
     #[error("invalid media item type: {value}")]
@@ -820,6 +870,7 @@ impl IntoResponse for ApiError {
             Self::ManualImport(error) if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
             Self::ManualImport(_) => StatusCode::BAD_REQUEST,
             Self::Library(kino_library::Error::MediaItemNotFound { .. }) => StatusCode::NOT_FOUND,
+            Self::Library(kino_library::Error::SourceFileNotFound { .. }) => StatusCode::NOT_FOUND,
             Self::Library(kino_library::Error::CurrentOcrSidecarNotFound { .. }) => {
                 StatusCode::NOT_FOUND
             }
@@ -844,6 +895,7 @@ impl IntoResponse for ApiError {
                 tracing::error!(error = %self, "library artwork api failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Self::Probe(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Library(_) => {
                 tracing::error!(error = %self, "library admin api failed");
                 StatusCode::INTERNAL_SERVER_ERROR

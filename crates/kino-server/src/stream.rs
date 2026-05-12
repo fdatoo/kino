@@ -108,6 +108,7 @@ pub(crate) async fn master_playlist(
         (status = 200, description = "HLS media playlist", body = String, content_type = "application/vnd.apple.mpegurl"),
         (status = 404, description = "Media item variant not found", body = StreamErrorResponse),
         (status = 422, description = "Media item variant is not playlist-ready", body = StreamErrorResponse),
+        (status = 503, description = "Media item variant is missing persisted probe data", body = StreamErrorResponse),
         (status = 500, description = "Media playlist generation failed", body = StreamErrorResponse)
     )
 )]
@@ -129,9 +130,9 @@ pub(crate) async fn media_playlist(
     let metadata = tokio::fs::metadata(&source_file.path).await?;
     let playlist = build_media_playlist(
         variant_id,
-        source_file
-            .probe_duration_seconds
-            .ok_or_else(|| playlist_unavailable("source file has no probed duration"))?,
+        source_file.probe_duration_seconds.ok_or_else(|| {
+            probe_data_missing(source_file.id, "source file has no probed duration")
+        })?,
         metadata.len(),
     )?;
 
@@ -290,6 +291,7 @@ async fn stream_file(path: PathBuf, headers: HeaderMap) -> StreamResult<Response
 
 #[derive(Debug, Clone)]
 struct SourceFileRow {
+    id: Id,
     media_item_id: Id,
     path: PathBuf,
     probe_duration_seconds: Option<u64>,
@@ -358,6 +360,9 @@ pub(crate) enum StreamError {
     #[error("media playlist unavailable: {reason}")]
     PlaylistUnavailable { reason: String },
 
+    #[error("probe data missing for source file {source_file_id}: {reason}")]
+    ProbeDataMissing { source_file_id: Id, reason: String },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -383,6 +388,10 @@ pub(crate) enum StreamError {
 #[derive(Serialize, utoipa::ToSchema)]
 pub(crate) struct StreamErrorResponse {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_file_id: Option<Id>,
 }
 
 impl IntoResponse for StreamError {
@@ -391,6 +400,7 @@ impl IntoResponse for StreamError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::PlaylistUnavailable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::ProbeDataMissing { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Io(_)
             | Self::Probe(_)
             | Self::Sqlx(_)
@@ -403,13 +413,7 @@ impl IntoResponse for StreamError {
             }
         };
 
-        let mut response = (
-            status,
-            Json(StreamErrorResponse {
-                error: self.to_string(),
-            }),
-        )
-            .into_response();
+        let mut response = (status, Json(stream_error_response(&self))).into_response();
 
         response
             .headers_mut()
@@ -437,7 +441,7 @@ impl IntoResponse for StreamError {
 async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
     let Some(row) = sqlx::query(
         r#"
-        SELECT media_item_id, path, probe_duration_seconds
+        SELECT id, media_item_id, path, probe_duration_seconds
         FROM source_files
         WHERE id = ?1
         "#,
@@ -455,7 +459,11 @@ async fn lookup_source_file(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
 async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow> {
     let Some(row) = sqlx::query(
         r#"
-        SELECT source_files.media_item_id, transcode_outputs.path, NULL AS probe_duration_seconds
+        SELECT
+            transcode_outputs.id,
+            source_files.media_item_id,
+            transcode_outputs.path,
+            NULL AS probe_duration_seconds
         FROM transcode_outputs
         JOIN source_files ON source_files.id = transcode_outputs.source_file_id
         WHERE transcode_outputs.id = ?1
@@ -478,7 +486,7 @@ async fn lookup_source_variant(
 ) -> StreamResult<SourceFileRow> {
     let Some(row) = sqlx::query(
         r#"
-        SELECT media_item_id, path, probe_duration_seconds
+        SELECT id, media_item_id, path, probe_duration_seconds
         FROM source_files
         WHERE media_item_id = ?1 AND id = ?2
         "#,
@@ -500,10 +508,42 @@ fn source_file_row(row: &sqlx::sqlite::SqliteRow) -> StreamResult<SourceFileRow>
         .try_get::<Option<i64>, _>("probe_duration_seconds")?
         .and_then(|value| u64::try_from(value).ok());
     Ok(SourceFileRow {
+        id: row.try_get("id")?,
         media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
         probe_duration_seconds,
     })
+}
+
+fn stream_error_response(error: &StreamError) -> StreamErrorResponse {
+    match error {
+        StreamError::ProbeDataMissing {
+            source_file_id,
+            reason,
+        } => StreamErrorResponse {
+            error: "probe_data_missing".to_owned(),
+            message: Some(reason.clone()),
+            source_file_id: Some(*source_file_id),
+        },
+        _ => StreamErrorResponse {
+            error: error.to_string(),
+            message: None,
+            source_file_id: None,
+        },
+    }
+}
+
+fn probe_data_missing(source_file_id: Id, reason: impl Into<String>) -> StreamError {
+    let reason = reason.into();
+    tracing::warn!(
+        source_file_id = %source_file_id,
+        reason = %reason,
+        "source file is missing persisted probe data"
+    );
+    StreamError::ProbeDataMissing {
+        source_file_id,
+        reason,
+    }
 }
 
 async fn read_subtitle_text(sidecar: &SubtitleSidecar) -> StreamResult<String> {
