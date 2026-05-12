@@ -19,7 +19,7 @@ use std::{
 pub use downgrade::DowngradeStore;
 pub use encoder::{
     Capabilities, DetectionConfig, Encoder, EncoderKind, EncoderRegistry, LaneId, VideoCodec,
-    available_encoders,
+    VideoToolboxEncoder, available_encoders,
 };
 pub use ephemeral::{
     ActiveEncode, ActiveEncodeLease, ActiveEncodeRequest, ActiveEncodes, EphemeralOutput,
@@ -31,9 +31,9 @@ pub use job::{
 };
 use kino_core::{Id, ProbeResult};
 pub use pipeline::{
-    AudioPolicy, ColorOutput, FfmpegEncodeCommand, FfmpegVmafCommand, HlsOutputSpec, InputSpec,
-    LogLevel, PipelineRunner, Preset, Progress, RunOutcome, VideoFilter, VideoOutputSpec,
-    verify_outputs,
+    AudioPolicy, ColorOutput, FfmpegEncodeCommand, FfmpegVmafCommand, HardwareVideoEncoder,
+    HlsOutputSpec, InputHardwareAccel, InputSpec, LogLevel, PipelineRunner, Preset, Progress,
+    RunOutcome, VideoFilter, VideoOutputSpec, verify_outputs,
 };
 pub use plan::VariantKind;
 pub use plan::{
@@ -175,6 +175,14 @@ pub enum Error {
         /// Planned output bit depth.
         bit_depth: u8,
     },
+    /// VideoToolbox cannot encode the requested codec shape.
+    #[error("videotoolbox encoder does not support codec={codec:?} bit_depth={bit_depth}")]
+    UnsupportedVideoToolboxCodec {
+        /// Requested video codec.
+        codec: VideoCodec,
+        /// Requested output bit depth.
+        bit_depth: u8,
+    },
     /// Internal no-op recorder state could not be accessed.
     #[error("transcode recorder lock failed: {0}")]
     RecorderLock(String),
@@ -246,6 +254,7 @@ impl Error {
             | Self::InvalidPlannedVariantJson(_)
             | Self::MissingSourceProbe { .. }
             | Self::NoEncoderForVariant { .. }
+            | Self::UnsupportedVideoToolboxCodec { .. }
             | Self::RecorderLock(_)
             | Self::Cancelled
             | Self::IntegrityFailed(_)

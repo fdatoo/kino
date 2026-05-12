@@ -120,6 +120,48 @@ impl VideoFilter {
     }
 }
 
+/// Hardware decode setup rendered before the input `-i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputHardwareAccel {
+    /// Render VideoToolbox decode with `videotoolbox_vld` hardware frames.
+    VideoToolbox,
+}
+
+impl InputHardwareAccel {
+    /// Return the FFmpeg `-hwaccel` value.
+    pub const fn as_ffmpeg(self) -> &'static str {
+        match self {
+            Self::VideoToolbox => "videotoolbox",
+        }
+    }
+
+    /// Return the FFmpeg `-hwaccel_output_format` value.
+    pub const fn output_format(self) -> &'static str {
+        match self {
+            Self::VideoToolbox => "videotoolbox_vld",
+        }
+    }
+}
+
+/// Hardware video encoder selected by a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareVideoEncoder {
+    /// Render `-c:v hevc_videotoolbox`.
+    HevcVideoToolbox,
+    /// Render `-c:v h264_videotoolbox`.
+    H264VideoToolbox,
+}
+
+impl HardwareVideoEncoder {
+    /// Return the FFmpeg encoder name.
+    pub const fn as_ffmpeg(self) -> &'static str {
+        match self {
+            Self::HevcVideoToolbox => "hevc_videotoolbox",
+            Self::H264VideoToolbox => "h264_videotoolbox",
+        }
+    }
+}
+
 /// Audio output policy rendered as FFmpeg audio mapping and codec flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioPolicy {
@@ -249,7 +291,9 @@ impl LogLevel {
 pub struct FfmpegEncodeCommand {
     binary: PathBuf,
     input: InputSpec,
+    input_hwaccel: Option<InputHardwareAccel>,
     video: VideoOutputSpec,
+    hardware_video_encoder: Option<HardwareVideoEncoder>,
     audio: AudioPolicy,
     filters: Vec<VideoFilter>,
     hls: Option<HlsOutputSpec>,
@@ -264,6 +308,7 @@ impl FfmpegEncodeCommand {
         Self {
             binary: binary.into(),
             input,
+            input_hwaccel: None,
             video: VideoOutputSpec {
                 codec: VideoCodec::Copy,
                 crf: None,
@@ -272,6 +317,7 @@ impl FfmpegEncodeCommand {
                 color: ColorOutput::CopyFromInput,
                 max_resolution: None,
             },
+            hardware_video_encoder: None,
             audio: AudioPolicy::Copy,
             filters: Vec::new(),
             hls: None,
@@ -284,6 +330,18 @@ impl FfmpegEncodeCommand {
     /// Replace the video output spec rendered by this command.
     pub fn video(mut self, spec: VideoOutputSpec) -> Self {
         self.video = spec;
+        self
+    }
+
+    /// Enable hardware decode for the input.
+    pub fn input_hardware_accel(mut self, accel: InputHardwareAccel) -> Self {
+        self.input_hwaccel = Some(accel);
+        self
+    }
+
+    /// Override the video encoder with a hardware encoder implementation.
+    pub fn hardware_video_encoder(mut self, encoder: HardwareVideoEncoder) -> Self {
+        self.hardware_video_encoder = Some(encoder);
         self
     }
 
@@ -346,6 +404,9 @@ impl FfmpegEncodeCommand {
             push_arg(&mut args, "pipe:1");
         }
 
+        if let Some(accel) = self.input_hwaccel {
+            render_input_hardware_accel(accel, &mut args);
+        }
         args.extend(self.input.to_args());
 
         if self.video.codec == VideoCodec::Copy {
@@ -356,11 +417,14 @@ impl FfmpegEncodeCommand {
         } else {
             push_arg(&mut args, "-map");
             push_arg(&mut args, "0:v:0");
-            render_video_args(&self.video, &mut args);
+            render_video_args(&self.video, self.hardware_video_encoder, &mut args);
 
             if !self.filters.is_empty() {
                 push_arg(&mut args, "-vf");
-                push_arg(&mut args, render_filters(&self.filters));
+                push_arg(
+                    &mut args,
+                    render_filters(&self.filters, self.hardware_video_encoder),
+                );
             }
 
             render_audio_args(&self.audio, &mut args);
@@ -390,25 +454,57 @@ impl fmt::Display for FfmpegEncodeCommand {
     }
 }
 
-fn render_video_args(video: &VideoOutputSpec, args: &mut Vec<OsString>) {
-    push_arg(args, "-c:v");
-    push_arg(args, video_codec_arg(video.codec));
-
-    if video.codec != VideoCodec::Copy {
-        if let Some(crf) = video.crf {
-            push_arg(args, "-crf");
-            push_arg(args, crf.to_string());
-        }
-        push_arg(args, "-preset");
-        push_arg(args, video.preset.as_ffmpeg());
-        push_arg(args, "-pix_fmt");
-        push_arg(args, pixel_format(video.bit_depth));
-    }
-
-    render_color_args(video, args);
+fn render_input_hardware_accel(accel: InputHardwareAccel, args: &mut Vec<OsString>) {
+    push_arg(args, "-hwaccel");
+    push_arg(args, accel.as_ffmpeg());
+    push_arg(args, "-hwaccel_output_format");
+    push_arg(args, accel.output_format());
 }
 
-fn render_color_args(video: &VideoOutputSpec, args: &mut Vec<OsString>) {
+fn render_video_args(
+    video: &VideoOutputSpec,
+    hardware_encoder: Option<HardwareVideoEncoder>,
+    args: &mut Vec<OsString>,
+) {
+    push_arg(args, "-c:v");
+    push_arg(
+        args,
+        hardware_encoder.map_or_else(
+            || video_codec_arg(video.codec),
+            HardwareVideoEncoder::as_ffmpeg,
+        ),
+    );
+
+    if video.codec != VideoCodec::Copy {
+        if hardware_encoder.is_none() {
+            if let Some(crf) = video.crf {
+                push_arg(args, "-crf");
+                push_arg(args, crf.to_string());
+            }
+            push_arg(args, "-preset");
+            push_arg(args, video.preset.as_ffmpeg());
+        }
+        if hardware_encoder.is_none() {
+            push_arg(args, "-pix_fmt");
+            push_arg(args, pixel_format(video.bit_depth));
+        } else if matches!(
+            hardware_encoder,
+            Some(HardwareVideoEncoder::HevcVideoToolbox)
+        ) && video.bit_depth > 8
+        {
+            push_arg(args, "-profile");
+            push_arg(args, "main10");
+        }
+    }
+
+    render_color_args(video, hardware_encoder, args);
+}
+
+fn render_color_args(
+    video: &VideoOutputSpec,
+    hardware_encoder: Option<HardwareVideoEncoder>,
+    args: &mut Vec<OsString>,
+) {
     match &video.color {
         ColorOutput::CopyFromInput => {}
         ColorOutput::SdrBt709 => {
@@ -429,7 +525,7 @@ fn render_color_args(video: &VideoOutputSpec, args: &mut Vec<OsString>) {
             push_arg(args, "smpte2084");
             push_arg(args, "-colorspace");
             push_arg(args, "bt2020nc");
-            if video.codec == VideoCodec::Hevc {
+            if video.codec == VideoCodec::Hevc && hardware_encoder.is_none() {
                 push_arg(args, "-x265-params");
                 push_arg(
                     args,
@@ -639,12 +735,27 @@ fn render_hls_args(hls: &HlsOutputSpec, args: &mut Vec<OsString>) {
     args.push(hls.output_dir.join(&hls.playlist_filename).into_os_string());
 }
 
-fn render_filters(filters: &[VideoFilter]) -> String {
+fn render_filters(
+    filters: &[VideoFilter],
+    hardware_encoder: Option<HardwareVideoEncoder>,
+) -> String {
     filters
         .iter()
-        .map(VideoFilter::as_ffmpeg)
+        .map(|filter| render_filter(filter, hardware_encoder))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn render_filter(filter: &VideoFilter, hardware_encoder: Option<HardwareVideoEncoder>) -> String {
+    match (filter, hardware_encoder) {
+        (
+            VideoFilter::Scale(width, height),
+            Some(HardwareVideoEncoder::HevcVideoToolbox | HardwareVideoEncoder::H264VideoToolbox),
+        ) => {
+            format!("scale_vt=w={width}:h={height}")
+        }
+        _ => filter.as_ffmpeg(),
+    }
 }
 
 fn video_codec_arg(codec: VideoCodec) -> &'static str {

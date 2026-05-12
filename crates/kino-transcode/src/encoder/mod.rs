@@ -7,6 +7,7 @@ mod kind;
 pub mod registry;
 pub mod software;
 mod video;
+pub mod videotoolbox;
 
 pub use backend::Encoder;
 pub use capabilities::Capabilities;
@@ -15,6 +16,7 @@ pub use kind::{EncoderKind, LaneId};
 pub use registry::EncoderRegistry;
 pub use software::{SoftwareEncodeContext, SoftwareEncoder};
 pub use video::VideoCodec;
+pub use videotoolbox::VideoToolboxEncoder;
 
 #[cfg(test)]
 mod tests {
