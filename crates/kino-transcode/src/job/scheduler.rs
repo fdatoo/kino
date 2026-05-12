@@ -130,14 +130,9 @@ impl Scheduler {
             warn!(%job_id, "transcode job cancellation receiver was already closed");
         }
 
-        transition_or_accept_terminal(
-            &self.store,
-            job_id,
-            JobState::Running,
-            JobState::Cancelled,
-            None,
-        )
-        .await?;
+        let job = self.store.fetch_job(job_id).await?;
+        transition_or_accept_terminal(&self.store, job_id, job.state, JobState::Cancelled, None)
+            .await?;
         Ok(())
     }
 

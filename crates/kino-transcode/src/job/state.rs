@@ -67,7 +67,7 @@ impl FromStr for JobState {
 /// Validate a durable job state transition and return the accepted target state.
 pub const fn try_transition(from: JobState, to: JobState) -> Result<JobState> {
     match (from, to) {
-        (JobState::Planned, JobState::Running)
+        (JobState::Planned, JobState::Running | JobState::Cancelled)
         | (JobState::Running, JobState::Verifying | JobState::Failed | JobState::Cancelled)
         | (JobState::Verifying, JobState::Completed | JobState::Failed) => Ok(to),
         _ => Err(Error::InvalidTransition { from, to }),
@@ -93,7 +93,7 @@ mod tests {
         (JobState::Planned, JobState::Verifying, false),
         (JobState::Planned, JobState::Completed, false),
         (JobState::Planned, JobState::Failed, false),
-        (JobState::Planned, JobState::Cancelled, false),
+        (JobState::Planned, JobState::Cancelled, true),
         (JobState::Running, JobState::Planned, false),
         (JobState::Running, JobState::Running, false),
         (JobState::Running, JobState::Verifying, true),
