@@ -1122,6 +1122,7 @@ dependencies = [
  "kino-db",
  "kino-fulfillment",
  "kino-library",
+ "kino-transcode",
  "m3u8-rs",
  "oas3",
  "rand 0.8.6",

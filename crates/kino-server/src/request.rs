@@ -30,6 +30,7 @@ use kino_library::{
     CatalogService, CatalogSort, LibraryScanReport, LibraryScanService, ReocrJob,
     SubtitleReocrService,
 };
+use kino_transcode::TranscodeHandOff;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthenticatedUser;
@@ -47,6 +48,7 @@ pub(crate) struct AppState {
     pub(crate) library_root: PathBuf,
     pub(crate) artwork_cache_dir: PathBuf,
     pub(crate) canonical_layout: CanonicalLayoutWriter,
+    pub(crate) transcode: Arc<dyn TranscodeHandOff>,
 }
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -177,6 +179,7 @@ pub(crate) fn router_with_canonical_transfer(
     subtitle_reocr: SubtitleReocrService,
     tmdb: Option<TmdbClient>,
     canonical_transfer: CanonicalLayoutTransfer,
+    transcode: Arc<dyn TranscodeHandOff>,
 ) -> Router {
     let state = AppState {
         db: db.clone(),
@@ -187,6 +190,7 @@ pub(crate) fn router_with_canonical_transfer(
         subtitle_reocr,
         tmdb,
         canonical_layout: CanonicalLayoutWriter::new(&library_root, canonical_transfer),
+        transcode,
         library_root,
         artwork_cache_dir,
     };

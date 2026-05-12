@@ -1,6 +1,6 @@
 //! HTTP API server for Kino.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Router,
@@ -14,6 +14,11 @@ use kino_core::{
 use kino_db::Db;
 use kino_fulfillment::tmdb::TmdbClient;
 use kino_library::SubtitleReocrService;
+use kino_transcode::{
+    DefaultPolicy, DetectionConfig, EncoderRegistry, JobStore, OutputPolicy, PipelineRunner,
+    Scheduler, SchedulerConfig, TranscodeHandOff, TranscodeService, available_encoders,
+    encoder::SoftwareEncoder,
+};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod admin_config;
@@ -36,6 +41,9 @@ pub enum Error {
     /// Binding or serving the HTTP listener failed.
     #[error("http server error: {0}")]
     Io(#[from] std::io::Error),
+    /// Transcode service initialization failed.
+    #[error(transparent)]
+    Transcode(#[from] kino_transcode::Error),
 }
 
 /// Crate-local `Result` alias.
@@ -88,7 +96,8 @@ fn router_with_config_and_reocr(
     subtitle_reocr: SubtitleReocrService,
 ) -> Router {
     let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
-    router_with_config_reocr_and_tmdb(db, config, subtitle_reocr, tmdb_client)
+    let transcode = local_transcode_handoff(db.clone(), &config);
+    router_with_config_reocr_tmdb_and_transcode(db, config, subtitle_reocr, tmdb_client, transcode)
 }
 
 fn router_with_config_reocr_and_tmdb(
@@ -96,6 +105,17 @@ fn router_with_config_reocr_and_tmdb(
     config: Config,
     subtitle_reocr: SubtitleReocrService,
     tmdb_client: Option<TmdbClient>,
+) -> Router {
+    let transcode = local_transcode_handoff(db.clone(), &config);
+    router_with_config_reocr_tmdb_and_transcode(db, config, subtitle_reocr, tmdb_client, transcode)
+}
+
+fn router_with_config_reocr_tmdb_and_transcode(
+    db: Db,
+    config: Config,
+    subtitle_reocr: SubtitleReocrService,
+    tmdb_client: Option<TmdbClient>,
+    transcode: Arc<dyn TranscodeHandOff>,
 ) -> Router {
     let auth_state = auth::AuthState { db: db.clone() };
     let public_base_url = config.server.public_base_url.clone();
@@ -111,6 +131,7 @@ fn router_with_config_reocr_and_tmdb(
             subtitle_reocr,
             tmdb_client,
             canonical_transfer,
+            transcode,
         ))
         .merge(catalog_admin::router(
             db.clone(),
@@ -192,8 +213,21 @@ pub fn router_with_library_root_and_tmdb_client(
 pub async fn serve(config: &Config, db: Db) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     let local_addr = listener.local_addr()?;
+    let transcode = build_transcode_service(db.clone(), config).await?;
+    let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &config.library_root);
+    let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
     tracing::info!(listen = %local_addr, "server listening");
-    axum::serve(listener, router_with_config(db, config.clone())).await?;
+    axum::serve(
+        listener,
+        router_with_config_reocr_tmdb_and_transcode(
+            db,
+            config.clone(),
+            subtitle_reocr,
+            tmdb_client,
+            transcode,
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -225,6 +259,46 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
         ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         .max_age(std::time::Duration::from_secs(600))
+}
+
+async fn build_transcode_service(db: Db, config: &Config) -> Result<Arc<dyn TranscodeHandOff>> {
+    let store = JobStore::new(db);
+    let policy: Box<dyn OutputPolicy> = Box::new(DefaultPolicy::from_config(config)?);
+    let registry = Arc::new(available_encoders(&DetectionConfig::default()).await?);
+    let runner = Arc::new(PipelineRunner::new());
+    let scheduler_config = SchedulerConfig::from(&config.transcode.scheduler);
+    let scheduler = Arc::new(Scheduler::new(
+        store.clone(),
+        registry,
+        runner,
+        scheduler_config,
+    ));
+
+    if scheduler_config.recovery_on_boot {
+        scheduler.recover_on_boot().await?;
+    }
+
+    Arc::clone(&scheduler).spawn();
+
+    Ok(Arc::new(TranscodeService::new(store, policy, scheduler)))
+}
+
+fn local_transcode_handoff(db: Db, config: &Config) -> Arc<dyn TranscodeHandOff> {
+    let store = JobStore::new(db);
+    let policy: Box<dyn OutputPolicy> = match DefaultPolicy::from_config(config) {
+        Ok(policy) => Box::new(policy),
+        Err(err) => panic!("invalid transcode policy config: {err}"),
+    };
+    let mut registry = EncoderRegistry::new();
+    registry.register(Box::new(SoftwareEncoder::new()));
+    let scheduler = Arc::new(Scheduler::new(
+        store.clone(),
+        Arc::new(registry),
+        Arc::new(PipelineRunner::new()),
+        SchedulerConfig::from(&config.transcode.scheduler),
+    ));
+
+    Arc::new(TranscodeService::new(store, policy, scheduler))
 }
 
 /// Serve the Kino HTTP API on an explicit socket address and library root.
@@ -269,17 +343,35 @@ pub async fn serve_with_library_root_artwork_cache_and_public_base_url(
     artwork_cache_dir: impl Into<PathBuf>,
     public_base_url: impl Into<String>,
 ) -> Result<()> {
+    let library_root = library_root.into();
+    let artwork_cache_dir = artwork_cache_dir.into();
+    let config = Config {
+        database_path: PathBuf::from("kino.db"),
+        library_root: library_root.clone(),
+        library: kino_core::LibraryConfig {
+            artwork_cache_dir: Some(artwork_cache_dir),
+            ..kino_core::LibraryConfig::default()
+        },
+        server: ServerConfig {
+            public_base_url: public_base_url.into(),
+            listen,
+            ..ServerConfig::default()
+        },
+        tmdb: kino_core::config::TmdbConfig::default(),
+        ocr: kino_core::OcrConfig::default(),
+        providers: kino_core::config::ProvidersConfig::default(),
+        transcode: kino_core::TranscodeConfig::default(),
+        log_level: "info".to_owned(),
+        log_format: LogFormat::Pretty,
+    };
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let local_addr = listener.local_addr()?;
+    let transcode = build_transcode_service(db.clone(), &config).await?;
+    let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &library_root);
     tracing::info!(listen = %local_addr, "server listening");
     axum::serve(
         listener,
-        router_with_library_root_artwork_cache_and_public_base_url(
-            db,
-            library_root,
-            artwork_cache_dir,
-            public_base_url,
-        ),
+        router_with_config_reocr_tmdb_and_transcode(db, config, subtitle_reocr, None, transcode),
     )
     .await?;
     Ok(())

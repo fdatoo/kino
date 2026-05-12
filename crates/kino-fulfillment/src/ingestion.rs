@@ -51,6 +51,11 @@ where
     /// Ingest a ready source file and hand it to transcode.
     pub async fn ingest_source_file(&self, input: IngestSourceFile) -> Result<IngestedSourceFile> {
         let source_file = SourceFile::new(input.source_file_id, input.source_path);
+        let source_file = if let Some(probe) = input.probe {
+            source_file.with_probe(probe)
+        } else {
+            source_file
+        };
         let transcode = self.transcode.submit(source_file.clone()).await?;
 
         Ok(IngestedSourceFile {
@@ -72,6 +77,12 @@ where
             .place(CanonicalLayoutInput::new(input.source_path, input.target))
             .await?;
         let source_file = SourceFile::new(input.source_file_id, layout.canonical_path.clone());
+        let source_file = if let Some(mut probe) = input.probe {
+            probe.source_path = layout.canonical_path.clone();
+            source_file.with_probe(probe)
+        } else {
+            source_file
+        };
         let transcode = self.transcode.submit(source_file.clone()).await?;
 
         Ok(IngestedCanonicalSourceFile {
@@ -89,6 +100,8 @@ pub struct IngestSourceFile {
     pub source_file_id: Id,
     /// Path to the source file ready for transcode consideration.
     pub source_path: PathBuf,
+    /// Probe facts collected before transcode planning.
+    pub probe: Option<ProbeResult>,
 }
 
 impl IngestSourceFile {
@@ -97,6 +110,7 @@ impl IngestSourceFile {
         Self {
             source_file_id: Id::new(),
             source_path: source_path.into(),
+            probe: None,
         }
     }
 
@@ -105,7 +119,14 @@ impl IngestSourceFile {
         Self {
             source_file_id,
             source_path: source_path.into(),
+            probe: None,
         }
+    }
+
+    /// Attach probe facts collected for this source file.
+    pub fn with_probe(mut self, probe: ProbeResult) -> Self {
+        self.probe = Some(probe);
+        self
     }
 }
 
@@ -118,6 +139,8 @@ pub struct IngestCanonicalSourceFile {
     pub source_path: PathBuf,
     /// Canonical media target that determines the library path.
     pub target: CanonicalMediaTarget,
+    /// Probe facts collected before canonical placement.
+    pub probe: Option<ProbeResult>,
 }
 
 impl IngestCanonicalSourceFile {
@@ -127,6 +150,7 @@ impl IngestCanonicalSourceFile {
             source_file_id: Id::new(),
             source_path: source_path.into(),
             target,
+            probe: None,
         }
     }
 
@@ -140,7 +164,14 @@ impl IngestCanonicalSourceFile {
             source_file_id,
             source_path: source_path.into(),
             target,
+            probe: None,
         }
+    }
+
+    /// Attach probe facts collected for this source file.
+    pub fn with_probe(mut self, probe: ProbeResult) -> Self {
+        self.probe = Some(probe);
+        self
     }
 }
 

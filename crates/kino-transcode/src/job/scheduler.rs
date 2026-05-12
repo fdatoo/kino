@@ -140,6 +140,20 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Return the lane selected for a planned variant on this host.
+    pub fn lane_for_variant(&self, variant: &PlannedVariant) -> Result<LaneId> {
+        let (width, height) = variant_dimensions(variant);
+        self.registry
+            .select_for_codec(variant.codec, width, height, variant.bit_depth)
+            .map(Encoder::lane)
+            .ok_or(Error::NoEncoderForVariant {
+                codec: variant.codec,
+                width,
+                height,
+                bit_depth: variant.bit_depth,
+            })
+    }
+
     async fn run_loop(self: Arc<Self>) {
         loop {
             if self.shutdown.is_cancelled() {
