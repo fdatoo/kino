@@ -1098,6 +1098,7 @@ name = "kino-transcode"
 version = "0.1.0"
 dependencies = [
  "kino-core",
+ "serde",
  "thiserror",
  "tokio",
 ]
