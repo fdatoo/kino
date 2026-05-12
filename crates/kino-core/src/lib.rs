@@ -21,7 +21,11 @@ pub use catalog::{
     CatalogStreamVariant, MediaItem, MediaItemKind, SourceFile, TranscodeOutput,
     VariantCapabilities, VariantKind,
 };
-pub use config::{CanonicalLayoutTransfer, Config, LibraryConfig, OcrConfig, SessionReaperConfig};
+pub use config::{
+    CanonicalLayoutTransfer, Config, LibraryConfig, OcrConfig, SessionReaperConfig,
+    TranscodeConfig, TranscodePolicyCompatibilityConfig, TranscodePolicyConfig,
+    TranscodePolicyHighConfig,
+};
 pub use device_token::DeviceToken;
 pub use id::Id;
 pub use identity::{

@@ -3,6 +3,7 @@
 pub mod encoder;
 pub mod job;
 pub mod pipeline;
+pub mod plan;
 
 use std::{
     future::Future,
@@ -18,6 +19,8 @@ pub use pipeline::{
     AudioPolicy, ColorOutput, FfmpegEncodeCommand, HlsOutputSpec, InputSpec, LogLevel, Preset,
     VideoFilter, VideoOutputSpec,
 };
+pub use plan::VariantKind;
+pub use plan::{DefaultPolicy, OutputPolicy, PlannedVariant, SourceContext, TranscodeProfile};
 
 /// Errors produced by `kino-transcode`.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +45,15 @@ pub enum Error {
     /// Video codec string is not recognized.
     #[error("invalid video codec: {0}")]
     InvalidVideoCodec(String),
+    /// Output variant kind string is not recognized.
+    #[error("invalid variant kind: {0}")]
+    InvalidVariantKind(String),
+    /// Output color target string is not recognized.
+    #[error("invalid color target: {0}")]
+    InvalidColorTarget(String),
+    /// Output audio policy kind string is not recognized.
+    #[error("invalid audio policy kind: {0}")]
+    InvalidAudioPolicyKind(String),
     /// Internal no-op recorder state could not be accessed.
     #[error("transcode recorder lock failed: {0}")]
     RecorderLock(String),
