@@ -211,6 +211,31 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
             .is_some()
     );
     assert!(body["paths"].get("/api/v1/stream/transcode/{id}").is_some());
+    assert!(
+        body["paths"]
+            .get("/api/v1/stream/items/{id}/master.m3u8")
+            .is_some()
+    );
+    assert!(
+        body["paths"]
+            .get("/api/v1/stream/transcodes/{transcode_output_id}/media.m3u8")
+            .is_some()
+    );
+    assert!(
+        body["paths"]
+            .get("/api/v1/stream/transcodes/{transcode_output_id}/init.mp4")
+            .is_some()
+    );
+    assert!(
+        body["paths"]
+            .get("/api/v1/stream/transcodes/{transcode_output_id}/seg-{segment}.m4s")
+            .is_some()
+    );
+    assert!(
+        body["paths"]
+            .get("/api/v1/stream/items/{id}/{variant_id}/master.m3u8")
+            .is_none()
+    );
     assert!(body["paths"].get("/api/v1/library/items/{id}").is_some());
     assert!(
         body["paths"]

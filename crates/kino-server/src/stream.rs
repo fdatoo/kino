@@ -39,7 +39,7 @@ pub(crate) fn router(db: Db) -> Router {
     let subtitles = SubtitleService::new(db.clone());
     Router::new()
         .route(
-            "/api/v1/stream/items/{id}/{variant_id}/master.m3u8",
+            "/api/v1/stream/items/{id}/master.m3u8",
             get(master_playlist),
         )
         .route(
@@ -52,43 +52,71 @@ pub(crate) fn router(db: Db) -> Router {
         )
         .route("/api/v1/stream/transcode/{id}", get(transcode_output))
         .route(
+            "/api/v1/stream/transcodes/{id}/media.m3u8",
+            get(transcode_media_playlist),
+        )
+        .route(
+            "/api/v1/stream/transcodes/{id}/init.mp4",
+            get(transcode_init_segment),
+        )
+        .route(
+            "/api/v1/stream/transcodes/{id}/{segment}",
+            get(transcode_media_segment),
+        )
+        .route(
             "/api/v1/stream/items/{id}/subtitles/{track_vtt}",
             get(subtitle_track),
         )
         .with_state(StreamState { db, subtitles })
 }
 
-/// Serve an HLS master playlist for a media item stream variant.
+/// Serve an HLS master playlist for a media item.
 #[utoipa::path(
     get,
-    path = "/api/v1/stream/items/{id}/{variant_id}/master.m3u8",
+    path = "/api/v1/stream/items/{id}/master.m3u8",
     tag = "stream",
     params(
-        ("id" = Id, Path, description = "Media item id"),
-        ("variant_id" = String, Path, description = "Catalog stream variant id")
+        ("id" = Id, Path, description = "Media item id")
     ),
     responses(
-        (status = 200, description = "HLS master playlist", content_type = "application/vnd.apple.mpegurl"),
-        (status = 404, description = "Stream variant not found", body = StreamErrorResponse),
+        (status = 200, description = "HLS master playlist", body = String, content_type = "application/vnd.apple.mpegurl"),
+        (status = 404, description = "Media item source file not found", body = StreamErrorResponse),
+        (status = 422, description = "Packaged transcode output is not playlist-ready", body = StreamErrorResponse),
         (status = 500, description = "Master playlist generation failed", body = StreamErrorResponse)
     )
 )]
 pub(crate) async fn master_playlist(
     State(state): State<StreamState>,
-    AxumPath((media_item_id, variant_id)): AxumPath<(Id, Id)>,
+    AxumPath(media_item_id): AxumPath<Id>,
 ) -> StreamResult<Response> {
-    let source_file = lookup_source_variant(&state.db, media_item_id, variant_id).await?;
+    let source_file = lookup_primary_source_file(&state.db, media_item_id).await?;
     let probe = FfprobeFileProbe::new().probe(&source_file.path).await?;
-    let metadata = tokio::fs::metadata(&source_file.path).await?;
     let subtitles = lookup_subtitle_tracks(&state.db, media_item_id).await?;
-    let playlist = build_master_playlist(
-        media_item_id,
-        variant_id,
-        metadata.len(),
-        source_file.probe_duration_seconds,
-        &probe,
-        &subtitles,
-    );
+    let transcode_outputs = lookup_packaged_transcode_outputs(&state.db, media_item_id).await?;
+    let playlist = if transcode_outputs.is_empty() {
+        let metadata = tokio::fs::metadata(&source_file.path).await?;
+        build_master_playlist(
+            media_item_id,
+            source_media_playlist_uri(media_item_id, source_file.id),
+            vec![StreamVariant::source_fallback(
+                source_media_playlist_uri(media_item_id, source_file.id),
+                metadata.len(),
+                source_file.probe_duration_seconds,
+                &probe,
+            )],
+            &probe,
+            &subtitles,
+        )
+    } else {
+        let variants = packaged_stream_variants(&transcode_outputs).await?;
+        build_master_playlist(
+            media_item_id,
+            transcode_media_playlist_uri(transcode_outputs[0].id),
+            variants,
+            &probe,
+            &subtitles,
+        )
+    };
 
     Response::builder()
         .status(StatusCode::OK)
@@ -221,6 +249,129 @@ pub(crate) async fn transcode_output(
     stream_file(transcode_output.path, headers).await
 }
 
+/// Serve a packaged transcode output HLS media playlist.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/transcodes/{transcode_output_id}/media.m3u8",
+    tag = "stream",
+    params(
+        ("transcode_output_id" = Id, Path, description = "Packaged transcode-output id")
+    ),
+    responses(
+        (status = 200, description = "Packaged HLS media playlist", body = String, content_type = "application/vnd.apple.mpegurl"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Transcode output not found", body = StreamErrorResponse),
+        (status = 422, description = "Transcode output is not playlist-ready", body = StreamErrorResponse),
+        (status = 500, description = "Transcode media playlist failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn transcode_media_playlist(
+    State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
+    AxumPath(id): AxumPath<Id>,
+) -> StreamResult<Response> {
+    let transcode_output = lookup_packaged_transcode_output(&state.db, id).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        transcode_output.media_item_id,
+        id.to_string(),
+    )
+    .await?;
+
+    let playlist_path = transcode_output.playlist_path()?;
+    let playlist = tokio::fs::read_to_string(&playlist_path).await?;
+    let playlist = rewrite_transcode_playlist_uris(id, &playlist)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HLS_CONTENT_TYPE)
+        .body(Body::from(playlist))
+        .map_err(StreamError::Response)
+}
+
+/// Serve a packaged transcode output init segment with single-range support.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/transcodes/{transcode_output_id}/init.mp4",
+    tag = "stream",
+    params(
+        ("transcode_output_id" = Id, Path, description = "Packaged transcode-output id"),
+        ("Range" = Option<String>, Header, description = "Single HTTP byte range")
+    ),
+    responses(
+        (status = 200, description = "Full init segment", content_type = "video/mp4"),
+        (status = 206, description = "Requested init segment byte range", content_type = "video/mp4"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Transcode output not found", body = StreamErrorResponse),
+        (status = 416, description = "Requested range is not satisfiable", body = StreamErrorResponse),
+        (status = 422, description = "Transcode output is missing init segment metadata", body = StreamErrorResponse),
+        (status = 500, description = "Init segment stream failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn transcode_init_segment(
+    State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
+    AxumPath(id): AxumPath<Id>,
+    headers: HeaderMap,
+) -> StreamResult<Response> {
+    let transcode_output = lookup_packaged_transcode_output(&state.db, id).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        transcode_output.media_item_id,
+        id.to_string(),
+    )
+    .await?;
+
+    stream_file(transcode_output.init_path()?, headers).await
+}
+
+/// Serve a packaged transcode output media segment with single-range support.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/transcodes/{transcode_output_id}/seg-{segment}.m4s",
+    tag = "stream",
+    params(
+        ("transcode_output_id" = Id, Path, description = "Packaged transcode-output id"),
+        ("segment" = String, Path, description = "Five-digit segment number"),
+        ("Range" = Option<String>, Header, description = "Single HTTP byte range")
+    ),
+    responses(
+        (status = 200, description = "Full media segment"),
+        (status = 206, description = "Requested media segment byte range"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Transcode output or segment not found", body = StreamErrorResponse),
+        (status = 416, description = "Requested range is not satisfiable", body = StreamErrorResponse),
+        (status = 500, description = "Media segment stream failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn transcode_media_segment(
+    State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
+    AxumPath((id, segment)): AxumPath<(Id, String)>,
+    headers: HeaderMap,
+) -> StreamResult<Response> {
+    let segment_filename = route_segment_filename(&segment)?;
+    let transcode_output = lookup_packaged_transcode_output(&state.db, id).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        transcode_output.media_item_id,
+        id.to_string(),
+    )
+    .await?;
+
+    stream_file(
+        transcode_output.directory_path.join(segment_filename),
+        headers,
+    )
+    .await
+}
+
 /// Serve a subtitle sidecar as a WebVTT rendition.
 #[utoipa::path(
     get,
@@ -302,11 +453,106 @@ struct SourceFileRow {
     probe_duration_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct PackagedTranscodeOutputRow {
+    id: Id,
+    media_item_id: Id,
+    directory_path: PathBuf,
+    playlist_filename: Option<String>,
+    init_filename: Option<String>,
+    encode_metadata_json: Option<String>,
+}
+
+impl PackagedTranscodeOutputRow {
+    fn playlist_path(&self) -> StreamResult<PathBuf> {
+        Ok(self
+            .directory_path
+            .join(playlist_filename(self.playlist_filename.as_deref())?))
+    }
+
+    fn init_path(&self) -> StreamResult<PathBuf> {
+        Ok(self
+            .directory_path
+            .join(init_filename(self.init_filename.as_deref())?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubtitleTrackRow {
     language: String,
     track_index: u32,
     forced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamVariant {
+    uri: String,
+    bandwidth: u64,
+    codecs: String,
+    resolution: Option<(u32, u32)>,
+    video_range: Option<VideoRange>,
+}
+
+impl StreamVariant {
+    fn source_fallback(
+        uri: String,
+        file_size_bytes: u64,
+        source_duration_seconds: Option<u64>,
+        probe: &ProbeResult,
+    ) -> Self {
+        Self {
+            uri,
+            bandwidth: estimate_bandwidth(
+                file_size_bytes,
+                probe.duration_seconds().or(source_duration_seconds),
+            ),
+            codecs: codec_string(probe),
+            resolution: primary_resolution(&probe.video_streams),
+            video_range: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoRange {
+    Sdr,
+    Pq,
+    Hlg,
+}
+
+impl VideoRange {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "SDR" => Some(Self::Sdr),
+            "PQ" => Some(Self::Pq),
+            "HLG" => Some(Self::Hlg),
+            _ => None,
+        }
+    }
+
+    const fn as_hls_value(self) -> &'static str {
+        match self {
+            Self::Sdr => "SDR",
+            Self::Pq => "PQ",
+            Self::Hlg => "HLG",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EncodeMetadata {
+    codecs: String,
+    resolution: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    video_range: Option<String>,
+    duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PackagedPlaylistMetrics {
+    bytes: u64,
+    duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +730,83 @@ async fn lookup_transcode_output(db: &Db, id: Id) -> StreamResult<SourceFileRow>
     source_file_row(&row)
 }
 
+async fn lookup_packaged_transcode_output(
+    db: &Db,
+    id: Id,
+) -> StreamResult<PackagedTranscodeOutputRow> {
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT
+            transcode_outputs.id,
+            source_files.media_item_id,
+            transcode_outputs.directory_path,
+            transcode_outputs.playlist_filename,
+            transcode_outputs.init_filename,
+            transcode_outputs.encode_metadata_json
+        FROM transcode_outputs
+        JOIN source_files ON source_files.id = transcode_outputs.source_file_id
+        WHERE transcode_outputs.id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(db.read_pool())
+    .await?
+    else {
+        return Err(StreamError::NotFound);
+    };
+
+    packaged_transcode_output_row(&row)
+}
+
+async fn lookup_packaged_transcode_outputs(
+    db: &Db,
+    media_item_id: Id,
+) -> StreamResult<Vec<PackagedTranscodeOutputRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            transcode_outputs.id,
+            source_files.media_item_id,
+            transcode_outputs.directory_path,
+            transcode_outputs.playlist_filename,
+            transcode_outputs.init_filename,
+            transcode_outputs.encode_metadata_json
+        FROM transcode_outputs
+        JOIN source_files ON source_files.id = transcode_outputs.source_file_id
+        WHERE source_files.media_item_id = ?1
+          AND transcode_outputs.directory_path IS NOT NULL
+        ORDER BY source_files.created_at, source_files.id, transcode_outputs.created_at, transcode_outputs.id
+        "#,
+    )
+    .bind(media_item_id)
+    .fetch_all(db.read_pool())
+    .await?;
+
+    rows.iter()
+        .map(packaged_transcode_output_row)
+        .collect::<StreamResult<Vec<_>>>()
+}
+
+async fn lookup_primary_source_file(db: &Db, media_item_id: Id) -> StreamResult<SourceFileRow> {
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT id, media_item_id, path, probe_duration_seconds
+        FROM source_files
+        WHERE media_item_id = ?1
+        ORDER BY created_at, id
+        LIMIT 1
+        "#,
+    )
+    .bind(media_item_id)
+    .fetch_optional(db.read_pool())
+    .await?
+    else {
+        return Err(StreamError::NotFound);
+    };
+
+    source_file_row(&row)
+}
+
 async fn lookup_source_variant(
     db: &Db,
     media_item_id: Id,
@@ -517,6 +840,26 @@ fn source_file_row(row: &sqlx::sqlite::SqliteRow) -> StreamResult<SourceFileRow>
         media_item_id: row.try_get("media_item_id")?,
         path: PathBuf::from(path),
         probe_duration_seconds,
+    })
+}
+
+fn packaged_transcode_output_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> StreamResult<PackagedTranscodeOutputRow> {
+    let directory_path = row.try_get::<Option<String>, _>("directory_path")?;
+    let Some(directory_path) = directory_path.filter(|value| !value.is_empty()) else {
+        return Err(playlist_unavailable(
+            "transcode output has no package directory",
+        ));
+    };
+
+    Ok(PackagedTranscodeOutputRow {
+        id: row.try_get("id")?,
+        media_item_id: row.try_get("media_item_id")?,
+        directory_path: PathBuf::from(directory_path),
+        playlist_filename: row.try_get("playlist_filename")?,
+        init_filename: row.try_get("init_filename")?,
+        encode_metadata_json: row.try_get("encode_metadata_json")?,
     })
 }
 
@@ -804,17 +1147,274 @@ async fn lookup_subtitle_tracks(db: &Db, media_item_id: Id) -> StreamResult<Vec<
         .map_err(StreamError::Sqlx)
 }
 
+async fn packaged_stream_variants(
+    outputs: &[PackagedTranscodeOutputRow],
+) -> StreamResult<Vec<StreamVariant>> {
+    let mut variants = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let Some(metadata_json) = output
+            .encode_metadata_json
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(media_playlist_filename) = output
+            .playlist_filename
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let metadata = parse_encode_metadata(output.id, metadata_json)?;
+        let playlist_path = output
+            .directory_path
+            .join(playlist_filename(Some(media_playlist_filename))?);
+        let playlist = tokio::fs::read_to_string(&playlist_path).await?;
+        let metrics = packaged_playlist_metrics(output, &playlist).await?;
+        let resolution = encode_metadata_resolution(output.id, &metadata)?;
+        let codecs = required_metadata_text(output.id, "codecs", metadata.codecs)?;
+        let video_range = encode_metadata_video_range(output.id, metadata.video_range)?;
+        variants.push(StreamVariant {
+            uri: transcode_media_playlist_uri(output.id),
+            bandwidth: estimate_bandwidth(
+                metrics.bytes,
+                metrics
+                    .duration_seconds
+                    .or(metadata.duration_seconds)
+                    .filter(|duration| *duration > 0),
+            ),
+            codecs,
+            resolution,
+            video_range,
+        });
+    }
+
+    if variants.is_empty() {
+        return Err(playlist_unavailable(
+            "packaged transcode outputs are missing playlists or encode metadata",
+        ));
+    }
+
+    Ok(variants)
+}
+
+fn parse_encode_metadata(id: Id, metadata_json: &str) -> StreamResult<EncodeMetadata> {
+    serde_json::from_str(metadata_json).map_err(|error| {
+        playlist_unavailable(format!(
+            "transcode output {id} encode metadata json is invalid: {error}"
+        ))
+    })
+}
+
+fn encode_metadata_resolution(
+    id: Id,
+    metadata: &EncodeMetadata,
+) -> StreamResult<Option<(u32, u32)>> {
+    if let Some(resolution) = metadata.resolution.as_deref() {
+        let resolution = required_metadata_text(id, "resolution", resolution.to_owned())?;
+        let Some((width, height)) = resolution.split_once('x') else {
+            return Err(invalid_encode_metadata(
+                id,
+                "resolution must be formatted as WIDTHxHEIGHT",
+            ));
+        };
+        let width = parse_positive_u32(id, "resolution width", width)?;
+        let height = parse_positive_u32(id, "resolution height", height)?;
+        return Ok(Some((width, height)));
+    }
+
+    match (metadata.width, metadata.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Ok(Some((width, height))),
+        (None, None) => Err(invalid_encode_metadata(id, "resolution is missing")),
+        _ => Err(invalid_encode_metadata(
+            id,
+            "width and height must both be present and positive",
+        )),
+    }
+}
+
+fn encode_metadata_video_range(id: Id, value: Option<String>) -> StreamResult<Option<VideoRange>> {
+    let value = value.ok_or_else(|| invalid_encode_metadata(id, "video_range is missing"))?;
+    let value = required_metadata_text(id, "video_range", value)?;
+    VideoRange::parse(&value)
+        .map(Some)
+        .ok_or_else(|| invalid_encode_metadata(id, "video_range must be SDR, PQ, or HLG"))
+}
+
+fn required_metadata_text(id: Id, field: &'static str, value: String) -> StreamResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(invalid_encode_metadata(id, format!("{field} is empty")));
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_positive_u32(id: Id, field: &'static str, value: &str) -> StreamResult<u32> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid_encode_metadata(id, format!("{field} must be positive")))
+}
+
+fn invalid_encode_metadata(id: Id, reason: impl Into<String>) -> StreamError {
+    playlist_unavailable(format!(
+        "transcode output {id} encode metadata is invalid: {}",
+        reason.into()
+    ))
+}
+
+async fn packaged_playlist_metrics(
+    output: &PackagedTranscodeOutputRow,
+    playlist: &str,
+) -> StreamResult<PackagedPlaylistMetrics> {
+    let mut bytes = 0_u64;
+    let mut duration = 0_f64;
+
+    if let Some(init_file) = output
+        .init_filename
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        bytes = bytes.saturating_add(
+            tokio::fs::metadata(output.directory_path.join(init_filename(Some(init_file))?))
+                .await?
+                .len(),
+        );
+    }
+
+    for line in playlist.lines().map(str::trim) {
+        if let Some(extinf) = line.strip_prefix("#EXTINF:") {
+            let value = extinf.split_once(',').map_or(extinf, |(value, _)| value);
+            if let Ok(seconds) = value.parse::<f64>() {
+                duration += seconds;
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let filename = segment_uri_filename(line)?;
+        bytes = bytes.saturating_add(
+            tokio::fs::metadata(output.directory_path.join(filename))
+                .await?
+                .len(),
+        );
+    }
+
+    Ok(PackagedPlaylistMetrics {
+        bytes,
+        duration_seconds: (duration > 0.0).then(|| duration.ceil() as u64),
+    })
+}
+
+fn rewrite_transcode_playlist_uris(id: Id, playlist: &str) -> StreamResult<String> {
+    let mut rewritten = String::with_capacity(playlist.len());
+    for line in playlist.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#EXT-X-MAP:") {
+            rewritten.push_str(&rewrite_hls_map_uri(id, line)?);
+        } else if trimmed.is_empty() || trimmed.starts_with('#') {
+            rewritten.push_str(line);
+        } else {
+            let filename = segment_uri_filename(trimmed)?;
+            rewritten.push_str(&format!("/api/v1/stream/transcodes/{id}/{filename}"));
+        }
+        rewritten.push('\n');
+    }
+    Ok(rewritten)
+}
+
+fn rewrite_hls_map_uri(id: Id, line: &str) -> StreamResult<String> {
+    let Some(attribute_start) = line.find("URI=\"") else {
+        return Err(playlist_unavailable("media playlist EXT-X-MAP has no URI"));
+    };
+    let value_start = attribute_start + "URI=\"".len();
+    let Some(value_end) = line[value_start..]
+        .find('"')
+        .map(|offset| value_start + offset)
+    else {
+        return Err(playlist_unavailable(
+            "media playlist EXT-X-MAP URI is not quoted",
+        ));
+    };
+
+    let mut rewritten = String::with_capacity(line.len() + 64);
+    rewritten.push_str(&line[..value_start]);
+    rewritten.push_str(&format!("/api/v1/stream/transcodes/{id}/init.mp4"));
+    rewritten.push_str(&line[value_end..]);
+    Ok(rewritten)
+}
+
+fn segment_uri_filename(uri: &str) -> StreamResult<String> {
+    let filename = uri.rsplit('/').next().unwrap_or(uri);
+    let filename = filename
+        .split_once('?')
+        .map_or(filename, |(filename, _)| filename);
+    if !filename.starts_with("seg-") || !filename.ends_with(".m4s") {
+        return Err(playlist_unavailable(
+            "media playlist segment URI must use seg-{n}.m4s",
+        ));
+    }
+    let segment = &filename["seg-".len()..filename.len() - ".m4s".len()];
+    segment_filename(segment)
+}
+
+fn playlist_filename(value: Option<&str>) -> StreamResult<&str> {
+    path_filename(value, "playlist_filename")
+}
+
+fn init_filename(value: Option<&str>) -> StreamResult<&str> {
+    path_filename(value, "init_filename")
+}
+
+fn path_filename<'a>(value: Option<&'a str>, field: &'static str) -> StreamResult<&'a str> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Err(playlist_unavailable(format!(
+            "transcode output is missing {field}"
+        )));
+    };
+    if value.contains('/') || value.contains('\\') || value == "." || value == ".." {
+        return Err(playlist_unavailable(format!(
+            "transcode output {field} must be a file name"
+        )));
+    }
+    Ok(value)
+}
+
+fn segment_filename(segment: &str) -> StreamResult<String> {
+    if segment.len() != 5 || !segment.chars().all(|character| character.is_ascii_digit()) {
+        return Err(StreamError::NotFound);
+    }
+    Ok(format!("seg-{segment}.m4s"))
+}
+
+fn route_segment_filename(segment: &str) -> StreamResult<String> {
+    if !segment.starts_with("seg-") || !segment.ends_with(".m4s") {
+        return Err(StreamError::NotFound);
+    }
+    let segment = &segment["seg-".len()..segment.len() - ".m4s".len()];
+    segment_filename(segment)
+}
+
+fn source_media_playlist_uri(media_item_id: Id, source_file_id: Id) -> String {
+    format!("/api/v1/stream/items/{media_item_id}/{source_file_id}/media.m3u8")
+}
+
+fn transcode_media_playlist_uri(transcode_output_id: Id) -> String {
+    format!("/api/v1/stream/transcodes/{transcode_output_id}/media.m3u8")
+}
+
 fn build_master_playlist(
     media_item_id: Id,
-    variant_id: Id,
-    file_size_bytes: u64,
-    source_duration_seconds: Option<u64>,
+    audio_playlist_uri: String,
+    variants: Vec<StreamVariant>,
     probe: &ProbeResult,
     subtitles: &[SubtitleTrackRow],
 ) -> String {
     let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
-    let media_playlist_uri =
-        format!("/api/v1/stream/items/{media_item_id}/{variant_id}/media.m3u8");
 
     for (position, audio) in probe.audio_streams.iter().enumerate() {
         let language = audio.language.as_deref();
@@ -833,7 +1433,7 @@ fn build_master_playlist(
         push_quoted_attribute(
             &mut playlist,
             "URI",
-            &format!("{media_playlist_uri}?audio={}", audio.index),
+            &format!("{audio_playlist_uri}?audio={}", audio.index),
         );
         playlist.push('\n');
     }
@@ -855,27 +1455,29 @@ fn build_master_playlist(
         playlist.push('\n');
     }
 
-    playlist.push_str("#EXT-X-STREAM-INF:");
-    playlist.push_str(&format!(
-        "BANDWIDTH={},CODECS=\"{}\"",
-        estimate_bandwidth(
-            file_size_bytes,
-            probe.duration_seconds().or(source_duration_seconds)
-        ),
-        codec_string(probe)
-    ));
-    if let Some((width, height)) = primary_resolution(&probe.video_streams) {
-        playlist.push_str(&format!(",RESOLUTION={width}x{height}"));
+    for variant in variants {
+        playlist.push_str("#EXT-X-STREAM-INF:");
+        playlist.push_str(&format!(
+            "BANDWIDTH={},CODECS=\"{}\"",
+            variant.bandwidth, variant.codecs
+        ));
+        if let Some((width, height)) = variant.resolution {
+            playlist.push_str(&format!(",RESOLUTION={width}x{height}"));
+        }
+        if let Some(video_range) = variant.video_range {
+            playlist.push_str(",VIDEO-RANGE=");
+            playlist.push_str(video_range.as_hls_value());
+        }
+        if !probe.audio_streams.is_empty() {
+            playlist.push_str(",AUDIO=\"audio\"");
+        }
+        if !subtitles.is_empty() {
+            playlist.push_str(",SUBTITLES=\"subs\"");
+        }
+        playlist.push('\n');
+        playlist.push_str(&variant.uri);
+        playlist.push('\n');
     }
-    if !probe.audio_streams.is_empty() {
-        playlist.push_str(",AUDIO=\"audio\"");
-    }
-    if !subtitles.is_empty() {
-        playlist.push_str(",SUBTITLES=\"subs\"");
-    }
-    playlist.push('\n');
-    playlist.push_str(&media_playlist_uri);
-    playlist.push('\n');
 
     playlist
 }
@@ -1154,6 +1756,7 @@ fn content_type(path: &Path) -> &'static str {
     {
         Some("mkv") | Some("mk3d") | Some("mka") | Some("mks") => "video/x-matroska",
         Some("mp4") => "video/mp4",
+        Some("m4s") => "video/iso.segment",
         Some("m4v") => "video/x-m4v",
         Some("mov") => "video/quicktime",
         Some("webm") => "video/webm",
