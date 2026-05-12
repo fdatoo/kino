@@ -33,6 +33,7 @@ pub mod session_reaper;
 pub mod session_service;
 mod stream;
 mod token;
+mod transcode_admin;
 pub mod variant_select;
 
 /// Errors produced by `kino-server`.
@@ -96,7 +97,7 @@ fn router_with_config_and_reocr(
     subtitle_reocr: SubtitleReocrService,
 ) -> Router {
     let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
-    let transcode = local_transcode_handoff(db.clone(), &config);
+    let transcode = local_transcode_runtime(db.clone(), &config);
     router_with_config_reocr_tmdb_and_transcode(db, config, subtitle_reocr, tmdb_client, transcode)
 }
 
@@ -106,8 +107,13 @@ fn router_with_config_reocr_and_tmdb(
     subtitle_reocr: SubtitleReocrService,
     tmdb_client: Option<TmdbClient>,
 ) -> Router {
-    let transcode = local_transcode_handoff(db.clone(), &config);
+    let transcode = local_transcode_runtime(db.clone(), &config);
     router_with_config_reocr_tmdb_and_transcode(db, config, subtitle_reocr, tmdb_client, transcode)
+}
+
+struct TranscodeRuntime {
+    service: Arc<TranscodeService>,
+    encoders: Arc<EncoderRegistry>,
 }
 
 fn router_with_config_reocr_tmdb_and_transcode(
@@ -115,7 +121,7 @@ fn router_with_config_reocr_tmdb_and_transcode(
     config: Config,
     subtitle_reocr: SubtitleReocrService,
     tmdb_client: Option<TmdbClient>,
-    transcode: Arc<dyn TranscodeHandOff>,
+    transcode: TranscodeRuntime,
 ) -> Router {
     let auth_state = auth::AuthState { db: db.clone() };
     let public_base_url = config.server.public_base_url.clone();
@@ -124,6 +130,7 @@ fn router_with_config_reocr_tmdb_and_transcode(
     let canonical_transfer = config.library.canonical_transfer;
     let cors = cors_layer(&config.server);
     let live_stream = live_stream_state(db.clone(), &config);
+    let transcode_handoff: Arc<dyn TranscodeHandOff> = transcode.service.clone();
     let protected_api = Router::new()
         .merge(request::router_with_canonical_transfer(
             db.clone(),
@@ -132,7 +139,7 @@ fn router_with_config_reocr_tmdb_and_transcode(
             subtitle_reocr,
             tmdb_client,
             canonical_transfer,
-            transcode,
+            transcode_handoff,
         ))
         .merge(catalog_admin::router(
             db.clone(),
@@ -141,8 +148,13 @@ fn router_with_config_reocr_tmdb_and_transcode(
         .merge(stream::router_with_live(db.clone(), live_stream))
         .merge(token::router(db.clone()))
         .merge(playback::router(db.clone()))
-        .merge(session_admin::router(db))
+        .merge(session_admin::router(db.clone()))
         .merge(admin_config::router(config))
+        .merge(transcode_admin::router(
+            db,
+            transcode.service,
+            transcode.encoders,
+        ))
         .route_layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_auth,
@@ -274,7 +286,7 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
         .max_age(std::time::Duration::from_secs(600))
 }
 
-async fn build_transcode_service(db: Db, config: &Config) -> Result<Arc<dyn TranscodeHandOff>> {
+async fn build_transcode_service(db: Db, config: &Config) -> Result<TranscodeRuntime> {
     let store = JobStore::new(db);
     let policy: Box<dyn OutputPolicy> = Box::new(DefaultPolicy::from_config(config)?);
     let registry = Arc::new(available_encoders(&DetectionConfig::default()).await?);
@@ -282,7 +294,7 @@ async fn build_transcode_service(db: Db, config: &Config) -> Result<Arc<dyn Tran
     let scheduler_config = SchedulerConfig::from(&config.transcode.scheduler);
     let scheduler = Arc::new(Scheduler::new(
         store.clone(),
-        registry,
+        Arc::clone(&registry),
         runner,
         scheduler_config,
     ));
@@ -293,10 +305,13 @@ async fn build_transcode_service(db: Db, config: &Config) -> Result<Arc<dyn Tran
 
     Arc::clone(&scheduler).spawn();
 
-    Ok(Arc::new(TranscodeService::new(store, policy, scheduler)))
+    Ok(TranscodeRuntime {
+        service: Arc::new(TranscodeService::new(store, policy, scheduler)),
+        encoders: registry,
+    })
 }
 
-fn local_transcode_handoff(db: Db, config: &Config) -> Arc<dyn TranscodeHandOff> {
+fn local_transcode_runtime(db: Db, config: &Config) -> TranscodeRuntime {
     let store = JobStore::new(db);
     let policy: Box<dyn OutputPolicy> = match DefaultPolicy::from_config(config) {
         Ok(policy) => Box::new(policy),
@@ -304,14 +319,18 @@ fn local_transcode_handoff(db: Db, config: &Config) -> Arc<dyn TranscodeHandOff>
     };
     let mut registry = EncoderRegistry::new();
     registry.register(Box::new(SoftwareEncoder::new()));
+    let registry = Arc::new(registry);
     let scheduler = Arc::new(Scheduler::new(
         store.clone(),
-        Arc::new(registry),
+        Arc::clone(&registry),
         Arc::new(PipelineRunner::new()),
         SchedulerConfig::from(&config.transcode.scheduler),
     ));
 
-    Arc::new(TranscodeService::new(store, policy, scheduler))
+    TranscodeRuntime {
+        service: Arc::new(TranscodeService::new(store, policy, scheduler)),
+        encoders: registry,
+    }
 }
 
 /// Serve the Kino HTTP API on an explicit socket address and library root.
