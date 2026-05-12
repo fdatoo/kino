@@ -4054,8 +4054,21 @@ fn source_file_stream_variant(source_file: &LibrarySourceFile) -> CatalogStreamV
         variant_id: source_file.id.to_string(),
         kind: VariantKind::Source,
         capabilities: source_file_variant_capabilities(source_file),
-        stream_url: format!("/api/v1/stream/sourcefile/{}", source_file.id),
+        stream_url: source_file_stream_url(source_file),
     }
+}
+
+fn source_file_stream_url(source_file: &LibrarySourceFile) -> String {
+    let extension = source_file
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or("unknown");
+    format!(
+        "/api/v1/stream/sourcefile/{}/file.{extension}",
+        source_file.id
+    )
 }
 
 fn source_file_variant_capabilities(source_file: &LibrarySourceFile) -> VariantCapabilities {
@@ -4662,7 +4675,10 @@ mod tests {
         assert_eq!(fetched.variants[0].capabilities.hdr, None);
         assert_eq!(
             fetched.variants[0].stream_url,
-            format!("/api/v1/stream/sourcefile/{}", fetched.source_files[0].id)
+            format!(
+                "/api/v1/stream/sourcefile/{}/file.mkv",
+                fetched.source_files[0].id
+            )
         );
         assert_eq!(
             fetched.subtitle_tracks,

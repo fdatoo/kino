@@ -187,7 +187,7 @@ mod tests {
                 resolution: Some("1080p".to_owned()),
                 hdr: None,
             },
-            stream_url: format!("/api/v1/stream/sourcefile/{variant_id}"),
+            stream_url: format!("/api/v1/stream/sourcefile/{variant_id}/file.mkv"),
         }
     }
 }
