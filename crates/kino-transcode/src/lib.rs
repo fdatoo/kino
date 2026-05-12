@@ -7,6 +7,7 @@ pub mod plan;
 
 use std::{
     future::Future,
+    io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Mutex,
@@ -16,8 +17,8 @@ pub use encoder::{Capabilities, Encoder, EncoderKind, EncoderRegistry, LaneId, V
 pub use job::state::JobState;
 use kino_core::Id;
 pub use pipeline::{
-    AudioPolicy, ColorOutput, FfmpegEncodeCommand, HlsOutputSpec, InputSpec, LogLevel, Preset,
-    VideoFilter, VideoOutputSpec,
+    AudioPolicy, ColorOutput, FfmpegEncodeCommand, HlsOutputSpec, InputSpec, LogLevel,
+    PipelineRunner, Preset, Progress, RunOutcome, VideoFilter, VideoOutputSpec, verify_outputs,
 };
 pub use plan::VariantKind;
 pub use plan::{DefaultPolicy, OutputPolicy, PlannedVariant, SourceContext, TranscodeProfile};
@@ -57,6 +58,56 @@ pub enum Error {
     /// Internal no-op recorder state could not be accessed.
     #[error("transcode recorder lock failed: {0}")]
     RecorderLock(String),
+    /// FFmpeg was cancelled and terminated before completion.
+    #[error("ffmpeg killed by signal during cancellation")]
+    Cancelled,
+    /// Encoded output did not pass integrity checks.
+    #[error("encoded output failed integrity check: {0}")]
+    IntegrityFailed(String),
+    /// FFmpeg exited with a non-zero status.
+    #[error("ffmpeg exited with status {status}: {stderr_tail}")]
+    FfmpegFailed {
+        /// Process status code, or `-1` when the process ended without a code.
+        status: i32,
+        /// Bounded tail of FFmpeg stderr retained for diagnostics.
+        stderr_tail: String,
+    },
+    /// Filesystem or process I/O failed.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+impl Error {
+    /// Return whether this error is likely retryable by the scheduler.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::FfmpegFailed { stderr_tail, .. } => {
+                let stderr_tail = stderr_tail.to_ascii_lowercase();
+                [
+                    "out of memory",
+                    "device is busy",
+                    "resource temporarily unavailable",
+                ]
+                .iter()
+                .any(|marker| stderr_tail.contains(marker))
+            }
+            Self::Io(source) => matches!(
+                source.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::ResourceBusy | io::ErrorKind::TimedOut
+            ),
+            Self::InvalidEncoderKind(_)
+            | Self::InvalidJobState(_)
+            | Self::InvalidTransition { .. }
+            | Self::InvalidLaneId(_)
+            | Self::InvalidVideoCodec(_)
+            | Self::InvalidVariantKind(_)
+            | Self::InvalidColorTarget(_)
+            | Self::InvalidAudioPolicyKind(_)
+            | Self::RecorderLock(_)
+            | Self::Cancelled
+            | Self::IntegrityFailed(_) => false,
+        }
+    }
 }
 
 /// Crate-local `Result` alias.
