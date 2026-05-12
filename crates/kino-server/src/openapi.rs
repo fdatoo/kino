@@ -21,6 +21,7 @@ use utoipa::openapi::server::Server;
         crate::request::re_resolve,
         crate::request::reset_request,
         crate::request::resolve_request,
+        crate::request::reprobe_source_file,
         crate::request::scan_library,
         crate::session_admin::list_sessions,
         crate::stream::media_playlist,

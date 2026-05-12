@@ -228,6 +228,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
             .get("/api/v1/admin/items/{id}/subtitles/{track}/re-ocr")
             .is_some()
     );
+    assert!(
+        body["paths"]
+            .get("/api/v1/admin/source-files/{id}/reprobe")
+            .is_some()
+    );
 
     let json = std::str::from_utf8(&bytes)?;
     let spec = oas3::from_json(json)?;
@@ -797,6 +802,38 @@ async fn manual_import_walks_state_from_resolved() -> Result<(), Box<dyn std::er
         catalog["items"][0]["source_files"][0]["probe"]["video"]["resolution"],
         "240p"
     );
+    let source_file_id: Id = catalog["items"][0]["source_files"][0]["id"]
+        .as_str()
+        .ok_or("source file id missing")?
+        .parse()?;
+    let (probe_duration_seconds,): (Option<i64>,) =
+        sqlx::query_as("SELECT probe_duration_seconds FROM source_files WHERE id = ?1")
+            .bind(source_file_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(probe_duration_seconds, Some(1));
+
+    let media_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/items/{}/{}/media.m3u8",
+                    catalog["items"][0]["id"]
+                        .as_str()
+                        .ok_or("media item id missing")?,
+                    source_file_id
+                ))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(media_response.status(), StatusCode::OK);
+    let media_bytes = to_bytes(media_response.into_body(), usize::MAX).await?;
+    let media_playlist = std::str::from_utf8(&media_bytes)?;
+    assert!(media_playlist.contains("#EXT-X-ENDLIST"));
+
     let (poster_local_path,): (String,) =
         sqlx::query_as("SELECT poster_local_path FROM media_metadata_cache LIMIT 1")
             .fetch_one(db.read_pool())
@@ -1476,6 +1513,50 @@ async fn admin_library_scan_rejects_unauthenticated() -> Result<(), Box<dyn std:
         .await?;
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_source_file_reprobe_updates_probe_duration() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let temp_dir = tempfile::tempdir()?;
+    let source_path = temp_dir.path().join("source.mkv");
+    write_sample_video(&source_path).await?;
+    let source_file_id = insert_source_file(&db, media_item_id, &source_path).await?;
+    let app = kino_server::router(db.clone());
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/source-files/{source_file_id}/reprobe"
+                ))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["source_file_id"], source_file_id.to_string());
+    assert_eq!(body["probe_duration_seconds"], 1);
+    let (probe_duration_seconds,): (Option<i64>,) =
+        sqlx::query_as("SELECT probe_duration_seconds FROM source_files WHERE id = ?1")
+            .bind(source_file_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(probe_duration_seconds, Some(1));
+    let (probe_rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM source_file_probes WHERE source_file_id = ?1")
+            .bind(source_file_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(probe_rows, 1);
 
     Ok(())
 }

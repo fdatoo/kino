@@ -8,6 +8,7 @@ use kino_library::{
     SubtitleExtractionInput, SubtitleService, subtitle_ocr,
 };
 use m3u8_rs::{AlternativeMediaType, MediaPlaylistType, Playlist};
+use serde_json::Value;
 use std::time::Duration;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
@@ -102,6 +103,40 @@ async fn media_playlist_requires_auth() -> Result<(), Box<dyn std::error::Error>
         .await?;
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_playlist_returns_probe_data_missing_when_duration_is_null()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let source_path = temp_dir.path().join("source.mkv");
+    std::fs::write(&source_path, b"source bytes")?;
+
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let media_item_id = insert_personal_media_item(&db).await?;
+    let source_file_id = insert_source_file(&db, media_item_id, &source_path).await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/stream/items/{media_item_id}/{source_file_id}/media.m3u8"
+                ))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let error: Value = serde_json::from_slice(&body)?;
+    assert_eq!(error["error"], "probe_data_missing");
+    assert_eq!(error["source_file_id"], source_file_id.to_string());
 
     Ok(())
 }

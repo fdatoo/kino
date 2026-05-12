@@ -220,8 +220,11 @@ fn release_year(release_date: Option<&str>) -> Option<u16> {
     year.parse().ok()
 }
 
-fn source_file_probe(probe: &ProbeResult) -> SourceFileProbeInput {
+pub(crate) fn source_file_probe(probe: &ProbeResult) -> SourceFileProbeInput {
     let mut input = SourceFileProbeInput::new();
+    input.duration_seconds = probe
+        .duration
+        .and_then(|duration| (duration.as_secs() > 0).then_some(duration.as_secs()));
     input.container = probe
         .container
         .as_ref()

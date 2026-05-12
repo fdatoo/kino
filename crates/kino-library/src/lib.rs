@@ -272,6 +272,13 @@ pub enum Error {
         id: Id,
     },
 
+    /// The requested source file does not exist.
+    #[error("source file not found: {id}")]
+    SourceFileNotFound {
+        /// Missing source file id.
+        id: Id,
+    },
+
     /// A catalog list limit was outside the accepted range.
     #[error("invalid catalog list limit {limit}; expected 1..={max}")]
     InvalidCatalogListLimit {
@@ -333,6 +340,13 @@ pub enum Error {
     InvalidSourceFileTrackIndex {
         /// Persisted track index.
         value: i64,
+    },
+
+    /// A source-file probe duration could not fit into SQLite's integer range.
+    #[error("invalid source-file probe duration: {value}")]
+    InvalidSourceFileProbeDuration {
+        /// Duration in whole seconds.
+        value: u64,
     },
 }
 
@@ -974,6 +988,8 @@ impl RegisterSourceFileInput {
 /// Source-file probe facts persisted during ingestion.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceFileProbeInput {
+    /// Container duration in whole seconds, when known.
+    pub duration_seconds: Option<u64>,
     /// Container format label, when known.
     pub container: Option<String>,
     /// Video codec label, when known.
@@ -1201,91 +1217,23 @@ impl CatalogService {
                 id,
                 media_item_id,
                 path,
+                probe_duration_seconds,
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
         )
         .bind(source_file_id)
         .bind(input.media_item_id)
         .bind(path_text)
+        .bind(optional_i64_from_u64(input.probe.duration_seconds)?)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            r#"
-            INSERT INTO source_file_probes (
-                source_file_id,
-                container,
-                video_codec,
-                video_width,
-                video_height,
-                video_hdr,
-                created_at,
-                updated_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            "#,
-        )
-        .bind(source_file_id)
-        .bind(input.probe.container.as_deref())
-        .bind(input.probe.video_codec.as_deref())
-        .bind(input.probe.video_width.map(i64::from))
-        .bind(input.probe.video_height.map(i64::from))
-        .bind(input.probe.video_hdr.as_deref())
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        for track in &input.probe.audio_tracks {
-            sqlx::query(
-                r#"
-                INSERT INTO source_file_audio_tracks (
-                    source_file_id,
-                    track_index,
-                    codec,
-                    language,
-                    channels
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5)
-                "#,
-            )
-            .bind(source_file_id)
-            .bind(i64::from(track.track_index))
-            .bind(&track.codec)
-            .bind(&track.language)
-            .bind(track.channels.map(i64::from))
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        for track in &input.probe.subtitle_tracks {
-            sqlx::query(
-                r#"
-                INSERT INTO source_file_subtitle_tracks (
-                    source_file_id,
-                    track_index,
-                    format,
-                    provenance,
-                    language,
-                    forced
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                "#,
-            )
-            .bind(source_file_id)
-            .bind(i64::from(track.track_index))
-            .bind(track.format.as_str())
-            .bind(track.provenance.as_str())
-            .bind(&track.language)
-            .bind(if track.forced { 1_i64 } else { 0_i64 })
-            .execute(&mut *tx)
-            .await?;
-        }
+        insert_source_file_probe_rows(&mut tx, source_file_id, &input.probe, now, true).await?;
 
         tx.commit().await?;
         let video = source_file_video_probe_from_input(&input.probe);
@@ -1311,6 +1259,82 @@ impl CatalogService {
                 .collect(),
             transcode_outputs: Vec::new(),
         })
+    }
+
+    /// Fetch one source file by id, including persisted probe facts.
+    pub async fn source_file(&self, source_file_id: Id) -> Result<LibrarySourceFile> {
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT id, media_item_id, path
+            FROM source_files
+            WHERE id = ?1
+            "#,
+        )
+        .bind(source_file_id)
+        .fetch_optional(self.db.read_pool())
+        .await?
+        else {
+            return Err(Error::SourceFileNotFound { id: source_file_id });
+        };
+        let mut source_file = library_source_file_from_row(&row)?;
+        self.attach_source_file_probes(std::slice::from_mut(&mut source_file))
+            .await?;
+        self.attach_source_file_audio_tracks(std::slice::from_mut(&mut source_file))
+            .await?;
+        self.attach_source_file_subtitle_tracks(std::slice::from_mut(&mut source_file))
+            .await?;
+
+        Ok(source_file)
+    }
+
+    /// Replace persisted probe facts for an existing source file.
+    pub async fn update_source_file_probe(
+        &self,
+        source_file_id: Id,
+        probe: SourceFileProbeInput,
+    ) -> Result<LibrarySourceFile> {
+        let now = Timestamp::now();
+        let mut tx = self.db.write_pool().begin().await?;
+        let Some(_) = sqlx::query(
+            r#"
+            SELECT media_item_id, path
+            FROM source_files
+            WHERE id = ?1
+            "#,
+        )
+        .bind(source_file_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Err(Error::SourceFileNotFound { id: source_file_id });
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE source_files
+            SET probe_duration_seconds = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+        )
+        .bind(optional_i64_from_u64(probe.duration_seconds)?)
+        .bind(now)
+        .bind(source_file_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM source_file_audio_tracks WHERE source_file_id = ?1")
+            .bind(source_file_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM source_file_probes WHERE source_file_id = ?1")
+            .bind(source_file_id)
+            .execute(&mut *tx)
+            .await?;
+        insert_source_file_probe_rows(&mut tx, source_file_id, &probe, now, false).await?;
+
+        tx.commit().await?;
+        self.source_file(source_file_id).await
     }
 
     /// Delete a media item and cascading library rows.
@@ -3764,6 +3788,14 @@ fn optional_u32_from_row(
         .transpose()
 }
 
+fn optional_i64_from_u64(value: Option<u64>) -> Result<Option<i64>> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| Error::InvalidSourceFileProbeDuration { value })
+        })
+        .transpose()
+}
+
 fn bool_from_row(row: &sqlx::sqlite::SqliteRow, field: &'static str) -> Result<bool> {
     let value: i64 = row.try_get(field)?;
     Ok(value != 0)
@@ -3826,6 +3858,92 @@ fn source_file_probe_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SourceFil
         container: row.try_get("container")?,
         video,
     })
+}
+
+async fn insert_source_file_probe_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_file_id: Id,
+    probe: &SourceFileProbeInput,
+    now: Timestamp,
+    include_subtitle_tracks: bool,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO source_file_probes (
+            source_file_id,
+            container,
+            video_codec,
+            video_width,
+            video_height,
+            video_hdr,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(source_file_id)
+    .bind(probe.container.as_deref())
+    .bind(probe.video_codec.as_deref())
+    .bind(probe.video_width.map(i64::from))
+    .bind(probe.video_height.map(i64::from))
+    .bind(probe.video_hdr.as_deref())
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    for track in &probe.audio_tracks {
+        sqlx::query(
+            r#"
+            INSERT INTO source_file_audio_tracks (
+                source_file_id,
+                track_index,
+                codec,
+                language,
+                channels
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(source_file_id)
+        .bind(i64::from(track.track_index))
+        .bind(&track.codec)
+        .bind(&track.language)
+        .bind(track.channels.map(i64::from))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !include_subtitle_tracks {
+        return Ok(());
+    }
+
+    for track in &probe.subtitle_tracks {
+        sqlx::query(
+            r#"
+            INSERT INTO source_file_subtitle_tracks (
+                source_file_id,
+                track_index,
+                format,
+                provenance,
+                language,
+                forced
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .bind(source_file_id)
+        .bind(i64::from(track.track_index))
+        .bind(track.format.as_str())
+        .bind(track.provenance.as_str())
+        .bind(&track.language)
+        .bind(if track.forced { 1_i64 } else { 0_i64 })
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
 }
 
 fn source_file_video_probe_from_input(
