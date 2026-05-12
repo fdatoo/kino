@@ -191,6 +191,31 @@ pub enum ProbeError {
         /// Invalid duration value.
         value: String,
     },
+
+    /// ffprobe emitted an invalid mastering display metadata rational.
+    #[error(
+        "ffprobe mastering display value is invalid: {value}; expected denominator {expected_denominator}"
+    )]
+    InvalidMasterDisplayValue {
+        /// Invalid rational value.
+        value: String,
+        /// Expected denominator for the ffprobe field.
+        expected_denominator: u32,
+    },
+
+    /// ffprobe emitted incomplete content light level metadata.
+    #[error("ffprobe content light level metadata is missing {field}")]
+    InvalidContentLightLevelValue {
+        /// Missing field name.
+        field: &'static str,
+    },
+
+    /// ffprobe emitted incomplete or invalid Dolby Vision metadata.
+    #[error("ffprobe dolby vision metadata field {field} is invalid")]
+    InvalidDolbyVisionValue {
+        /// Invalid field name.
+        field: &'static str,
+    },
 }
 
 /// Typed result produced by probing a media file.
@@ -235,7 +260,7 @@ impl ProbeResult {
 
         for stream in output.streams {
             match stream.codec_type.as_deref() {
-                Some("video") => video_streams.push(ProbeVideoStream::from_stream(stream)),
+                Some("video") => video_streams.push(ProbeVideoStream::from_stream(stream)?),
                 Some("audio") => audio_streams.push(ProbeAudioStream::from_stream(stream)),
                 Some("subtitle") => subtitle_streams.push(ProbeSubtitleStream::from_stream(stream)),
                 _ => {}
@@ -364,18 +389,172 @@ pub struct ProbeVideoStream {
     pub height: Option<u32>,
     /// Language tag reported for the stream.
     pub language: Option<String>,
+    /// Color primaries reported by ffprobe, for example `bt2020`.
+    pub color_primaries: Option<String>,
+    /// Color transfer characteristic reported by ffprobe, for example `smpte2084`.
+    pub color_transfer: Option<String>,
+    /// Color space reported by ffprobe, for example `bt2020nc`.
+    pub color_space: Option<String>,
+    /// SMPTE ST 2086 mastering display metadata.
+    pub master_display: Option<MasterDisplay>,
+    /// CTA-861.3 content light level metadata.
+    pub max_cll: Option<MaxCll>,
+    /// Dolby Vision configuration metadata.
+    pub dolby_vision: Option<DolbyVision>,
 }
 
 impl ProbeVideoStream {
-    fn from_stream(stream: FfprobeStream) -> Self {
-        Self {
+    fn from_stream(stream: FfprobeStream) -> Result<Self, ProbeError> {
+        let master_display = stream
+            .side_data_list
+            .iter()
+            .find(|side_data| {
+                side_data.side_data_type.as_deref() == Some("Mastering display metadata")
+            })
+            .map(MasterDisplay::from_side_data)
+            .transpose()?;
+        let max_cll = stream
+            .side_data_list
+            .iter()
+            .find(|side_data| {
+                side_data.side_data_type.as_deref() == Some("Content light level metadata")
+            })
+            .map(MaxCll::from_side_data)
+            .transpose()?;
+        let dolby_vision = stream
+            .side_data_list
+            .iter()
+            .find(|side_data| {
+                side_data.side_data_type.as_deref() == Some("DOVI configuration record")
+            })
+            .map(DolbyVision::from_side_data)
+            .transpose()?;
+
+        Ok(Self {
             index: stream.index,
             codec_name: stream.codec_name.and_then(non_empty_owned),
             codec_long_name: stream.codec_long_name.and_then(non_empty_owned),
             width: stream.width,
             height: stream.height,
             language: tag_value(stream.tags.as_ref(), "language"),
-        }
+            color_primaries: stream.color_primaries.and_then(non_empty_owned),
+            color_transfer: stream.color_transfer.and_then(non_empty_owned),
+            color_space: stream.color_space.and_then(non_empty_owned),
+            master_display,
+            max_cll,
+            dolby_vision,
+        })
+    }
+}
+
+/// SMPTE ST 2086 mastering display metadata from ffprobe side data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterDisplay {
+    /// Red primary x chromaticity numerator.
+    pub red_x: u32,
+    /// Red primary y chromaticity numerator.
+    pub red_y: u32,
+    /// Green primary x chromaticity numerator.
+    pub green_x: u32,
+    /// Green primary y chromaticity numerator.
+    pub green_y: u32,
+    /// Blue primary x chromaticity numerator.
+    pub blue_x: u32,
+    /// Blue primary y chromaticity numerator.
+    pub blue_y: u32,
+    /// White point x chromaticity numerator.
+    pub white_x: u32,
+    /// White point y chromaticity numerator.
+    pub white_y: u32,
+    /// Minimum mastering display luminance numerator.
+    pub min_luminance: u32,
+    /// Maximum mastering display luminance numerator.
+    pub max_luminance: u32,
+}
+
+impl MasterDisplay {
+    fn from_side_data(side_data: &FfprobeSideData) -> Result<Self, ProbeError> {
+        Ok(Self {
+            red_x: parse_master_display_numerator(side_data.red_x.as_deref(), "red_x", 50_000)?,
+            red_y: parse_master_display_numerator(side_data.red_y.as_deref(), "red_y", 50_000)?,
+            green_x: parse_master_display_numerator(
+                side_data.green_x.as_deref(),
+                "green_x",
+                50_000,
+            )?,
+            green_y: parse_master_display_numerator(
+                side_data.green_y.as_deref(),
+                "green_y",
+                50_000,
+            )?,
+            blue_x: parse_master_display_numerator(side_data.blue_x.as_deref(), "blue_x", 50_000)?,
+            blue_y: parse_master_display_numerator(side_data.blue_y.as_deref(), "blue_y", 50_000)?,
+            white_x: parse_master_display_numerator(
+                side_data.white_x.as_deref(),
+                "white_x",
+                50_000,
+            )?,
+            white_y: parse_master_display_numerator(
+                side_data.white_y.as_deref(),
+                "white_y",
+                50_000,
+            )?,
+            min_luminance: parse_master_display_numerator(
+                side_data.min_luminance.as_deref(),
+                "min_luminance",
+                10_000,
+            )?,
+            max_luminance: parse_master_display_numerator(
+                side_data.max_luminance.as_deref(),
+                "max_luminance",
+                10_000,
+            )?,
+        })
+    }
+}
+
+/// CTA-861.3 content light level metadata from ffprobe side data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaxCll {
+    /// Maximum content light level.
+    pub max_content: u32,
+    /// Maximum frame-average light level.
+    pub max_average: u32,
+}
+
+impl MaxCll {
+    fn from_side_data(side_data: &FfprobeSideData) -> Result<Self, ProbeError> {
+        Ok(Self {
+            max_content: required_u32(side_data.max_content, "max_content")?,
+            max_average: required_u32(side_data.max_average, "max_average")?,
+        })
+    }
+}
+
+/// Dolby Vision configuration metadata from ffprobe side data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolbyVision {
+    /// Dolby Vision profile number.
+    pub profile: u8,
+    /// Dolby Vision level number.
+    pub level: u8,
+    /// Whether the reference processing unit is present.
+    pub rpu_present: bool,
+    /// Whether the enhancement layer is present.
+    pub el_present: bool,
+    /// Whether the base layer is present.
+    pub bl_present: bool,
+}
+
+impl DolbyVision {
+    fn from_side_data(side_data: &FfprobeSideData) -> Result<Self, ProbeError> {
+        Ok(Self {
+            profile: required_u8(side_data.dv_profile, "dv_profile")?,
+            level: required_u8(side_data.dv_level, "dv_level")?,
+            rpu_present: required_flag(side_data.rpu_present_flag, "rpu_present_flag")?,
+            el_present: required_flag(side_data.el_present_flag, "el_present_flag")?,
+            bl_present: required_flag(side_data.bl_present_flag, "bl_present_flag")?,
+        })
     }
 }
 
@@ -499,7 +678,34 @@ struct FfprobeStream {
     width: Option<u32>,
     height: Option<u32>,
     channels: Option<u32>,
+    color_primaries: Option<String>,
+    color_transfer: Option<String>,
+    color_space: Option<String>,
+    #[serde(default)]
+    side_data_list: Vec<FfprobeSideData>,
     tags: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeSideData {
+    side_data_type: Option<String>,
+    red_x: Option<String>,
+    red_y: Option<String>,
+    green_x: Option<String>,
+    green_y: Option<String>,
+    blue_x: Option<String>,
+    blue_y: Option<String>,
+    white_x: Option<String>,
+    white_y: Option<String>,
+    min_luminance: Option<String>,
+    max_luminance: Option<String>,
+    max_content: Option<u32>,
+    max_average: Option<u32>,
+    dv_profile: Option<u8>,
+    dv_level: Option<u8>,
+    rpu_present_flag: Option<u8>,
+    el_present_flag: Option<u8>,
+    bl_present_flag: Option<u8>,
 }
 
 fn status_string(status: ExitStatus) -> String {
@@ -523,6 +729,66 @@ fn parse_duration(path: &Path, value: &str) -> Result<Duration, ProbeError> {
     }
 
     Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_numerator(value: &str, expected_denominator: u32) -> Result<u32, ProbeError> {
+    let (numerator, denominator) =
+        value
+            .split_once('/')
+            .ok_or_else(|| ProbeError::InvalidMasterDisplayValue {
+                value: value.to_owned(),
+                expected_denominator,
+            })?;
+    let numerator =
+        numerator
+            .parse::<u32>()
+            .map_err(|_| ProbeError::InvalidMasterDisplayValue {
+                value: value.to_owned(),
+                expected_denominator,
+            })?;
+    let denominator =
+        denominator
+            .parse::<u32>()
+            .map_err(|_| ProbeError::InvalidMasterDisplayValue {
+                value: value.to_owned(),
+                expected_denominator,
+            })?;
+    if denominator != expected_denominator {
+        return Err(ProbeError::InvalidMasterDisplayValue {
+            value: value.to_owned(),
+            expected_denominator,
+        });
+    }
+
+    Ok(numerator)
+}
+
+fn parse_master_display_numerator(
+    value: Option<&str>,
+    field: &'static str,
+    expected_denominator: u32,
+) -> Result<u32, ProbeError> {
+    let value = value.ok_or_else(|| ProbeError::InvalidMasterDisplayValue {
+        value: format!("<missing {field}>"),
+        expected_denominator,
+    })?;
+    parse_numerator(value, expected_denominator)
+}
+
+fn required_u32(value: Option<u32>, field: &'static str) -> Result<u32, ProbeError> {
+    value.ok_or(ProbeError::InvalidContentLightLevelValue { field })
+}
+
+fn required_u8(value: Option<u8>, field: &'static str) -> Result<u8, ProbeError> {
+    value.ok_or(ProbeError::InvalidDolbyVisionValue { field })
+}
+
+fn required_flag(value: Option<u8>, field: &'static str) -> Result<bool, ProbeError> {
+    match required_u8(value, field)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ProbeError::InvalidDolbyVisionValue { field }),
+    }
 }
 
 fn tag_value(tags: Option<&HashMap<String, String>>, key: &str) -> Option<String> {
@@ -786,8 +1052,183 @@ exit 66
             width: None,
             height: None,
             channels: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_space: None,
+            side_data_list: Vec::new(),
             tags: None,
         }
+    }
+
+    #[test]
+    fn sdr_probe_json_has_no_hdr_metadata() {
+        let result = probe_result_from_json(
+            r#"
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "h264",
+      "width": 1920,
+      "height": 1080,
+      "color_primaries": "bt709",
+      "color_transfer": "bt709",
+      "color_space": "bt709"
+    }
+  ]
+}
+"#,
+        );
+
+        let video = result.video_streams.first().unwrap();
+        assert_eq!(video.color_primaries.as_deref(), Some("bt709"));
+        assert_eq!(video.color_transfer.as_deref(), Some("bt709"));
+        assert_eq!(video.color_space.as_deref(), Some("bt709"));
+        assert_eq!(video.master_display, None);
+        assert_eq!(video.max_cll, None);
+        assert_eq!(video.dolby_vision, None);
+    }
+
+    #[test]
+    fn hdr10_probe_json_populates_master_display_and_max_cll() {
+        let result = probe_result_from_json(
+            r#"
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "hevc",
+      "width": 3840,
+      "height": 2160,
+      "color_primaries": "bt2020",
+      "color_transfer": "smpte2084",
+      "color_space": "bt2020nc",
+      "side_data_list": [
+        {
+          "side_data_type": "Mastering display metadata",
+          "red_x": "13250/50000",
+          "red_y": "34500/50000",
+          "green_x": "7500/50000",
+          "green_y": "3000/50000",
+          "blue_x": "34000/50000",
+          "blue_y": "16000/50000",
+          "white_x": "15635/50000",
+          "white_y": "16450/50000",
+          "min_luminance": "50/10000",
+          "max_luminance": "10000000/10000"
+        },
+        {
+          "side_data_type": "Content light level metadata",
+          "max_content": 1000,
+          "max_average": 400
+        }
+      ]
+    }
+  ]
+}
+"#,
+        );
+
+        let video = result.video_streams.first().unwrap();
+        assert_eq!(video.color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(video.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(video.color_space.as_deref(), Some("bt2020nc"));
+        assert_eq!(
+            video.master_display,
+            Some(MasterDisplay {
+                red_x: 13250,
+                red_y: 34500,
+                green_x: 7500,
+                green_y: 3000,
+                blue_x: 34000,
+                blue_y: 16000,
+                white_x: 15635,
+                white_y: 16450,
+                min_luminance: 50,
+                max_luminance: 10_000_000,
+            })
+        );
+        assert_eq!(
+            video.max_cll,
+            Some(MaxCll {
+                max_content: 1000,
+                max_average: 400,
+            })
+        );
+        assert_eq!(video.dolby_vision, None);
+    }
+
+    #[test]
+    fn dolby_vision_probe_json_populates_dovi_metadata() {
+        let result = probe_result_from_json(
+            r#"
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "hevc",
+      "width": 3840,
+      "height": 2160,
+      "color_primaries": "bt2020",
+      "color_transfer": "smpte2084",
+      "color_space": "bt2020nc",
+      "side_data_list": [
+        {
+          "side_data_type": "Mastering display metadata",
+          "red_x": "13250/50000",
+          "red_y": "34500/50000",
+          "green_x": "7500/50000",
+          "green_y": "3000/50000",
+          "blue_x": "34000/50000",
+          "blue_y": "16000/50000",
+          "white_x": "15635/50000",
+          "white_y": "16450/50000",
+          "min_luminance": "50/10000",
+          "max_luminance": "10000000/10000"
+        },
+        {
+          "side_data_type": "Content light level metadata",
+          "max_content": 1000,
+          "max_average": 400
+        },
+        {
+          "side_data_type": "DOVI configuration record",
+          "dv_version_major": 1,
+          "dv_version_minor": 0,
+          "dv_profile": 8,
+          "dv_level": 9,
+          "rpu_present_flag": 1,
+          "el_present_flag": 0,
+          "bl_present_flag": 1
+        }
+      ]
+    }
+  ]
+}
+"#,
+        );
+
+        let video = result.video_streams.first().unwrap();
+        assert!(video.master_display.is_some());
+        assert!(video.max_cll.is_some());
+        assert_eq!(
+            video.dolby_vision,
+            Some(DolbyVision {
+                profile: 8,
+                level: 9,
+                rpu_present: true,
+                el_present: false,
+                bl_present: true,
+            })
+        );
+    }
+
+    fn probe_result_from_json(json: &str) -> ProbeResult {
+        let output = serde_json::from_str::<FfprobeOutput>(json).unwrap();
+        ProbeResult::from_ffprobe_output(PathBuf::from("movie.mkv"), output).unwrap()
     }
 
     #[test]
