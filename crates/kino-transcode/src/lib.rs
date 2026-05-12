@@ -17,7 +17,9 @@ pub use encoder::{
     Capabilities, DetectionConfig, Encoder, EncoderKind, EncoderRegistry, LaneId, VideoCodec,
     available_encoders,
 };
-pub use job::{JobState, JobStore, ListJobsFilter, NewJob, TranscodeJob};
+pub use job::{
+    JobState, JobStore, ListJobsFilter, NewJob, Scheduler, SchedulerConfig, TranscodeJob,
+};
 use kino_core::Id;
 pub use pipeline::{
     AudioPolicy, ColorOutput, FfmpegEncodeCommand, FfmpegVmafCommand, HlsOutputSpec, InputSpec,
@@ -99,6 +101,9 @@ pub enum Error {
     /// Output audio policy kind string is not recognized.
     #[error("invalid audio policy kind: {0}")]
     InvalidAudioPolicyKind(String),
+    /// Stored planned variant JSON could not be decoded.
+    #[error("invalid planned variant json: {0}")]
+    InvalidPlannedVariantJson(#[from] serde_json::Error),
     /// Internal no-op recorder state could not be accessed.
     #[error("transcode recorder lock failed: {0}")]
     RecorderLock(String),
@@ -160,6 +165,7 @@ impl Error {
             | Self::InvalidVariantKind(_)
             | Self::InvalidColorTarget(_)
             | Self::InvalidAudioPolicyKind(_)
+            | Self::InvalidPlannedVariantJson(_)
             | Self::RecorderLock(_)
             | Self::Cancelled
             | Self::IntegrityFailed(_)

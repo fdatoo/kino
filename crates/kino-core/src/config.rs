@@ -201,6 +201,11 @@ pub struct TranscodeConfig {
     /// [`TranscodePolicyConfig`].
     #[serde(default)]
     pub policy: TranscodePolicyConfig,
+
+    /// Scheduler settings. Defaults documented on
+    /// [`TranscodeSchedulerConfig`].
+    #[serde(default)]
+    pub scheduler: TranscodeSchedulerConfig,
 }
 
 /// Default output policy configuration.
@@ -252,6 +257,39 @@ pub struct TranscodePolicyCompatibilityConfig {
     /// Maximum output height. Defaults to 1080.
     #[serde(default = "default_transcode_compat_max_height")]
     pub max_height: u32,
+}
+
+/// Durable transcode scheduler settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodeSchedulerConfig {
+    /// Dispatch tick interval. Defaults to 250 milliseconds.
+    #[serde(
+        default = "default_transcode_scheduler_tick_interval",
+        rename = "tick_millis",
+        deserialize_with = "duration_millis"
+    )]
+    pub tick_interval: Duration,
+
+    /// Maximum job attempts before terminal failure. Defaults to 3.
+    #[serde(default = "default_transcode_scheduler_max_attempts")]
+    pub max_attempts: u32,
+
+    /// Retry backoff for transient failures. Defaults to 60 seconds.
+    #[serde(
+        default = "default_transcode_scheduler_backoff",
+        rename = "backoff_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub backoff: Duration,
+
+    /// Lane reserved for live transcodes. Defaults to `cpu`.
+    #[serde(default = "default_transcode_scheduler_reserve_live_lane")]
+    pub reserve_live_lane: String,
+
+    /// Whether startup should reset running jobs to planned. Defaults to true.
+    #[serde(default = "default_true")]
+    pub recovery_on_boot: bool,
 }
 
 /// Fulfillment provider configuration sections.
@@ -363,6 +401,26 @@ fn default_transcode_compat_max_height() -> u32 {
     1080
 }
 
+fn default_transcode_scheduler_tick_interval() -> Duration {
+    Duration::from_millis(250)
+}
+
+fn default_transcode_scheduler_max_attempts() -> u32 {
+    3
+}
+
+fn default_transcode_scheduler_backoff() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_transcode_scheduler_reserve_live_lane() -> String {
+    "cpu".into()
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -419,6 +477,18 @@ impl Default for TranscodePolicyCompatibilityConfig {
             codec: default_transcode_compat_codec(),
             vmaf_target: default_transcode_compat_vmaf_target(),
             max_height: default_transcode_compat_max_height(),
+        }
+    }
+}
+
+impl Default for TranscodeSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval: default_transcode_scheduler_tick_interval(),
+            max_attempts: default_transcode_scheduler_max_attempts(),
+            backoff: default_transcode_scheduler_backoff(),
+            reserve_live_lane: default_transcode_scheduler_reserve_live_lane(),
+            recovery_on_boot: default_true(),
         }
     }
 }
@@ -494,6 +564,15 @@ pub enum ConfigError {
     #[error("invalid transcode policy config {field}: {reason}")]
     InvalidTranscodePolicyConfig {
         /// Transcode policy config field.
+        field: &'static str,
+        /// Human-readable validation failure.
+        reason: &'static str,
+    },
+
+    /// The configured transcode scheduler settings are invalid.
+    #[error("invalid transcode scheduler config {field}: {reason}")]
+    InvalidTranscodeSchedulerConfig {
+        /// Transcode scheduler config field.
         field: &'static str,
         /// Human-readable validation failure.
         reason: &'static str,
@@ -647,6 +726,14 @@ where
     Ok(Duration::from_secs(seconds))
 }
 
+fn duration_millis<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let millis = u64::deserialize(deserializer)?;
+    Ok(Duration::from_millis(millis))
+}
+
 fn comma_separated_strings<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -783,6 +870,38 @@ fn validate_transcode_config(config: &TranscodeConfig) -> Result<(), ConfigError
         return Err(ConfigError::InvalidTranscodePolicyConfig {
             field: "compat.max_height",
             reason: "must be positive",
+        });
+    }
+    validate_transcode_scheduler_config(&config.scheduler)?;
+
+    Ok(())
+}
+
+fn validate_transcode_scheduler_config(
+    config: &TranscodeSchedulerConfig,
+) -> Result<(), ConfigError> {
+    if config.tick_interval.is_zero() {
+        return Err(ConfigError::InvalidTranscodeSchedulerConfig {
+            field: "tick_millis",
+            reason: "must be positive",
+        });
+    }
+    if config.max_attempts == 0 {
+        return Err(ConfigError::InvalidTranscodeSchedulerConfig {
+            field: "max_attempts",
+            reason: "must be positive",
+        });
+    }
+    if config.backoff.is_zero() {
+        return Err(ConfigError::InvalidTranscodeSchedulerConfig {
+            field: "backoff_seconds",
+            reason: "must be positive",
+        });
+    }
+    if config.reserve_live_lane.trim().is_empty() {
+        return Err(ConfigError::InvalidTranscodeSchedulerConfig {
+            field: "reserve_live_lane",
+            reason: "is empty",
         });
     }
 
@@ -983,6 +1102,13 @@ mod tests {
                 compat.vmaf_target = 91
                 compat.max_height = 720
 
+                [transcode.scheduler]
+                tick_millis = 125
+                max_attempts = 4
+                backoff_seconds = 30
+                reserve_live_lane = "gpu_intel"
+                recovery_on_boot = false
+
                 [providers.disc_rip]
                 path = "{}"
                 preference = 30
@@ -1041,6 +1167,14 @@ mod tests {
             assert_eq!(cfg.transcode.policy.compat.codec, "h264");
             assert_eq!(cfg.transcode.policy.compat.vmaf_target, 91.0);
             assert_eq!(cfg.transcode.policy.compat.max_height, 720);
+            assert_eq!(
+                cfg.transcode.scheduler.tick_interval,
+                Duration::from_millis(125)
+            );
+            assert_eq!(cfg.transcode.scheduler.max_attempts, 4);
+            assert_eq!(cfg.transcode.scheduler.backoff, Duration::from_secs(30));
+            assert_eq!(cfg.transcode.scheduler.reserve_live_lane, "gpu_intel");
+            assert!(!cfg.transcode.scheduler.recovery_on_boot);
             let disc_rip = cfg.providers.disc_rip.expect("disc rip should parse");
             assert_eq!(disc_rip.path, fixture.library_root.join("rips"));
             assert_eq!(disc_rip.preference, 30);
@@ -1109,6 +1243,14 @@ mod tests {
             assert_eq!(cfg.transcode.policy.compat.codec, "h264");
             assert_eq!(cfg.transcode.policy.compat.vmaf_target, 90.0);
             assert_eq!(cfg.transcode.policy.compat.max_height, 1080);
+            assert_eq!(
+                cfg.transcode.scheduler.tick_interval,
+                Duration::from_millis(250)
+            );
+            assert_eq!(cfg.transcode.scheduler.max_attempts, 3);
+            assert_eq!(cfg.transcode.scheduler.backoff, Duration::from_secs(60));
+            assert_eq!(cfg.transcode.scheduler.reserve_live_lane, "cpu");
+            assert!(cfg.transcode.scheduler.recovery_on_boot);
             assert_eq!(
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::HardLink
@@ -1374,6 +1516,30 @@ mod tests {
             assert_eq!(cfg.transcode.policy.compat.codec, "h264");
             assert_eq!(cfg.transcode.policy.compat.vmaf_target, 91.0);
             assert_eq!(cfg.transcode.policy.compat.max_height, 720);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_transcode_scheduler() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_TRANSCODE__SCHEDULER__TICK_MILLIS", "500");
+            jail.set_env("KINO_TRANSCODE__SCHEDULER__MAX_ATTEMPTS", "5");
+            jail.set_env("KINO_TRANSCODE__SCHEDULER__BACKOFF_SECONDS", "15");
+            jail.set_env("KINO_TRANSCODE__SCHEDULER__RESERVE_LIVE_LANE", "gpu_intel");
+            jail.set_env("KINO_TRANSCODE__SCHEDULER__RECOVERY_ON_BOOT", "false");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(
+                cfg.transcode.scheduler.tick_interval,
+                Duration::from_millis(500)
+            );
+            assert_eq!(cfg.transcode.scheduler.max_attempts, 5);
+            assert_eq!(cfg.transcode.scheduler.backoff, Duration::from_secs(15));
+            assert_eq!(cfg.transcode.scheduler.reserve_live_lane, "gpu_intel");
+            assert!(!cfg.transcode.scheduler.recovery_on_boot);
             Ok(())
         });
     }
@@ -1783,6 +1949,35 @@ mod tests {
                 ConfigError::InvalidTranscodePolicyConfig { .. }
             ));
             assert!(err.to_string().contains("compat.max_height"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_zero_transcode_scheduler_max_attempts() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [transcode.scheduler]
+                        max_attempts = 0
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::InvalidTranscodeSchedulerConfig { .. }
+            ));
+            assert!(err.to_string().contains("max_attempts"), "got: {err}");
             Ok(())
         });
     }

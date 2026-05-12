@@ -31,6 +31,8 @@ serde_json = "1"
 sha2 = "0.10"
 shell-words = "1"
 tempfile = "3"
+dashmap = "6"
+tokio-util = "0.7"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "sqlite", "migrate"] }
 url = "2"
 utoipa = { version = "5.5.0", features = ["time", "uuid"] }

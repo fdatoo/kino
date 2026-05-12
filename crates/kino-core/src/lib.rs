@@ -24,7 +24,7 @@ pub use catalog::{
 pub use config::{
     CanonicalLayoutTransfer, Config, LibraryConfig, OcrConfig, SessionReaperConfig,
     TranscodeConfig, TranscodePolicyCompatibilityConfig, TranscodePolicyConfig,
-    TranscodePolicyHighConfig,
+    TranscodePolicyHighConfig, TranscodeSchedulerConfig,
 };
 pub use device_token::DeviceToken;
 pub use id::Id;
