@@ -234,6 +234,7 @@ mod tests {
                 (24, String::from("subtitle forced flag")),
                 (25, String::from("transcode jobs")),
                 (26, String::from("transcode outputs packaging")),
+                (27, String::from("transcode color downgrades")),
             ]
         );
 
