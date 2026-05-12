@@ -4,12 +4,14 @@ mod backend;
 mod capabilities;
 mod kind;
 pub mod registry;
+pub mod software;
 mod video;
 
 pub use backend::Encoder;
 pub use capabilities::Capabilities;
 pub use kind::{EncoderKind, LaneId};
 pub use registry::EncoderRegistry;
+pub use software::{SoftwareEncodeContext, SoftwareEncoder};
 pub use video::VideoCodec;
 
 #[cfg(test)]
