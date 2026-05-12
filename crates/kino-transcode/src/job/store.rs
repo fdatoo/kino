@@ -95,6 +95,10 @@ impl JobStore {
         Self { db }
     }
 
+    pub(crate) const fn db(&self) -> &Db {
+        &self.db
+    }
+
     /// Insert a planned job unless the source/profile pair already exists.
     pub async fn insert_job_idempotent(&self, new: &NewJob) -> Result<Option<Id>> {
         let id = Id::new();

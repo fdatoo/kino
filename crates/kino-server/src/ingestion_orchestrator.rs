@@ -20,6 +20,7 @@ use kino_library::{
     SubtitleExtractionInput, SubtitleFormat, SubtitleProvenance, SubtitleService,
     subtitle_ocr::{TesseractOcrEngine, ocr_subtitle_track},
 };
+use kino_transcode::SourceFile;
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, process::Command};
 
@@ -154,6 +155,12 @@ async fn ingest_request_inner(
             &canonical_path,
             source_probe,
         ))
+        .await?;
+    let mut transcode_probe = probe.clone();
+    transcode_probe.source_path = canonical_path.clone();
+    state
+        .transcode
+        .submit(SourceFile::new(source_file.id, canonical_path.clone()).with_probe(transcode_probe))
         .await?;
 
     let message = format!(
@@ -528,6 +535,9 @@ enum IngestError {
 
     #[error(transparent)]
     Library(#[from] kino_library::Error),
+
+    #[error(transparent)]
+    Transcode(#[from] kino_transcode::Error),
 
     #[error("tmdb client is not configured")]
     TmdbNotConfigured,

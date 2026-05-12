@@ -4,6 +4,7 @@ pub mod encoder;
 pub mod job;
 pub mod pipeline;
 pub mod plan;
+pub mod service;
 
 use std::{
     future::Future,
@@ -20,7 +21,7 @@ pub use encoder::{
 pub use job::{
     JobState, JobStore, ListJobsFilter, NewJob, Scheduler, SchedulerConfig, TranscodeJob,
 };
-use kino_core::Id;
+use kino_core::{Id, ProbeResult};
 pub use pipeline::{
     AudioPolicy, ColorOutput, FfmpegEncodeCommand, FfmpegVmafCommand, HlsOutputSpec, InputSpec,
     LogLevel, PipelineRunner, Preset, Progress, RunOutcome, VideoFilter, VideoOutputSpec,
@@ -32,6 +33,7 @@ pub use plan::{
     SourceContext, TranscodeProfile, VideoRange, VmafSampleEncoder, VmafSamplingConfig,
     VmafTrialEncodeRequest, fit_crf, measure_sample_crfs, select_samples,
 };
+pub use service::TranscodeService;
 
 /// Errors produced by `kino-transcode`.
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +106,26 @@ pub enum Error {
     /// Stored planned variant JSON could not be decoded.
     #[error("invalid planned variant json: {0}")]
     InvalidPlannedVariantJson(#[from] serde_json::Error),
+    /// A source file was submitted without the probe result required for planning.
+    #[error("source file {id} is missing transcode probe data")]
+    MissingSourceProbe {
+        /// Source-file id that could not be planned.
+        id: Id,
+    },
+    /// No detected encoder can run a planned output variant.
+    #[error(
+        "no encoder supports planned variant codec={codec:?} width={width} height={height} bit_depth={bit_depth}"
+    )]
+    NoEncoderForVariant {
+        /// Requested video codec.
+        codec: VideoCodec,
+        /// Planned output width used for capability matching.
+        width: u32,
+        /// Planned output height used for capability matching.
+        height: u32,
+        /// Planned output bit depth.
+        bit_depth: u8,
+    },
     /// Internal no-op recorder state could not be accessed.
     #[error("transcode recorder lock failed: {0}")]
     RecorderLock(String),
@@ -166,6 +188,8 @@ impl Error {
             | Self::InvalidColorTarget(_)
             | Self::InvalidAudioPolicyKind(_)
             | Self::InvalidPlannedVariantJson(_)
+            | Self::MissingSourceProbe { .. }
+            | Self::NoEncoderForVariant { .. }
             | Self::RecorderLock(_)
             | Self::Cancelled
             | Self::IntegrityFailed(_)
@@ -188,6 +212,8 @@ pub struct SourceFile {
     pub id: Id,
     /// Filesystem path ingestion placed or accepted.
     pub path: PathBuf,
+    /// Probe facts collected before transcode planning.
+    pub probe: Option<ProbeResult>,
 }
 
 impl SourceFile {
@@ -196,12 +222,19 @@ impl SourceFile {
         Self {
             id,
             path: path.into(),
+            probe: None,
         }
     }
 
     /// Filesystem path for this source file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Attach probe facts collected for this source file.
+    pub fn with_probe(mut self, probe: ProbeResult) -> Self {
+        self.probe = Some(probe);
+        self
     }
 }
 
