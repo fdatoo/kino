@@ -604,7 +604,7 @@ fn render_audio_args(audio: &AudioPolicy, args: &mut Vec<OsString>) {
     match audio {
         AudioPolicy::StereoAac { bitrate_kbps } => {
             push_arg(args, "-map");
-            push_arg(args, "0:a:0");
+            push_arg(args, "0:a:0?");
             push_arg(args, "-c:a");
             push_arg(args, "aac");
             push_arg(args, "-ac");
@@ -614,7 +614,7 @@ fn render_audio_args(audio: &AudioPolicy, args: &mut Vec<OsString>) {
         }
         AudioPolicy::StereoAacWithSurroundPassthrough { bitrate_kbps } => {
             push_arg(args, "-map");
-            push_arg(args, "0:a");
+            push_arg(args, "0:a?");
             push_arg(args, "-c:a");
             push_arg(args, "copy");
             push_arg(args, "-c:a:0");
