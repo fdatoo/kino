@@ -1,0 +1,5 @@
+---
+source: crates/kino-transcode/src/encoder/videotoolbox.rs
+expression: "format!(\"{command}\")"
+---
+ffmpeg -hide_banner -nostdin -loglevel warning -progress pipe:1 -hwaccel videotoolbox -hwaccel_output_format videotoolbox_vld -i '/library/Some Movie/source.mkv' -map 0:v:0 -c:v hevc_videotoolbox -pix_fmt p010le -color_primaries bt709 -color_trc bt709 -colorspace bt709 -vf 'hwdownload,format=p010le,scale=1920:1080' -map 0:a:0 -c:a aac -ac 2 -b:a 192k -f hls -hls_segment_type fmp4 -hls_time 6 -hls_playlist_type vod -hls_segment_filename '/library/Some Movie/transcodes/videotoolbox-hevc-1080p/seg-%05d.m4s' -hls_fmp4_init_filename init.mp4 '/library/Some Movie/transcodes/videotoolbox-hevc-1080p/media.m3u8'

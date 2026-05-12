@@ -8,7 +8,9 @@ use std::{
 use tokio::process::Command;
 use tracing::{debug, info};
 
-use super::{EncoderKind, EncoderRegistry, QsvEncoder, SoftwareEncoder, VaapiEncoder};
+use super::{
+    EncoderKind, EncoderRegistry, QsvEncoder, SoftwareEncoder, VaapiEncoder, VideoToolboxEncoder,
+};
 use crate::Result;
 
 const VAAPI_RENDER_NODE: &str = "/dev/dri/renderD128";
@@ -81,10 +83,38 @@ pub async fn available_encoders(config: &DetectionConfig) -> Result<EncoderRegis
     }
 
     if config.allow.contains(&EncoderKind::VideoToolbox) {
-        debug!("encoder backend unavailable: kind=videotoolbox reason=not implemented");
+        match probe_videotoolbox(&config.ffmpeg_binary).await {
+            Ok(()) => {
+                registry.register(Box::new(VideoToolboxEncoder::with_binary(
+                    config.ffmpeg_binary.clone(),
+                )));
+                info!("encoder backend available: kind=videotoolbox");
+            }
+            Err(reason) => {
+                debug!(reason, "encoder backend unavailable: kind=videotoolbox");
+            }
+        }
     }
 
     Ok(registry)
+}
+
+#[cfg(target_os = "macos")]
+async fn probe_videotoolbox(binary: &Path) -> std::result::Result<(), String> {
+    let hwaccels = ffmpeg_hwaccels(binary).await?;
+    if hwaccels
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("videotoolbox"))
+    {
+        Ok(())
+    } else {
+        Err("ffmpeg hwaccels output did not include videotoolbox".to_owned())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn probe_videotoolbox(_binary: &Path) -> std::result::Result<(), String> {
+    Err("videotoolbox is only available on macOS".to_owned())
 }
 
 async fn probe_qsv(binary: &Path) -> std::result::Result<(), String> {

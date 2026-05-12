@@ -19,7 +19,7 @@ use std::{
 pub use downgrade::DowngradeStore;
 pub use encoder::{
     Capabilities, DetectionConfig, Encoder, EncoderKind, EncoderRegistry, LaneId, QsvEncoder,
-    VaapiEncoder, VideoCodec, available_encoders,
+    VaapiEncoder, VideoCodec, VideoToolboxEncoder, available_encoders,
 };
 pub use ephemeral::{
     ActiveEncode, ActiveEncodeLease, ActiveEncodeRequest, ActiveEncodes, EphemeralOutput,
