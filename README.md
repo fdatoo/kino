@@ -37,6 +37,22 @@ binary:
 | `kino-admin`        | Minimal web UI for configuration and operations     |
 | `kino-cli`          | Operational tooling                                 |
 
+## Runtime requirements
+
+Kino shells out to a handful of standard tools at runtime:
+
+- **ffmpeg + ffprobe** — required. The transcode pipeline depends on FFmpeg's
+  `zscale` filter (provided by `libzimg`) for the HDR → SDR tone-map chain used
+  by the Compatibility variant. Homebrew's default `ffmpeg` formula does *not*
+  build with `zimg`; either install via the
+  [`homebrew-ffmpeg/ffmpeg`](https://github.com/homebrew-ffmpeg/homebrew-ffmpeg)
+  tap with `--with-zimg`, or build FFmpeg from source with `--enable-libzimg`.
+  Verify with `ffmpeg -filters | grep zscale`. Compatibility encodes fail with
+  `No such filter: 'zscale'` when the filter is absent.
+- **tesseract** — optional, used only for OCR of image-based subtitle tracks
+  (PGS / VobSub / DVB). When unavailable, image subtitles are skipped at
+  ingest with a `warn` log; text subtitles still work.
+
 ## Build
 
     just build
