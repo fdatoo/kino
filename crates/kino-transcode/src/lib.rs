@@ -14,7 +14,7 @@ use std::{
 };
 
 pub use encoder::{Capabilities, Encoder, EncoderKind, EncoderRegistry, LaneId, VideoCodec};
-pub use job::state::JobState;
+pub use job::{JobState, JobStore, ListJobsFilter, NewJob, TranscodeJob};
 use kino_core::Id;
 pub use pipeline::{
     AudioPolicy, ColorOutput, FfmpegEncodeCommand, HlsOutputSpec, InputSpec, LogLevel,
@@ -40,6 +40,42 @@ pub enum Error {
         /// Requested durable job state.
         to: JobState,
     },
+    /// A transcode job row was not found.
+    #[error("transcode job not found: {id}")]
+    JobNotFound {
+        /// Missing transcode job id.
+        id: Id,
+    },
+    /// A stored profile hash has the wrong byte length.
+    #[error("invalid transcode profile hash length: {len}")]
+    InvalidProfileHashLength {
+        /// Actual persisted hash length.
+        len: usize,
+    },
+    /// A stored job attempt count cannot be represented.
+    #[error("invalid transcode job attempt value: {value}")]
+    InvalidJobAttempt {
+        /// Persisted attempt value.
+        value: i64,
+    },
+    /// A stored job progress value cannot be represented as a percent.
+    #[error("invalid transcode job progress percent: {value}")]
+    InvalidJobProgress {
+        /// Persisted progress value.
+        value: i64,
+    },
+    /// A requested progress update is outside the percent range.
+    #[error("invalid transcode progress percent: {pct}")]
+    InvalidProgressPct {
+        /// Requested progress percent.
+        pct: u8,
+    },
+    /// A retry backoff could not be represented by Kino timestamps.
+    #[error("transcode retry backoff is too large")]
+    RetryBackoffTooLarge,
+    /// Adding retry backoff to the current timestamp overflowed.
+    #[error("transcode retry timestamp is out of range")]
+    RetryTimestampOutOfRange,
     /// Encoder lane id string is not recognized.
     #[error("invalid lane id: {0}")]
     InvalidLaneId(String),
@@ -75,6 +111,9 @@ pub enum Error {
     /// Filesystem or process I/O failed.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// A database operation failed.
+    #[error("transcode database operation failed: {0}")]
+    Sqlx(#[from] sqlx::Error),
 }
 
 impl Error {
@@ -98,6 +137,13 @@ impl Error {
             Self::InvalidEncoderKind(_)
             | Self::InvalidJobState(_)
             | Self::InvalidTransition { .. }
+            | Self::JobNotFound { .. }
+            | Self::InvalidProfileHashLength { .. }
+            | Self::InvalidJobAttempt { .. }
+            | Self::InvalidJobProgress { .. }
+            | Self::InvalidProgressPct { .. }
+            | Self::RetryBackoffTooLarge
+            | Self::RetryTimestampOutOfRange
             | Self::InvalidLaneId(_)
             | Self::InvalidVideoCodec(_)
             | Self::InvalidVariantKind(_)
@@ -105,7 +151,8 @@ impl Error {
             | Self::InvalidAudioPolicyKind(_)
             | Self::RecorderLock(_)
             | Self::Cancelled
-            | Self::IntegrityFailed(_) => false,
+            | Self::IntegrityFailed(_)
+            | Self::Sqlx(_) => false,
         }
     }
 }
