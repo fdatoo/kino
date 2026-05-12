@@ -84,7 +84,7 @@ impl PipelineRunner {
         self.run_process(command.into_command(), cancel).await
     }
 
-    async fn run_process(
+    pub(crate) async fn run_process(
         &self,
         mut command: Command,
         cancel: oneshot::Receiver<()>,

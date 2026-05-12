@@ -923,7 +923,7 @@ async fn packaged_hls_fixture() -> Result<PackagedHlsFixture, Box<dyn std::error
         &db,
         source_file_id,
         &high_dir,
-        r#"{"codecs":"hvc1.2.4.L153.B0,mp4a.40.2","resolution":"3840x2160","video_range":"PQ"}"#,
+        r#"{"encoder_kind":"software","ffmpeg_version":"ffmpeg version 7.1","duration_us":24000000,"vmaf_samples":[{"sample_idx":0,"crf":24,"mean_vmaf":95.4}],"chosen_crf":24,"spot_check_vmaf":95.1,"codecs":"hvc1.2.4.L153.B0,mp4a.40.2","resolution":[3840,2160],"bandwidth":null,"video_range":"PQ","color_downgrade":null}"#,
     )
     .await?;
     let compatibility_id = insert_packaged_transcode_output(
