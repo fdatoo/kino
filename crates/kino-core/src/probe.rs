@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -448,7 +448,7 @@ impl ProbeVideoStream {
 }
 
 /// SMPTE ST 2086 mastering display metadata from ffprobe side data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MasterDisplay {
     /// Red primary x chromaticity numerator.
     pub red_x: u32,
@@ -514,7 +514,7 @@ impl MasterDisplay {
 }
 
 /// CTA-861.3 content light level metadata from ffprobe side data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaxCll {
     /// Maximum content light level.
     pub max_content: u32,
@@ -532,7 +532,7 @@ impl MaxCll {
 }
 
 /// Dolby Vision configuration metadata from ffprobe side data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DolbyVision {
     /// Dolby Vision profile number.
     pub profile: u8,

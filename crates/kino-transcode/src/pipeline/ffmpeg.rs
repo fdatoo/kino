@@ -348,16 +348,23 @@ impl FfmpegEncodeCommand {
 
         args.extend(self.input.to_args());
 
-        push_arg(&mut args, "-map");
-        push_arg(&mut args, "0:v:0");
-        render_video_args(&self.video, &mut args);
+        if self.video.codec == VideoCodec::Copy {
+            push_arg(&mut args, "-map");
+            push_arg(&mut args, "0");
+            push_arg(&mut args, "-c");
+            push_arg(&mut args, "copy");
+        } else {
+            push_arg(&mut args, "-map");
+            push_arg(&mut args, "0:v:0");
+            render_video_args(&self.video, &mut args);
 
-        if !self.filters.is_empty() {
-            push_arg(&mut args, "-vf");
-            push_arg(&mut args, render_filters(&self.filters));
+            if !self.filters.is_empty() {
+                push_arg(&mut args, "-vf");
+                push_arg(&mut args, render_filters(&self.filters));
+            }
+
+            render_audio_args(&self.audio, &mut args);
         }
-
-        render_audio_args(&self.audio, &mut args);
 
         if let Some(hls) = &self.hls {
             render_hls_args(hls, &mut args);
@@ -798,6 +805,23 @@ mod tests {
             .add_filter(VideoFilter::HdrToSdrTonemap)
             .add_filter(VideoFilter::Scale(1920, 1080))
             .hls(hls_output("h264-1080p-tonemap"));
+
+        insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn snapshot_copy_passthrough_maps_all_streams() {
+        let command = FfmpegEncodeCommand::new("ffmpeg", input())
+            .video(VideoOutputSpec {
+                codec: VideoCodec::Copy,
+                crf: None,
+                preset: Preset::Medium,
+                bit_depth: 10,
+                color: ColorOutput::CopyFromInput,
+                max_resolution: None,
+            })
+            .audio(AudioPolicy::Copy)
+            .hls(hls_output("original"));
 
         insta::assert_snapshot!(format!("{command}"));
     }

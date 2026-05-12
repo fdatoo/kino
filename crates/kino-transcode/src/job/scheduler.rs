@@ -8,12 +8,13 @@ use tokio::{sync::oneshot, task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::{JobState, JobStore, TranscodeJob};
+use super::{JobState, JobStore, NewTranscodeOutput, TranscodeJob};
 use crate::encoder::SoftwareEncodeContext;
 use crate::plan::{AudioPolicyKind, ColorTarget};
 use crate::{
-    AudioPolicy, ColorOutput, Encoder, EncoderRegistry, Error, HlsOutputSpec, LaneId,
-    PipelineRunner, PlannedVariant, Preset, Result, VideoFilter, VideoOutputSpec, verify_outputs,
+    AudioPolicy, ColorDowngrade, ColorOutput, DowngradeStore, EncodeMetadata, Encoder,
+    EncoderRegistry, Error, HlsOutputSpec, LaneId, PipelineRunner, PlannedVariant, Preset, Result,
+    SampleMeasurement, TranscodeProfile, VideoFilter, VideoOutputSpec, VideoRange, verify_outputs,
 };
 
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(250);
@@ -188,27 +189,36 @@ impl Scheduler {
     }
 
     async fn dispatch_job(self: &Arc<Self>, job: TranscodeJob) -> Result<()> {
-        let variant = match serde_json::from_str::<PlannedVariant>(&job.profile_json) {
-            Ok(variant) => variant,
+        let planned = match planned_job(&job) {
+            Ok(planned) => planned,
             Err(err) => {
                 self.fail_running_job(job.id, err.to_string()).await?;
                 return Ok(());
             }
         };
+        let variant = planned.variant;
         let (width, height) = variant_dimensions(&variant);
         let Some(encoder) = self.select_encoder(job.lane, &variant, width, height) else {
             self.fail_running_job(job.id, "no encoder supports this variant")
                 .await?;
             return Ok(());
         };
-
-        let context = match encode_context(&job, &variant, width, height) {
-            Ok(context) => context,
+        let input_path = match self.store.source_path(job.source_file_id).await {
+            Ok(path) => path,
             Err(err) => {
                 self.fail_running_job(job.id, err.to_string()).await?;
                 return Ok(());
             }
         };
+
+        let context =
+            match encode_context(&job, &variant, &planned.source, input_path, width, height) {
+                Ok(context) => context,
+                Err(err) => {
+                    self.fail_running_job(job.id, err.to_string()).await?;
+                    return Ok(());
+                }
+            };
         let command = match encoder.build_command(&context) {
             Ok(command) => command,
             Err(err) => {
@@ -258,7 +268,7 @@ impl Scheduler {
         let result = self.runner.run(command, cancel_rx).await;
         match result {
             Ok(_) => {
-                if let Err(err) = self.complete_job(job.id, &output_dir).await {
+                if let Err(err) = self.complete_job(&job, &output_dir).await {
                     error!(%job.id, error = %err, "transcode job completion failed");
                 }
             }
@@ -285,14 +295,14 @@ impl Scheduler {
         self.cleanup_job(job.lane, job.id);
     }
 
-    async fn complete_job(&self, job_id: Id, output_dir: &std::path::Path) -> Result<()> {
+    async fn complete_job(&self, job: &TranscodeJob, output_dir: &std::path::Path) -> Result<()> {
         self.store
-            .transition_state(job_id, JobState::Running, JobState::Verifying, None)
+            .transition_state(job.id, JobState::Running, JobState::Verifying, None)
             .await?;
         if let Err(err) = verify_outputs(output_dir) {
             self.store
                 .transition_state(
-                    job_id,
+                    job.id,
                     JobState::Verifying,
                     JobState::Failed,
                     Some(&err.to_string()),
@@ -300,8 +310,9 @@ impl Scheduler {
                 .await?;
             return Err(err);
         }
+        persist_output(&self.store, job, output_dir).await?;
         self.store
-            .transition_state(job_id, JobState::Verifying, JobState::Completed, None)
+            .transition_state(job.id, JobState::Verifying, JobState::Completed, None)
             .await?;
         Ok(())
     }
@@ -368,6 +379,8 @@ async fn transition_or_accept_terminal(
 fn encode_context(
     job: &TranscodeJob,
     variant: &PlannedVariant,
+    source: &SourceColorContext,
+    input_path: PathBuf,
     width: u32,
     height: u32,
 ) -> Result<SoftwareEncodeContext> {
@@ -376,19 +389,17 @@ fn encode_context(
         .join("jobs")
         .join(job.id.to_string());
     std::fs::create_dir_all(&output_dir)?;
+    let copy = variant.codec == crate::VideoCodec::Copy;
 
     Ok(SoftwareEncodeContext {
-        input_path: PathBuf::from("/kino/source-path-unavailable"),
+        input_path,
         video: VideoOutputSpec {
             codec: variant.codec,
-            crf: variant.vmaf_target.map(|_| 23),
+            crf: (!copy).then(|| variant.vmaf_target.map(|_| 23)).flatten(),
             preset: Preset::Medium,
             bit_depth: variant.bit_depth,
-            color: match variant.color {
-                ColorTarget::Sdr => ColorOutput::SdrBt709,
-                ColorTarget::Hdr10 => ColorOutput::CopyFromInput,
-            },
-            max_resolution: Some((width, height)),
+            color: color_output(variant, source),
+            max_resolution: (!copy).then_some((width, height)),
         },
         audio: match variant.audio {
             AudioPolicyKind::StereoAac => AudioPolicy::StereoAac { bitrate_kbps: 192 },
@@ -397,12 +408,171 @@ fn encode_context(
             }
             AudioPolicyKind::Copy => AudioPolicy::Copy,
         },
-        filters: variant
-            .width
-            .map(|planned_width| vec![VideoFilter::Scale(planned_width, height)])
-            .unwrap_or_default(),
+        filters: video_filters(variant, source, height),
         hls: HlsOutputSpec::cmaf_vod(output_dir, Duration::from_secs(6)),
     })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SourceColorContext {
+    color_transfer: Option<String>,
+    master_display: Option<kino_core::MasterDisplay>,
+    max_cll: Option<kino_core::MaxCll>,
+    dolby_vision: Option<kino_core::DolbyVision>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PlannedJob {
+    variant: PlannedVariant,
+    source: SourceColorContext,
+    duration_us: Option<u64>,
+}
+
+fn planned_job(job: &TranscodeJob) -> Result<PlannedJob> {
+    if let Ok(profile) = serde_json::from_str::<TranscodeProfile>(&job.profile_json) {
+        return Ok(PlannedJob {
+            variant: profile.variant(),
+            source: SourceColorContext {
+                color_transfer: profile.source_color_transfer,
+                master_display: profile.source_master_display,
+                max_cll: profile.source_max_cll,
+                dolby_vision: profile.source_dolby_vision,
+            },
+            duration_us: profile.source_duration_us,
+        });
+    }
+
+    Ok(PlannedJob {
+        variant: serde_json::from_str::<PlannedVariant>(&job.profile_json)?,
+        source: SourceColorContext::default(),
+        duration_us: None,
+    })
+}
+
+fn color_output(variant: &PlannedVariant, source: &SourceColorContext) -> ColorOutput {
+    if variant.codec == crate::VideoCodec::Copy {
+        return ColorOutput::CopyFromInput;
+    }
+
+    match variant.color {
+        ColorTarget::Sdr => ColorOutput::SdrBt709,
+        ColorTarget::Hdr10 => match (source.master_display.clone(), source.max_cll.clone()) {
+            (Some(master_display), Some(max_cll)) => ColorOutput::Hdr10 {
+                master_display,
+                max_cll,
+            },
+            _ => ColorOutput::CopyFromInput,
+        },
+    }
+}
+
+fn video_filters(
+    variant: &PlannedVariant,
+    source: &SourceColorContext,
+    height: u32,
+) -> Vec<VideoFilter> {
+    if variant.codec == crate::VideoCodec::Copy {
+        return Vec::new();
+    }
+
+    let mut filters = Vec::new();
+    if variant.color == ColorTarget::Sdr && source_is_hdr_or_dv(source) {
+        filters.push(VideoFilter::HdrToSdrTonemap);
+    }
+    if let Some(planned_width) = variant.width {
+        filters.push(VideoFilter::Scale(planned_width, height));
+    }
+    filters
+}
+
+fn source_is_hdr_or_dv(source: &SourceColorContext) -> bool {
+    source.dolby_vision.is_some()
+        || source.master_display.is_some()
+        || source
+            .color_transfer
+            .as_deref()
+            .is_some_and(|transfer| matches!(transfer, "smpte2084" | "arib-std-b67"))
+}
+
+fn detect_color_downgrade(
+    variant: &PlannedVariant,
+    source: &SourceColorContext,
+) -> Option<ColorDowngrade> {
+    if variant.codec == crate::VideoCodec::Copy {
+        return None;
+    }
+
+    if source.dolby_vision.is_some() {
+        return match variant.color {
+            ColorTarget::Hdr10 => Some(ColorDowngrade::DvToHdr10),
+            ColorTarget::Sdr => Some(ColorDowngrade::DvToSdr),
+        };
+    }
+
+    (variant.color == ColorTarget::Sdr && source_is_hdr_or_dv(source))
+        .then_some(ColorDowngrade::Hdr10ToSdr)
+}
+
+async fn persist_output(
+    store: &JobStore,
+    job: &TranscodeJob,
+    output_dir: &std::path::Path,
+) -> Result<()> {
+    let planned = planned_job(job)?;
+    let (width, height) = variant_dimensions(&planned.variant);
+    let downgrade = detect_color_downgrade(&planned.variant, &planned.source);
+    let metadata = EncodeMetadata {
+        encoder_kind: job.lane.as_str().to_owned(),
+        ffmpeg_version: None,
+        duration_us: planned.duration_us.unwrap_or(0),
+        vmaf_samples: Vec::<SampleMeasurement>::new(),
+        chosen_crf: planned.variant.vmaf_target.map(|_| 23),
+        spot_check_vmaf: None,
+        codecs: codecs_for_variant(&planned.variant),
+        resolution: (width, height),
+        bandwidth: None,
+        video_range: video_range_for_variant(&planned.variant),
+        color_downgrade: downgrade,
+    };
+    let hls = HlsOutputSpec::cmaf_vod(output_dir.to_path_buf(), Duration::from_secs(6));
+    let output_id = store
+        .upsert_transcode_output(&NewTranscodeOutput {
+            source_file_id: job.source_file_id,
+            path: hls
+                .output_dir
+                .join(&hls.playlist_filename)
+                .display()
+                .to_string(),
+            directory_path: hls.output_dir.display().to_string(),
+            playlist_filename: hls.playlist_filename,
+            init_filename: hls.init_filename,
+            encode_metadata_json: serde_json::to_string(&metadata)?,
+        })
+        .await?;
+
+    if let Some(kind) = downgrade {
+        DowngradeStore::new(store.db().clone())
+            .insert_color_downgrade(output_id, kind, None)
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn codecs_for_variant(variant: &PlannedVariant) -> String {
+    match variant.codec {
+        crate::VideoCodec::Hevc | crate::VideoCodec::Copy => "hvc1,mp4a.40.2",
+        crate::VideoCodec::H264 => "avc1.640028,mp4a.40.2",
+        crate::VideoCodec::Av1 => "av01,mp4a.40.2",
+    }
+    .to_owned()
+}
+
+fn video_range_for_variant(variant: &PlannedVariant) -> VideoRange {
+    match variant.color {
+        ColorTarget::Hdr10 => VideoRange::Pq,
+        ColorTarget::Sdr => VideoRange::Sdr,
+    }
 }
 
 fn variant_dimensions(variant: &PlannedVariant) -> (u32, u32) {
@@ -415,13 +585,16 @@ fn variant_dimensions(variant: &PlannedVariant) -> (u32, u32) {
 mod tests {
     use std::{fs, path::Path, sync::Arc, time::Duration};
 
-    use kino_core::{Id, Timestamp};
+    use kino_core::{
+        DolbyVision, Id, MasterDisplay, MaxCll, ProbeResult, ProbeVideoStream, Timestamp,
+    };
     use kino_db::Db;
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
-        Capabilities, EncoderKind, InputSpec, NewJob, VideoCodec,
+        Capabilities, EncoderKind, InputSpec, NewJob, SourceContext, VideoCodec,
+        encoder::SoftwareEncoder,
         plan::variant::{AudioPolicyKind, Container, VariantKind},
     };
 
@@ -537,6 +710,105 @@ mod tests {
         assert_eq!(job.state, JobState::Planned);
         assert_eq!(job.attempt, 2);
         Ok(())
+    }
+
+    #[test]
+    fn snapshot_dv_original_copy_maps_all_streams_without_color_overrides() {
+        let source = source_context_for_video(dolby_vision_video());
+        let variant = PlannedVariant {
+            kind: VariantKind::Original,
+            codec: VideoCodec::Copy,
+            container: Container::Fmp4Cmaf,
+            width: None,
+            bit_depth: 10,
+            color: ColorTarget::Hdr10,
+            audio: AudioPolicyKind::Copy,
+            vmaf_target: None,
+        };
+        let command = command_for_variant(&source, &variant, 3840, 2160);
+
+        insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn snapshot_hdr10_high_reencode_preserves_hdr10_metadata() {
+        let source = source_context_for_video(hdr10_video());
+        let variant = PlannedVariant {
+            kind: VariantKind::High,
+            codec: VideoCodec::Hevc,
+            container: Container::Fmp4Cmaf,
+            width: None,
+            bit_depth: 10,
+            color: ColorTarget::Hdr10,
+            audio: AudioPolicyKind::StereoAacWithSurroundPassthrough,
+            vmaf_target: Some(95.0),
+        };
+        let command = command_for_variant(&source, &variant, 3840, 2160);
+
+        insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn snapshot_hdr10_compatibility_reencode_tonemaps_to_sdr() {
+        let source = source_context_for_video(hdr10_video());
+        let variant = PlannedVariant {
+            kind: VariantKind::Compatibility,
+            codec: VideoCodec::H264,
+            container: Container::Fmp4Cmaf,
+            width: Some(1920),
+            bit_depth: 8,
+            color: ColorTarget::Sdr,
+            audio: AudioPolicyKind::StereoAac,
+            vmaf_target: Some(90.0),
+        };
+        let command = command_for_variant(&source, &variant, 1920, 1080);
+
+        insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn color_downgrade_detection_classifies_dv_and_hdr10_outputs() {
+        let mut variant = planned_variant(VideoCodec::Hevc);
+        variant.color = ColorTarget::Hdr10;
+        let dv = source_context_for_video(dolby_vision_video());
+        let hdr10 = source_context_for_video(hdr10_video());
+        let dv_profile = TranscodeProfile::from_source_variant(&dv, &variant);
+        let dv_source = SourceColorContext {
+            color_transfer: dv_profile.source_color_transfer,
+            master_display: dv_profile.source_master_display,
+            max_cll: dv_profile.source_max_cll,
+            dolby_vision: dv_profile.source_dolby_vision,
+        };
+
+        assert_eq!(
+            detect_color_downgrade(&variant, &dv_source),
+            Some(ColorDowngrade::DvToHdr10)
+        );
+
+        variant.color = ColorTarget::Sdr;
+        let hdr10_profile = TranscodeProfile::from_source_variant(&hdr10, &variant);
+        let hdr10_source = SourceColorContext {
+            color_transfer: hdr10_profile.source_color_transfer,
+            master_display: hdr10_profile.source_master_display,
+            max_cll: hdr10_profile.source_max_cll,
+            dolby_vision: hdr10_profile.source_dolby_vision,
+        };
+        assert_eq!(
+            detect_color_downgrade(&variant, &hdr10_source),
+            Some(ColorDowngrade::Hdr10ToSdr)
+        );
+
+        let dv_profile = TranscodeProfile::from_source_variant(&dv, &variant);
+        let dv_source = SourceColorContext {
+            color_transfer: dv_profile.source_color_transfer,
+            master_display: dv_profile.source_master_display,
+            max_cll: dv_profile.source_max_cll,
+            dolby_vision: dv_profile.source_dolby_vision,
+        };
+        assert_eq!(
+            detect_color_downgrade(&variant, &dv_source),
+            Some(ColorDowngrade::DvToSdr)
+        );
     }
 
     struct Fixture {
@@ -709,6 +981,139 @@ printf '#EXTM3U\n#EXTINF:1,\nseg-00000.m4s\n#EXT-X-ENDLIST\n' > "$playlist"
             color: ColorTarget::Sdr,
             audio: AudioPolicyKind::StereoAac,
             vmaf_target: Some(90.0),
+        }
+    }
+
+    fn command_for_variant(
+        source: &SourceContext,
+        variant: &PlannedVariant,
+        width: u32,
+        height: u32,
+    ) -> crate::FfmpegEncodeCommand {
+        let profile = TranscodeProfile::from_source_variant(source, variant);
+        let job = transcode_job(profile.profile_json());
+        let planned = match planned_job(&job) {
+            Ok(planned) => planned,
+            Err(err) => panic!("profile should decode: {err}"),
+        };
+        let mut context = match encode_context(
+            &job,
+            &planned.variant,
+            &planned.source,
+            source.probe.source_path.clone(),
+            width,
+            height,
+        ) {
+            Ok(context) => context,
+            Err(err) => panic!("context should build: {err}"),
+        };
+        context.hls = HlsOutputSpec::cmaf_vod(
+            format!(
+                "/library/Some Movie/transcodes/{}",
+                planned.variant.kind.as_str()
+            ),
+            Duration::from_secs(6),
+        );
+
+        SoftwareEncoder::new().build_command(&context)
+    }
+
+    fn transcode_job(profile_json: String) -> TranscodeJob {
+        let now = Timestamp::now();
+        TranscodeJob {
+            id: fixed_id("018f16f2-76c0-7c5d-9a38-6dc365f4f062"),
+            source_file_id: fixed_id("018f16f2-76c0-7c5d-9a38-6dc365f4f063"),
+            profile_json,
+            profile_hash: [7; 32],
+            state: JobState::Running,
+            lane: LaneId::Cpu,
+            attempt: 1,
+            progress_pct: None,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now,
+            updated_at: now,
+            started_at: Some(now),
+            completed_at: None,
+        }
+    }
+
+    fn source_context_for_video(video: ProbeVideoStream) -> SourceContext {
+        SourceContext {
+            source_file_id: fixed_id("018f16f2-76c0-7c5d-9a38-6dc365f4f063"),
+            probe: ProbeResult {
+                source_path: PathBuf::from("/library/Some Movie/source.mkv"),
+                container: None,
+                title: None,
+                duration: None,
+                video_streams: vec![video],
+                audio_streams: Vec::new(),
+                subtitle_streams: Vec::new(),
+            },
+        }
+    }
+
+    fn hdr10_video() -> ProbeVideoStream {
+        let mut video = base_video();
+        video.color_primaries = Some("bt2020".to_owned());
+        video.color_transfer = Some("smpte2084".to_owned());
+        video.color_space = Some("bt2020nc".to_owned());
+        video.master_display = Some(master_display());
+        video.max_cll = Some(MaxCll {
+            max_content: 1_000,
+            max_average: 400,
+        });
+        video
+    }
+
+    fn dolby_vision_video() -> ProbeVideoStream {
+        let mut video = hdr10_video();
+        video.dolby_vision = Some(DolbyVision {
+            profile: 8,
+            level: 6,
+            rpu_present: true,
+            el_present: false,
+            bl_present: true,
+        });
+        video
+    }
+
+    fn base_video() -> ProbeVideoStream {
+        ProbeVideoStream {
+            index: 0,
+            codec_name: Some("hevc".to_owned()),
+            codec_long_name: None,
+            width: Some(3840),
+            height: Some(2160),
+            language: None,
+            color_primaries: Some("bt709".to_owned()),
+            color_transfer: Some("bt709".to_owned()),
+            color_space: Some("bt709".to_owned()),
+            master_display: None,
+            max_cll: None,
+            dolby_vision: None,
+        }
+    }
+
+    const fn master_display() -> MasterDisplay {
+        MasterDisplay {
+            red_x: 34_000,
+            red_y: 16_000,
+            green_x: 13_250,
+            green_y: 34_500,
+            blue_x: 7_500,
+            blue_y: 3_000,
+            white_x: 15_635,
+            white_y: 16_450,
+            min_luminance: 50,
+            max_luminance: 10_000_000,
+        }
+    }
+
+    fn fixed_id(value: &str) -> Id {
+        match value.parse() {
+            Ok(id) => id,
+            Err(err) => panic!("test id should parse: {err}"),
         }
     }
 

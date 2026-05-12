@@ -1,0 +1,5 @@
+---
+source: crates/kino-transcode/src/pipeline/ffmpeg.rs
+expression: "format!(\"{command}\")"
+---
+ffmpeg -hide_banner -nostdin -loglevel warning -progress pipe:1 -i '/library/Some Movie/source.mkv' -map 0 -c copy -f hls -hls_segment_type fmp4 -hls_time 6 -hls_playlist_type vod -hls_segment_filename '/library/Some Movie/transcodes/original/seg-%05d.m4s' -hls_fmp4_init_filename init.mp4 '/library/Some Movie/transcodes/original/media.m3u8'
