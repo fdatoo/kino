@@ -14,9 +14,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use kino_core::Id;
+use kino_core::{FfprobeFileProbe, Id, ProbeAudioStream, ProbeResult, ProbeVideoStream};
 use kino_db::Db;
-use kino_fulfillment::{FfprobeFileProbe, ProbeAudioStream, ProbeResult, ProbeVideoStream};
 use kino_library::{SubtitleFormat, SubtitleProvenance, SubtitleService, SubtitleSidecar};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -373,7 +372,7 @@ pub(crate) enum StreamError {
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
-    Probe(#[from] kino_fulfillment::ProbeError),
+    Probe(#[from] kino_core::ProbeError),
 
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),

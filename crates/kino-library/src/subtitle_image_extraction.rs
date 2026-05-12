@@ -54,6 +54,19 @@ impl ProbeSubtitleKind {
     }
 }
 
+impl From<kino_core::ProbeSubtitleKind> for ProbeSubtitleKind {
+    fn from(kind: kino_core::ProbeSubtitleKind) -> Self {
+        match kind {
+            kino_core::ProbeSubtitleKind::Srt => Self::Srt,
+            kino_core::ProbeSubtitleKind::Ass => Self::Ass,
+            kino_core::ProbeSubtitleKind::ImagePgs => Self::ImagePgs,
+            kino_core::ProbeSubtitleKind::ImageVobSub => Self::ImageVobSub,
+            kino_core::ProbeSubtitleKind::ImageDvb => Self::ImageDvb,
+            kino_core::ProbeSubtitleKind::Other => Self::Other,
+        }
+    }
+}
+
 impl fmt::Display for ProbeSubtitleKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

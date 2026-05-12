@@ -11,6 +11,7 @@ pub mod id;
 pub mod identity;
 pub mod playback_session;
 pub mod playback_state;
+pub mod probe;
 pub mod request;
 pub mod time;
 pub mod tracing;
@@ -29,6 +30,10 @@ pub use identity::{
 };
 pub use playback_session::{PlaybackSession, PlaybackSessionStatus};
 pub use playback_state::{InvalidPlaybackPosition, PlaybackProgress, Watched, WatchedSource};
+pub use probe::{
+    DEFAULT_FFPROBE_PROGRAM, FfprobeFileProbe, ProbeAudioStream, ProbeContainer, ProbeError,
+    ProbeResult, ProbeSubtitleKind, ProbeSubtitleStream, ProbeVideoStream,
+};
 pub use request::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use time::Timestamp;
 pub use user::{SEEDED_USER_ID, User};
