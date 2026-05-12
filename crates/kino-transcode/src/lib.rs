@@ -11,7 +11,7 @@ use std::{
     sync::Mutex,
 };
 
-pub use encoder::{Capabilities, Encoder, EncoderKind, LaneId, VideoCodec};
+pub use encoder::{Capabilities, Encoder, EncoderKind, EncoderRegistry, LaneId, VideoCodec};
 pub use job::state::JobState;
 use kino_core::Id;
 pub use pipeline::{
