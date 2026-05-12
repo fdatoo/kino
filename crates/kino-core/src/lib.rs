@@ -31,8 +31,9 @@ pub use identity::{
 pub use playback_session::{PlaybackSession, PlaybackSessionStatus};
 pub use playback_state::{InvalidPlaybackPosition, PlaybackProgress, Watched, WatchedSource};
 pub use probe::{
-    DEFAULT_FFPROBE_PROGRAM, FfprobeFileProbe, ProbeAudioStream, ProbeContainer, ProbeError,
-    ProbeResult, ProbeSubtitleKind, ProbeSubtitleStream, ProbeVideoStream,
+    DEFAULT_FFPROBE_PROGRAM, DolbyVision, FfprobeFileProbe, MasterDisplay, MaxCll,
+    ProbeAudioStream, ProbeContainer, ProbeError, ProbeResult, ProbeSubtitleKind,
+    ProbeSubtitleStream, ProbeVideoStream,
 };
 pub use request::{Request, RequestFailureReason, RequestRequester, RequestState, RequestTarget};
 pub use time::Timestamp;
