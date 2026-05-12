@@ -10,7 +10,10 @@ workspace = true
 [dependencies]
 kino-core = { path = "../kino-core" }
 serde = { workspace = true }
+shell-words = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
+insta = { workspace = true }
 tokio = { workspace = true }
