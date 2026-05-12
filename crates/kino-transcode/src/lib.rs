@@ -1,6 +1,7 @@
 //! Transcode handoff interface.
 
 pub mod encoder;
+pub mod job;
 
 use std::{
     future::Future,
@@ -10,6 +11,7 @@ use std::{
 };
 
 pub use encoder::{Capabilities, Encoder, EncoderKind, LaneId, VideoCodec};
+pub use job::state::JobState;
 use kino_core::Id;
 
 /// Errors produced by `kino-transcode`.
@@ -18,6 +20,17 @@ pub enum Error {
     /// Encoder kind string is not recognized.
     #[error("invalid encoder kind: {0}")]
     InvalidEncoderKind(String),
+    /// Job state string is not recognized.
+    #[error("invalid job state: {0}")]
+    InvalidJobState(String),
+    /// Requested job state transition is not legal.
+    #[error("invalid job state transition: {from} -> {to}")]
+    InvalidTransition {
+        /// Current durable job state.
+        from: JobState,
+        /// Requested durable job state.
+        to: JobState,
+    },
     /// Encoder lane id string is not recognized.
     #[error("invalid lane id: {0}")]
     InvalidLaneId(String),
