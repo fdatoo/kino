@@ -9,6 +9,7 @@ pub mod registry;
 pub mod software;
 pub mod vaapi;
 mod video;
+pub mod videotoolbox;
 
 pub use backend::Encoder;
 pub use capabilities::Capabilities;
@@ -19,6 +20,7 @@ pub use registry::EncoderRegistry;
 pub use software::{SoftwareEncodeContext, SoftwareEncoder};
 pub use vaapi::VaapiEncoder;
 pub use video::VideoCodec;
+pub use videotoolbox::VideoToolboxEncoder;
 
 #[cfg(test)]
 mod tests {

@@ -228,6 +228,8 @@ impl InputSpec {
 pub enum HardwareAccel {
     /// Render Intel Quick Sync decode flags.
     Qsv,
+    /// Render macOS VideoToolbox decode flags.
+    VideoToolbox,
     /// Render VA-API decode flags bound to a Linux DRM render node.
     Vaapi {
         /// DRM render node used to initialize FFmpeg's VA-API device.
@@ -490,6 +492,12 @@ fn render_hardware_accel_args(accel: &HardwareAccel, args: &mut Vec<OsString>) {
             push_arg(args, "qsv");
             push_arg(args, "-hwaccel_output_format");
             push_arg(args, "qsv");
+        }
+        HardwareAccel::VideoToolbox => {
+            push_arg(args, "-hwaccel");
+            push_arg(args, "videotoolbox");
+            push_arg(args, "-hwaccel_output_format");
+            push_arg(args, "videotoolbox_vld");
         }
         HardwareAccel::Vaapi { render_node } => {
             push_arg(args, "-init_hw_device");

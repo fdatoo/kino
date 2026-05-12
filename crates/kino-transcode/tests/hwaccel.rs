@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use kino_transcode::VideoToolboxEncoder;
 use kino_transcode::{
     AudioPolicy, ColorOutput, HlsOutputSpec, Preset, QsvEncoder, VaapiEncoder, VideoCodec,
     VideoOutputSpec, encoder::SoftwareEncodeContext,
@@ -59,6 +61,40 @@ async fn vaapi_encoder_runs_tiny_hls_encode() -> Result<(), Box<dyn std::error::
     tokio::fs::create_dir_all(&output_dir).await?;
 
     let encoder = VaapiEncoder::with_binary(FFMPEG, RENDER_NODE);
+    let command = encoder.build_command(&SoftwareEncodeContext {
+        input_path: input,
+        video: VideoOutputSpec {
+            codec: VideoCodec::H264,
+            crf: Some(24),
+            preset: Preset::Medium,
+            bit_depth: 8,
+            color: ColorOutput::SdrBt709,
+            max_resolution: Some((64, 64)),
+        },
+        audio: AudioPolicy::None,
+        filters: Vec::new(),
+        hls: hls_output(&output_dir),
+    });
+
+    run_encode(command.into_command()).await?;
+    assert_hls_segments(&output_dir).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn videotoolbox_encoder_runs_tiny_hls_encode() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let input = temp.path().join("input.mp4");
+    generate_input(&input).await?;
+
+    if !videotoolbox_available(&input).await? {
+        return Ok(());
+    }
+
+    let output_dir = temp.path().join("videotoolbox");
+    tokio::fs::create_dir_all(&output_dir).await?;
+
+    let encoder = VideoToolboxEncoder::with_binary(FFMPEG);
     let command = encoder.build_command(&SoftwareEncodeContext {
         input_path: input,
         video: VideoOutputSpec {
@@ -148,6 +184,58 @@ async fn vaapi_available() -> Result<bool, Box<dyn std::error::Error>> {
             "-an",
             "-c:v",
             "h264_vaapi",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .await?;
+
+    Ok(output.status.success())
+}
+
+#[cfg(target_os = "macos")]
+async fn videotoolbox_available(input: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let hwaccels = match Command::new(FFMPEG)
+        .args(["-hide_banner", "-hwaccels"])
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Box::new(err)),
+    };
+    if !hwaccels.status.success()
+        || !String::from_utf8_lossy(&hwaccels.stdout)
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case("videotoolbox"))
+    {
+        return Ok(false);
+    }
+
+    let output = Command::new(FFMPEG)
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-hwaccel",
+            "videotoolbox",
+            "-hwaccel_output_format",
+            "videotoolbox_vld",
+            "-i",
+        ])
+        .arg(input)
+        .args([
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            "h264_videotoolbox",
+            "-vf",
+            "hwdownload,format=nv12",
+            "-pix_fmt",
+            "nv12",
             "-f",
             "null",
             "-",
