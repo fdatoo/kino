@@ -66,7 +66,7 @@ impl TranscodeService {
         let mut inserted = Vec::new();
 
         for variant in self.policy.plan(&source) {
-            let profile = TranscodeProfile::from_variant(source.source_file_id, &variant);
+            let profile = TranscodeProfile::from_source_variant(&source, &variant);
             let id = self
                 .store
                 .insert_job_idempotent(&NewJob {

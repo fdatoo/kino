@@ -118,6 +118,17 @@ pub enum ColorDowngrade {
     DvToSdr,
 }
 
+impl ColorDowngrade {
+    /// Return the stable lowercase identifier stored in durable rows.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DvToHdr10 => "dv_to_hdr10",
+            Self::Hdr10ToSdr => "hdr10_to_sdr",
+            Self::DvToSdr => "dv_to_sdr",
+        }
+    }
+}
+
 /// Select evenly distributed source samples as `(start, duration)` pairs.
 pub fn select_samples(
     source_duration: Duration,

@@ -1,6 +1,6 @@
 //! SQLx accessors for durable transcode jobs.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use kino_core::{Id, Timestamp};
 use kino_db::Db;
@@ -83,6 +83,23 @@ pub struct NewJob {
     pub lane: LaneId,
 }
 
+/// Insert payload for a packaged transcode output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTranscodeOutput {
+    /// Source file this output was encoded from.
+    pub source_file_id: Id,
+    /// Public playlist path for this output.
+    pub path: String,
+    /// Directory containing the packaged HLS assets.
+    pub directory_path: String,
+    /// Media playlist filename within `directory_path`.
+    pub playlist_filename: String,
+    /// CMAF init segment filename within `directory_path`.
+    pub init_filename: String,
+    /// JSON-encoded [`crate::EncodeMetadata`].
+    pub encode_metadata_json: String,
+}
+
 /// Persistent transcode job query layer.
 #[derive(Clone)]
 pub struct JobStore {
@@ -155,6 +172,17 @@ impl JobStore {
         };
 
         job_from_row(&row)
+    }
+
+    /// Fetch the filesystem path for a source file.
+    pub async fn source_path(&self, source_file_id: Id) -> Result<PathBuf> {
+        let path = sqlx::query_scalar::<_, String>("SELECT path FROM source_files WHERE id = ?1")
+            .bind(source_file_id)
+            .fetch_optional(self.db.read_pool())
+            .await?;
+
+        path.map(PathBuf::from)
+            .ok_or(Error::SourceFileNotFound { id: source_file_id })
     }
 
     /// List jobs matching all provided filters.
@@ -336,6 +364,48 @@ impl JobStore {
         }
 
         Ok(())
+    }
+
+    /// Insert or update a packaged output row and return its durable id.
+    pub async fn upsert_transcode_output(&self, new: &NewTranscodeOutput) -> Result<Id> {
+        let id = Id::new();
+        let now = Timestamp::now();
+        let output_id = sqlx::query_scalar::<_, Id>(
+            r#"
+            INSERT INTO transcode_outputs (
+                id,
+                source_file_id,
+                path,
+                created_at,
+                updated_at,
+                directory_path,
+                playlist_filename,
+                init_filename,
+                encode_metadata_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(path) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                directory_path = excluded.directory_path,
+                playlist_filename = excluded.playlist_filename,
+                init_filename = excluded.init_filename,
+                encode_metadata_json = excluded.encode_metadata_json
+            RETURNING id
+            "#,
+        )
+        .bind(id)
+        .bind(new.source_file_id)
+        .bind(&new.path)
+        .bind(now)
+        .bind(now)
+        .bind(&new.directory_path)
+        .bind(&new.playlist_filename)
+        .bind(&new.init_filename)
+        .bind(&new.encode_metadata_json)
+        .fetch_one(self.db.write_pool())
+        .await?;
+
+        Ok(output_id)
     }
 }
 

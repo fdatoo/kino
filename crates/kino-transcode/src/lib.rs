@@ -1,5 +1,6 @@
 //! Transcode handoff interface.
 
+pub mod downgrade;
 pub mod encoder;
 pub mod job;
 pub mod pipeline;
@@ -14,12 +15,14 @@ use std::{
     sync::Mutex,
 };
 
+pub use downgrade::DowngradeStore;
 pub use encoder::{
     Capabilities, DetectionConfig, Encoder, EncoderKind, EncoderRegistry, LaneId, VideoCodec,
     available_encoders,
 };
 pub use job::{
-    JobState, JobStore, ListJobsFilter, NewJob, Scheduler, SchedulerConfig, TranscodeJob,
+    JobState, JobStore, ListJobsFilter, NewJob, NewTranscodeOutput, Scheduler, SchedulerConfig,
+    TranscodeJob,
 };
 use kino_core::{Id, ProbeResult};
 pub use pipeline::{
@@ -56,6 +59,12 @@ pub enum Error {
     #[error("transcode job not found: {id}")]
     JobNotFound {
         /// Missing transcode job id.
+        id: Id,
+    },
+    /// A source file row was not found.
+    #[error("source file not found: {id}")]
+    SourceFileNotFound {
+        /// Missing source file id.
         id: Id,
     },
     /// A stored profile hash has the wrong byte length.
@@ -103,6 +112,9 @@ pub enum Error {
     /// Output audio policy kind string is not recognized.
     #[error("invalid audio policy kind: {0}")]
     InvalidAudioPolicyKind(String),
+    /// Color downgrade kind string is not recognized.
+    #[error("invalid color downgrade: {0}")]
+    InvalidColorDowngrade(String),
     /// Stored planned variant JSON could not be decoded.
     #[error("invalid planned variant json: {0}")]
     InvalidPlannedVariantJson(#[from] serde_json::Error),
@@ -176,6 +188,7 @@ impl Error {
             | Self::InvalidJobState(_)
             | Self::InvalidTransition { .. }
             | Self::JobNotFound { .. }
+            | Self::SourceFileNotFound { .. }
             | Self::InvalidProfileHashLength { .. }
             | Self::InvalidJobAttempt { .. }
             | Self::InvalidJobProgress { .. }
@@ -187,6 +200,7 @@ impl Error {
             | Self::InvalidVariantKind(_)
             | Self::InvalidColorTarget(_)
             | Self::InvalidAudioPolicyKind(_)
+            | Self::InvalidColorDowngrade(_)
             | Self::InvalidPlannedVariantJson(_)
             | Self::MissingSourceProbe { .. }
             | Self::NoEncoderForVariant { .. }
