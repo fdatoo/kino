@@ -18,6 +18,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod admin_config;
 pub mod auth;
+mod catalog_admin;
 mod ingestion_orchestrator;
 mod openapi;
 mod playback;
@@ -110,6 +111,10 @@ fn router_with_config_reocr_and_tmdb(
             subtitle_reocr,
             tmdb_client,
             canonical_transfer,
+        ))
+        .merge(catalog_admin::router(
+            db.clone(),
+            config.library_root.clone(),
         ))
         .merge(stream::router(db.clone()))
         .merge(token::router(db.clone()))

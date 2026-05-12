@@ -108,6 +108,13 @@ pub(crate) struct ReResolveRequest {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CancelRequest {
+    /// Optional status-event message.
+    message: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecordPlanRequest {
@@ -187,8 +194,9 @@ pub(crate) fn router_with_canonical_transfer(
         .route("/api/v1/requests", post(create_request).get(list_requests))
         .route(
             "/api/v1/requests/{id}",
-            get(get_request).delete(cancel_request),
+            get(get_request).delete(delete_cancel_request),
         )
+        .route("/api/v1/requests/{id}/cancel", post(cancel_request))
         .route("/api/v1/requests/{id}/resolve", post(resolve_request))
         .route("/api/v1/requests/{id}/reset", post(reset_request))
         .route("/api/v1/requests/{id}/plans", post(record_plan))
@@ -295,12 +303,13 @@ pub(crate) async fn get_request(
 }
 
 #[utoipa::path(
-    delete,
-    path = "/api/v1/requests/{id}",
+    post,
+    path = "/api/v1/requests/{id}/cancel",
     tag = "requests",
     params(
         ("id" = Id, Path, description = "Request id")
     ),
+    request_body = Option<CancelRequest>,
     responses(
         (status = 200, description = "Request cancelled", body = RequestDetail),
         (status = 400, description = "Invalid request id", body = ErrorResponse),
@@ -312,11 +321,39 @@ pub(crate) async fn get_request(
 pub(crate) async fn cancel_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    payload: Option<Json<CancelRequest>>,
+) -> ApiResult<Json<RequestDetail>> {
+    let id = parse_id(id)?;
+    let message = cancel_message(
+        payload
+            .as_ref()
+            .and_then(|payload| payload.message.as_deref()),
+    );
+    let detail = state
+        .requests
+        .transition(
+            id,
+            RequestTransition::Cancel,
+            Some(RequestEventActor::System),
+            Some(message),
+        )
+        .await?;
+    Ok(Json(detail))
+}
+
+pub(crate) async fn delete_cancel_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
 ) -> ApiResult<Json<RequestDetail>> {
     let id = parse_id(id)?;
     let detail = state
         .requests
-        .transition(id, RequestTransition::Cancel, None, None)
+        .transition(
+            id,
+            RequestTransition::Cancel,
+            Some(RequestEventActor::System),
+            Some("cancelled by operator"),
+        )
         .await?;
     Ok(Json(detail))
 }
@@ -916,7 +953,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn parse_id(value: String) -> ApiResult<Id> {
+pub(crate) fn parse_id(value: String) -> ApiResult<Id> {
     value
         .parse()
         .map_err(|source| ApiError::InvalidId { value, source })
@@ -1030,6 +1067,13 @@ fn manual_import_plan_summary(message: Option<&str>) -> &str {
         .map(str::trim)
         .filter(|message| !message.is_empty())
         .unwrap_or("manual import")
+}
+
+fn cancel_message(message: Option<&str>) -> &str {
+    message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or("cancelled by operator")
 }
 
 fn artwork_cache_path(cache_dir: &FsPath, local_path: &FsPath) -> Option<PathBuf> {

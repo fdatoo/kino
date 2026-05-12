@@ -13,8 +13,9 @@ use kino_fulfillment::{
     tmdb::{TmdbClient, TmdbClientConfig},
 };
 use kino_library::{
-    ImageSubtitleExtraction, ImageSubtitleExtractionInput, ImageSubtitleFrame, ProbeSubtitleKind,
-    SubtitleReocrService,
+    CatalogService, ImageSubtitleExtraction, ImageSubtitleExtractionInput, ImageSubtitleFrame,
+    OcrSubtitleExtractionInput, OcrSubtitleTrack, ProbeSubtitleKind, SubtitleReocrService,
+    SubtitleService, TranscodeCapabilities,
     subtitle_ocr::{OcrEngine, OcrFrameResult},
 };
 use serde::de::DeserializeOwned;
@@ -181,6 +182,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(body["info"]["version"], "0.1.0-phase-2");
     assert_eq!(body["servers"][0]["url"], "https://kino.example.test");
     assert!(body["paths"].get("/api/v1/library/items").is_some());
+    assert!(body["paths"].get("/api/v1/requests/{id}/cancel").is_some());
     let catalog_params = body["paths"]["/api/v1/library/items"]["get"]["parameters"]
         .as_array()
         .ok_or("catalog list parameters should be an array")?;
@@ -193,6 +195,11 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
         );
     }
     assert!(body["paths"].get("/api/v1/admin/config").is_some());
+    assert!(
+        body["paths"]
+            .get("/api/v1/admin/library/items/{id}")
+            .is_some()
+    );
     assert!(
         body["paths"]
             .get("/api/v1/stream/sourcefile/{id}/file.{ext}")
@@ -859,6 +866,286 @@ async fn manual_import_walks_state_from_resolved() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
+async fn delete_catalog_item_removes_rows_and_canonical_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let (auth, token_id) = common::issued_token_with_id(&db).await?;
+    let library_root = tempfile::tempdir()?;
+    let artwork_cache = tempfile::tempdir()?;
+    let tmdb = TmdbTestServer::new(vec![
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","popularity":83.1}]}"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, r#"{"results":[]}"#),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{
+                "id":27205,
+                "title":"Inception",
+                "release_date":"2010-07-15",
+                "overview":"A thief enters dreams.",
+                "runtime":1,
+                "popularity":83.1,
+                "poster_path":"/poster.jpg",
+                "backdrop_path":"/backdrop.jpg",
+                "credits":{"cast":[{"order":0,"name":"Leonardo DiCaprio","character":"Cobb","profile_path":null}]},
+                "images":{"logos":[]}
+            }"#,
+        ),
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{
+                "id":27205,
+                "title":"Inception",
+                "release_date":"2010-07-15",
+                "overview":"A thief enters dreams.",
+                "runtime":1,
+                "poster_path":"/poster.jpg",
+                "backdrop_path":"/backdrop.jpg",
+                "credits":{"cast":[{"order":0,"name":"Leonardo DiCaprio","character":"Cobb","profile_path":null}]},
+                "images":{"logos":[]}
+            }"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, "poster-bytes"),
+        TmdbTestResponse::json(StatusCode::OK, "backdrop-bytes"),
+    ])
+    .await?;
+    let app = kino_server::router_with_library_root_and_tmdb_client(
+        db.clone(),
+        library_root.path(),
+        artwork_cache.path(),
+        tmdb.client()?,
+    );
+    let created = create_request(&app, &auth, "Inception (2010)").await?;
+
+    let resolve_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/resolve", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(resolve_response.status(), StatusCode::OK);
+
+    let incoming = tempfile::tempdir()?;
+    let path = incoming.path().join("inception.mkv");
+    write_sample_video(&path).await?;
+    let import_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/requests/{}/manual-import",
+                    created.request.id
+                ))
+                .bearer(&auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"path":"{}"}}"#, path.display())))?,
+        )
+        .await?;
+    assert_eq!(import_response.status(), StatusCode::OK);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?has_source_file=true")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let catalog: Value = response_json(catalog_response).await?;
+    let media_item_id: Id = catalog["items"][0]["id"]
+        .as_str()
+        .ok_or("media item id missing")?
+        .parse()?;
+    let source_file_id: Id = catalog["items"][0]["source_files"][0]["id"]
+        .as_str()
+        .ok_or("source file id missing")?
+        .parse()?;
+    let canonical_path = Path::new(
+        catalog["items"][0]["source_files"][0]["path"]
+            .as_str()
+            .ok_or("source file path missing")?,
+    )
+    .to_path_buf();
+    let item_dir = canonical_path
+        .parent()
+        .ok_or("canonical source should have a parent")?
+        .to_path_buf();
+
+    let transcode_path = item_dir.join("Inception (2010).1080p.mp4");
+    tokio::fs::write(&transcode_path, b"transcoded").await?;
+    CatalogService::new(db.clone())
+        .register_transcode_output(
+            media_item_id,
+            TranscodeCapabilities {
+                codec: "h264".to_owned(),
+                container: "mp4".to_owned(),
+                resolution: Some("1080p".to_owned()),
+                hdr: None,
+            },
+            &transcode_path,
+        )
+        .await?;
+
+    let sidecars = SubtitleService::new(db.clone())
+        .extract_ocr_subtitles(OcrSubtitleExtractionInput::new(
+            media_item_id,
+            &item_dir,
+            vec![OcrSubtitleTrack::new(
+                4,
+                "eng",
+                vec![kino_library::subtitle_ocr::OcrCue {
+                    start: Duration::from_millis(250),
+                    end: Duration::from_millis(750),
+                    text: String::from("HELLO"),
+                    confidence: 99.0,
+                }],
+            )],
+        ))
+        .await?
+        .sidecars;
+    let sidecar_path = sidecars[0].path.clone();
+
+    let now = Timestamp::now();
+    sqlx::query(
+        r#"
+        INSERT INTO playback_progress (
+            user_id,
+            media_item_id,
+            position_seconds,
+            updated_at,
+            source_device_token_id
+        )
+        VALUES (?1, ?2, 42, ?3, ?4)
+        "#,
+    )
+    .bind(SEEDED_USER_ID)
+    .bind(media_item_id)
+    .bind(now)
+    .bind(token_id)
+    .execute(db.write_pool())
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO watched (
+            user_id,
+            media_item_id,
+            watched_at,
+            source
+        )
+        VALUES (?1, ?2, ?3, 'manual')
+        "#,
+    )
+    .bind(SEEDED_USER_ID)
+    .bind(media_item_id)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO playback_sessions (
+            id,
+            user_id,
+            token_id,
+            media_item_id,
+            variant_id,
+            started_at,
+            last_seen_at,
+            ended_at,
+            status
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'active')
+        "#,
+    )
+    .bind(Id::new())
+    .bind(SEEDED_USER_ID)
+    .bind(token_id)
+    .bind(media_item_id)
+    .bind(source_file_id.to_string())
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/admin/library/items/{media_item_id}"))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+    assert_deleted_catalog_rows(&db, media_item_id, source_file_id).await?;
+    assert!(!tokio::fs::try_exists(&canonical_path).await?);
+    assert!(!tokio::fs::try_exists(&transcode_path).await?);
+    assert!(!tokio::fs::try_exists(&sidecar_path).await?);
+    assert!(!tokio::fs::try_exists(&item_dir).await?);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed: Value = response_json(list_response).await?;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0));
+
+    let get_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/v1/library/items/{media_item_id}"))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_catalog_item_returns_not_found_for_missing_item()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let library_root = tempfile::tempdir()?;
+    let app = kino_server::router_with_library_root(db, library_root.path());
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/admin/library/items/{}", Id::new()))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn manual_import_api_fails_when_probe_rejects_source()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = kino_db::test_db().await?;
@@ -1289,6 +1576,161 @@ async fn request_reset_rejects_satisfied_request() -> Result<(), Box<dyn std::er
         .await?;
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_cancel_api_cancels_pending_and_rejects_terminal()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let service = RequestService::new(db.clone());
+    let app = kino_server::router(db.clone());
+    let pending = create_request(&app, &auth, "Inception (2010)").await?;
+
+    let cancel_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/cancel", pending.request.id))
+                .bearer(&auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"message":"operator stopped it"}"#))?,
+        )
+        .await?;
+    assert_eq!(cancel_response.status(), StatusCode::OK);
+    let cancelled: RequestDetail = response_json(cancel_response).await?;
+    assert_eq!(cancelled.request.state, RequestState::Cancelled);
+    assert_eq!(
+        cancelled
+            .status_events
+            .last()
+            .and_then(|event| event.message.as_deref()),
+        Some("operator stopped it")
+    );
+
+    let satisfied = service
+        .create(NewRequest::anonymous("Satisfied Movie"))
+        .await?;
+    service
+        .resolve_identity(
+            satisfied.request.id,
+            identity(550),
+            RequestIdentityProvenance::Manual,
+            None,
+            None,
+        )
+        .await?;
+    service
+        .transition(
+            satisfied.request.id,
+            RequestTransition::StartPlanning,
+            None,
+            None,
+        )
+        .await?;
+    service
+        .transition(satisfied.request.id, RequestTransition::Satisfy, None, None)
+        .await?;
+
+    let satisfied_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/cancel", satisfied.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(satisfied_response.status(), StatusCode::CONFLICT);
+
+    let missing_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/cancel", Id::new()))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_cancel_reset_then_resolve_composes() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let tmdb = TmdbTestServer::new(vec![
+        TmdbTestResponse::json(
+            StatusCode::OK,
+            r#"{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","popularity":83.1}]}"#,
+        ),
+        TmdbTestResponse::json(StatusCode::OK, r#"{"results":[]}"#),
+    ])
+    .await?;
+    let app = kino_server::router_with_tmdb_client(db, tmdb.client()?);
+    let created = create_request(&app, &auth, "Inception (2010)").await?;
+
+    let cancel_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/cancel", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(cancel_response.status(), StatusCode::OK);
+    let cancelled: RequestDetail = response_json(cancel_response).await?;
+    assert_eq!(cancelled.request.state, RequestState::Cancelled);
+
+    let reset_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/reset", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(reset_response.status(), StatusCode::OK);
+    let reset: RequestDetail = response_json(reset_response).await?;
+    assert_eq!(reset.request.state, RequestState::Pending);
+
+    let resolve_response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/v1/requests/{}/resolve", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(resolve_response.status(), StatusCode::OK);
+
+    let fetched_response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/api/v1/requests/{}", created.request.id))
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+    let fetched: RequestDetail = response_json(fetched_response).await?;
+    assert_eq!(fetched.request.state, RequestState::Resolved);
+    assert_eq!(
+        fetched.request.target.canonical_identity_id,
+        Some(identity(27_205))
+    );
 
     Ok(())
 }
@@ -2279,6 +2721,68 @@ async fn media_item_count(db: &kino_db::Db) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
         .fetch_one(db.read_pool())
         .await
+}
+
+async fn assert_deleted_catalog_rows(
+    db: &kino_db::Db,
+    media_item_id: Id,
+    source_file_id: Id,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let media_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE id = ?1")
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+    assert_eq!(media_items, 0);
+
+    let source_files: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM source_files WHERE media_item_id = ?1")
+            .bind(media_item_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(source_files, 0);
+
+    let subtitle_sidecars: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM subtitle_sidecars WHERE media_item_id = ?1")
+            .bind(media_item_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(subtitle_sidecars, 0);
+
+    let transcode_outputs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transcode_outputs WHERE source_file_id = ?1")
+            .bind(source_file_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(transcode_outputs, 0);
+
+    let playback_progress: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM playback_progress WHERE media_item_id = ?1")
+            .bind(media_item_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(playback_progress, 0);
+
+    let watched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watched WHERE media_item_id = ?1")
+        .bind(media_item_id)
+        .fetch_one(db.read_pool())
+        .await?;
+    assert_eq!(watched, 0);
+
+    let playback_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM playback_sessions WHERE media_item_id = ?1")
+            .bind(media_item_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(playback_sessions, 0);
+
+    let fts_source: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items_fts_source WHERE media_item_id = ?1")
+            .bind(media_item_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    assert_eq!(fts_source, 0);
+
+    Ok(())
 }
 
 async fn fulfilling_request(
