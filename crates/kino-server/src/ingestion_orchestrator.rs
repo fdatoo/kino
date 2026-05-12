@@ -4,12 +4,12 @@ use std::{
 };
 
 use kino_core::{
-    CanonicalIdentityId, CanonicalIdentityKind, CanonicalLayoutTransfer, Id, RequestFailureReason,
+    CanonicalIdentityId, CanonicalIdentityKind, CanonicalLayoutTransfer, FfprobeFileProbe, Id,
+    ProbeResult, ProbeSubtitleKind, RequestFailureReason,
 };
 use kino_fulfillment::{
-    ExpectedProbedFile, FfprobeFileProbe, ProbeResult, ProbeSubtitleKind,
-    ProbedFileVerificationResult, RequestDetail, RequestEventActor, RequestTransition,
-    movie::TmdbMovieId, tmdb::TmdbClient,
+    ExpectedProbedFile, ProbedFile, ProbedFileVerificationResult, RequestDetail, RequestEventActor,
+    RequestTransition, movie::TmdbMovieId, tmdb::TmdbClient,
 };
 use kino_library::{
     CanonicalLayoutInput, CanonicalLayoutResult, CanonicalMediaTarget,
@@ -91,7 +91,7 @@ async fn ingest_request_inner(
         .verify_probed_file(
             request_id,
             expected,
-            probe.as_probed_file(),
+            ProbedFile::from_probe_result(&probe),
             Some(RequestEventActor::System),
         )
         .await?;
@@ -524,7 +524,7 @@ enum IngestError {
     Fulfillment(#[from] kino_fulfillment::Error),
 
     #[error(transparent)]
-    Probe(#[from] kino_fulfillment::ProbeError),
+    Probe(#[from] kino_core::ProbeError),
 
     #[error(transparent)]
     Library(#[from] kino_library::Error),

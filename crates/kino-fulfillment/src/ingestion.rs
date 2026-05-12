@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, fmt, path::PathBuf};
 
-use kino_core::{CanonicalIdentityId, Id};
+use kino_core::{CanonicalIdentityId, Id, ProbeResult};
 use kino_library::{
     CanonicalLayoutInput, CanonicalLayoutResult, CanonicalLayoutWriter, CanonicalMediaTarget,
 };
@@ -241,6 +241,26 @@ impl ProbedFile {
     /// Construct an empty probed-file projection.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Project a rich file-probe result into request-matching facts.
+    pub fn from_probe_result(probe: &ProbeResult) -> Self {
+        Self {
+            title: probe.title.clone(),
+            duration_seconds: probe
+                .duration
+                .and_then(|duration| u32::try_from(duration.as_secs()).ok()),
+            audio_languages: probe
+                .audio_streams
+                .iter()
+                .filter_map(|stream| stream.language.clone())
+                .collect(),
+            subtitle_languages: probe
+                .subtitle_streams
+                .iter()
+                .filter_map(|stream| stream.language.clone())
+                .collect(),
+        }
     }
 
     /// Set the detected title.
