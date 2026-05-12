@@ -47,7 +47,10 @@ pub(crate) fn router(db: Db) -> Router {
             "/api/v1/stream/items/{id}/{variant_id}/media.m3u8",
             get(media_playlist),
         )
-        .route("/api/v1/stream/sourcefile/{id}", get(source_file))
+        .route(
+            "/api/v1/stream/sourcefile/{id}/file.{ext}",
+            get(source_file),
+        )
         .route("/api/v1/stream/transcode/{id}", get(transcode_output))
         .route(
             "/api/v1/stream/items/{id}/subtitles/{track_vtt}",
@@ -130,6 +133,7 @@ pub(crate) async fn media_playlist(
     let metadata = tokio::fs::metadata(&source_file.path).await?;
     let playlist = build_media_playlist(
         variant_id,
+        &source_file.path,
         source_file.probe_duration_seconds.ok_or_else(|| {
             probe_data_missing(source_file.id, "source file has no probed duration")
         })?,
@@ -149,10 +153,11 @@ pub(crate) async fn media_playlist(
 /// `416 Range Not Satisfiable` until segment callers need multipart responses.
 #[utoipa::path(
     get,
-    path = "/api/v1/stream/sourcefile/{id}",
+    path = "/api/v1/stream/sourcefile/{id}/file.{ext}",
     tag = "stream",
     params(
         ("id" = Id, Path, description = "Source-file id"),
+        ("ext" = String, Path, description = "Source-file extension"),
         ("Range" = Option<String>, Header, description = "Single HTTP byte range")
     ),
     responses(
@@ -166,10 +171,11 @@ pub(crate) async fn media_playlist(
 pub(crate) async fn source_file(
     State(state): State<StreamState>,
     AuthenticatedUser { user, token_id }: AuthenticatedUser,
-    AxumPath(id): AxumPath<Id>,
+    AxumPath((id, ext)): AxumPath<(Id, String)>,
     headers: HeaderMap,
 ) -> StreamResult<Response> {
     let source_file = lookup_source_file(&state.db, id).await?;
+    validate_source_file_extension(&source_file.path, &ext)?;
     session_service::heartbeat_or_open_session(
         &state.db,
         user.id,
@@ -877,6 +883,7 @@ fn build_master_playlist(
 
 fn build_media_playlist(
     source_file_id: Id,
+    source_file_path: &Path,
     duration_seconds: u64,
     file_size: u64,
 ) -> StreamResult<String> {
@@ -893,7 +900,7 @@ fn build_media_playlist(
         .map(|segment| segment.duration_seconds)
         .max()
         .unwrap_or(HLS_SEGMENT_TARGET_SECONDS);
-    let source_uri = format!("/api/v1/stream/sourcefile/{source_file_id}");
+    let source_uri = source_file_uri(source_file_id, source_file_path)?;
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
     playlist.push_str("#EXT-X-VERSION:4\n");
@@ -915,6 +922,31 @@ fn build_media_playlist(
 
     playlist.push_str("#EXT-X-ENDLIST\n");
     Ok(playlist)
+}
+
+fn source_file_uri(source_file_id: Id, source_file_path: &Path) -> StreamResult<String> {
+    let extension = source_file_extension(source_file_path)
+        .ok_or_else(|| playlist_unavailable("source file has no extension"))?;
+    Ok(format!(
+        "/api/v1/stream/sourcefile/{source_file_id}/file.{extension}"
+    ))
+}
+
+fn validate_source_file_extension(source_file_path: &Path, requested: &str) -> StreamResult<()> {
+    let Some(extension) = source_file_extension(source_file_path) else {
+        return Err(StreamError::NotFound);
+    };
+    if extension.eq_ignore_ascii_case(requested) {
+        Ok(())
+    } else {
+        Err(StreamError::NotFound)
+    }
+}
+
+fn source_file_extension(path: &Path) -> Option<&str> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
 }
 
 fn byte_range_segments(duration_seconds: u64, file_size: u64) -> Vec<ByteRangeSegment> {

@@ -195,7 +195,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     assert!(body["paths"].get("/api/v1/admin/config").is_some());
     assert!(
         body["paths"]
-            .get("/api/v1/stream/sourcefile/{id}")
+            .get("/api/v1/stream/sourcefile/{id}/file.{ext}")
             .is_some()
     );
     assert!(
@@ -1630,7 +1630,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     );
     assert_eq!(
         listed["items"][0]["variants"][0]["stream_url"],
-        format!("/api/v1/stream/sourcefile/{matrix_source_file}")
+        format!("/api/v1/stream/sourcefile/{matrix_source_file}/file.mkv")
     );
     assert_eq!(listed["next_offset"], Value::Null);
 
@@ -1683,7 +1683,7 @@ async fn catalog_api_lists_filters_and_gets_items() -> Result<(), Box<dyn std::e
     assert_eq!(fetched["variants"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         fetched["variants"][0]["stream_url"],
-        format!("/api/v1/stream/sourcefile/{matrix_source_file}")
+        format!("/api/v1/stream/sourcefile/{matrix_source_file}/file.mkv")
     );
     assert_eq!(fetched["subtitle_tracks"][0]["language"], "eng");
     assert_eq!(fetched["subtitle_tracks"][0]["label"], "ENG");
@@ -1853,7 +1853,7 @@ async fn catalog_item_detail_includes_multiple_source_file_probe_tracks()
     assert_eq!(fetched["variants"][0]["capabilities"]["hdr"], "hdr10");
     assert_eq!(
         fetched["variants"][0]["stream_url"],
-        format!("/api/v1/stream/sourcefile/{main_source_file}")
+        format!("/api/v1/stream/sourcefile/{main_source_file}/file.mkv")
     );
     assert_eq!(fetched["variants"][1]["capabilities"]["codec"], "h264");
     assert_eq!(fetched["variants"][1]["capabilities"]["container"], "mp4");

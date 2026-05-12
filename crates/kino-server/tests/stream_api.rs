@@ -68,10 +68,8 @@ async fn media_playlist_uses_source_file_byte_ranges() -> Result<(), Box<dyn std
     let mut total_length = 0;
     for segment in &playlist.segments {
         assert_eq!(segment.duration, 6.0);
-        assert_eq!(
-            segment.uri,
-            format!("/api/v1/stream/sourcefile/{}", fixture.source_file_id)
-        );
+        assert_eq!(segment.uri, source_file_uri(fixture.source_file_id));
+        assert!(segment.uri.ends_with(".mkv"));
         let Some(byte_range) = &segment.byte_range else {
             return Err("segment missing byte range".into());
         };
@@ -150,10 +148,7 @@ async fn stream_source_file_serves_full_file() -> Result<(), Box<dyn std::error:
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
-                    fixture.source_file_id
-                ))
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .body(Body::empty())?,
         )
@@ -178,7 +173,8 @@ async fn stream_source_file_serves_full_file() -> Result<(), Box<dyn std::error:
 }
 
 #[tokio::test]
-async fn stream_source_file_serves_single_range() -> Result<(), Box<dyn std::error::Error>> {
+async fn stream_source_file_rejects_mismatching_extension() -> Result<(), Box<dyn std::error::Error>>
+{
     let fixture = stream_fixture().await?;
 
     let response = fixture
@@ -187,9 +183,29 @@ async fn stream_source_file_serves_single_range() -> Result<(), Box<dyn std::err
             HttpRequest::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
+                    "/api/v1/stream/sourcefile/{}/file.mp4",
                     fixture.source_file_id
                 ))
+                .bearer(&fixture.auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_source_file_serves_single_range() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = stream_fixture().await?;
+
+    let response = fixture
+        .app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .header(header::RANGE, "bytes=0-99")
                 .body(Body::empty())?,
@@ -252,10 +268,7 @@ async fn stream_request_opens_playback_session() -> Result<(), Box<dyn std::erro
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
-                    fixture.source_file_id
-                ))
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .body(Body::empty())?,
         )
@@ -283,10 +296,7 @@ async fn second_stream_request_replaces_prior_active_session()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
-                    fixture.source_file_id
-                ))
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .body(Body::empty())?,
         )
@@ -334,10 +344,7 @@ async fn repeated_stream_request_heartbeats_existing_session()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
-                    fixture.source_file_id
-                ))
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .body(Body::empty())?,
         )
@@ -351,10 +358,7 @@ async fn repeated_stream_request_heartbeats_existing_session()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
-                    fixture.source_file_id
-                ))
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .header(header::RANGE, "bytes=0-99")
                 .body(Body::empty())?,
@@ -502,10 +506,7 @@ async fn stream_source_file_serves_suffix_range() -> Result<(), Box<dyn std::err
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
-                    fixture.source_file_id
-                ))
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .header(header::RANGE, "bytes=-100")
                 .body(Body::empty())?,
@@ -534,10 +535,7 @@ async fn stream_source_file_rejects_out_of_bounds_range() -> Result<(), Box<dyn 
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!(
-                    "/api/v1/stream/sourcefile/{}",
-                    fixture.source_file_id
-                ))
+                .uri(source_file_uri(fixture.source_file_id))
                 .bearer(&fixture.auth)
                 .header(header::RANGE, "bytes=99999999-")
                 .body(Body::empty())?,
@@ -562,7 +560,7 @@ async fn stream_source_file_requires_auth() -> Result<(), Box<dyn std::error::Er
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
-                .uri(format!("/api/v1/stream/sourcefile/{}", Id::new()))
+                .uri(source_file_uri(Id::new()))
                 .body(Body::empty())?,
         )
         .await?;
@@ -771,6 +769,10 @@ fn parse_media_playlist(
         Ok(Playlist::MasterPlaylist(_)) => Err("expected media playlist, got master".into()),
         Err(error) => Err(format!("playlist parse failed: {error:?}").into()),
     }
+}
+
+fn source_file_uri(source_file_id: Id) -> String {
+    format!("/api/v1/stream/sourcefile/{source_file_id}/file.mkv")
 }
 
 async fn stream_fixture() -> Result<StreamFixture, Box<dyn std::error::Error>> {

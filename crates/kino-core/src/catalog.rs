@@ -237,7 +237,7 @@ mod tests {
                     resolution: Some("2160p".to_owned()),
                     hdr: Some("hdr10".to_owned()),
                 },
-                stream_url: "/api/v1/stream/sourcefile/source-file-id".to_owned(),
+                stream_url: "/api/v1/stream/sourcefile/source-file-id/file.mkv".to_owned(),
             },
             CatalogStreamVariant {
                 variant_id: "transcode-output-id".to_owned(),
@@ -266,7 +266,7 @@ mod tests {
                         "resolution": "2160p",
                         "hdr": "hdr10",
                     },
-                    "stream_url": "/api/v1/stream/sourcefile/source-file-id",
+                    "stream_url": "/api/v1/stream/sourcefile/source-file-id/file.mkv",
                 },
                 {
                     "variant_id": "transcode-output-id",
