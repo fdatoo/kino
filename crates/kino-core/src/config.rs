@@ -206,6 +206,11 @@ pub struct TranscodeConfig {
     /// [`TranscodeSchedulerConfig`].
     #[serde(default)]
     pub scheduler: TranscodeSchedulerConfig,
+
+    /// Runtime live-transcode cache settings. Defaults documented on
+    /// [`EphemeralConfig`].
+    #[serde(default)]
+    pub ephemeral: EphemeralConfig,
 }
 
 /// Default output policy configuration.
@@ -290,6 +295,40 @@ pub struct TranscodeSchedulerConfig {
     /// Whether startup should reset running jobs to planned. Defaults to true.
     #[serde(default = "default_true")]
     pub recovery_on_boot: bool,
+}
+
+/// On-the-fly transcode cache settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EphemeralConfig {
+    /// Whether new live encodes may be started. Existing cache hits still serve.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Directory used for short-lived live encode outputs. Defaults to
+    /// `<library_root>/.kino/ephemeral` when omitted.
+    #[serde(default)]
+    pub cache_root: PathBuf,
+
+    /// Maximum total ephemeral cache size. Defaults to 25 GiB.
+    #[serde(default = "default_transcode_ephemeral_max_size_bytes")]
+    pub max_size_bytes: u64,
+
+    /// Maximum age since last access before eviction. Defaults to 6 hours.
+    #[serde(
+        default = "default_transcode_ephemeral_max_age",
+        rename = "max_age_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub max_age: Duration,
+
+    /// Interval between eviction sweeps. Defaults to 60 seconds.
+    #[serde(
+        default = "default_transcode_ephemeral_eviction_tick",
+        rename = "eviction_tick_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub eviction_tick: Duration,
 }
 
 /// Fulfillment provider configuration sections.
@@ -417,6 +456,18 @@ fn default_transcode_scheduler_reserve_live_lane() -> String {
     "cpu".into()
 }
 
+fn default_transcode_ephemeral_max_size_bytes() -> u64 {
+    25 * 1024 * 1024 * 1024
+}
+
+fn default_transcode_ephemeral_max_age() -> Duration {
+    Duration::from_secs(6 * 60 * 60)
+}
+
+fn default_transcode_ephemeral_eviction_tick() -> Duration {
+    Duration::from_secs(60)
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -489,6 +540,18 @@ impl Default for TranscodeSchedulerConfig {
             backoff: default_transcode_scheduler_backoff(),
             reserve_live_lane: default_transcode_scheduler_reserve_live_lane(),
             recovery_on_boot: default_true(),
+        }
+    }
+}
+
+impl Default for EphemeralConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            cache_root: PathBuf::new(),
+            max_size_bytes: default_transcode_ephemeral_max_size_bytes(),
+            max_age: default_transcode_ephemeral_max_age(),
+            eviction_tick: default_transcode_ephemeral_eviction_tick(),
         }
     }
 }
@@ -578,6 +641,15 @@ pub enum ConfigError {
         reason: &'static str,
     },
 
+    /// The configured ephemeral transcode cache settings are invalid.
+    #[error("invalid transcode ephemeral config {field}: {reason}")]
+    InvalidTranscodeEphemeralConfig {
+        /// Ephemeral config field.
+        field: &'static str,
+        /// Human-readable validation failure.
+        reason: &'static str,
+    },
+
     /// A configured fulfillment provider has invalid scalar settings.
     #[error("invalid provider config {provider}: {reason}")]
     InvalidProviderConfig {
@@ -658,14 +730,20 @@ impl Config {
     }
 
     fn validate(self) -> Result<Self, ConfigError> {
-        validate_library_root(&self.library_root)?;
-        validate_database_path(&self.database_path)?;
-        validate_server_config(&self.server)?;
-        validate_tmdb_config(&self.tmdb)?;
-        validate_ocr_config(&self.ocr)?;
-        validate_transcode_config(&self.transcode)?;
-        validate_provider_configs(&self.providers)?;
-        Ok(self)
+        let mut config = self;
+        if config.transcode.ephemeral.cache_root.as_os_str().is_empty() {
+            config.transcode.ephemeral.cache_root =
+                default_ephemeral_cache_root(&config.library_root);
+        }
+
+        validate_library_root(&config.library_root)?;
+        validate_database_path(&config.database_path)?;
+        validate_server_config(&config.server)?;
+        validate_tmdb_config(&config.tmdb)?;
+        validate_ocr_config(&config.ocr)?;
+        validate_transcode_config(&config.transcode)?;
+        validate_provider_configs(&config.providers)?;
+        Ok(config)
     }
 
     /// Return the artwork cache directory, applying the library-root default.
@@ -680,6 +758,11 @@ impl Config {
 /// Return Kino's default content-addressed artwork cache directory.
 pub fn default_artwork_cache_dir(library_root: &Path) -> PathBuf {
     library_root.join(".kino").join("artwork")
+}
+
+/// Return Kino's default live-transcode cache directory.
+pub fn default_ephemeral_cache_root(library_root: &Path) -> PathBuf {
+    library_root.join(".kino").join("ephemeral")
 }
 
 fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigError> {
@@ -873,6 +956,7 @@ fn validate_transcode_config(config: &TranscodeConfig) -> Result<(), ConfigError
         });
     }
     validate_transcode_scheduler_config(&config.scheduler)?;
+    validate_ephemeral_config(&config.ephemeral)?;
 
     Ok(())
 }
@@ -902,6 +986,35 @@ fn validate_transcode_scheduler_config(
         return Err(ConfigError::InvalidTranscodeSchedulerConfig {
             field: "reserve_live_lane",
             reason: "is empty",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_ephemeral_config(config: &EphemeralConfig) -> Result<(), ConfigError> {
+    if config.cache_root.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidTranscodeEphemeralConfig {
+            field: "ephemeral.cache_root",
+            reason: "is empty",
+        });
+    }
+    if config.max_size_bytes == 0 {
+        return Err(ConfigError::InvalidTranscodeEphemeralConfig {
+            field: "ephemeral.max_size_bytes",
+            reason: "must be positive",
+        });
+    }
+    if config.max_age.is_zero() {
+        return Err(ConfigError::InvalidTranscodeEphemeralConfig {
+            field: "ephemeral.max_age_seconds",
+            reason: "must be positive",
+        });
+    }
+    if config.eviction_tick.is_zero() {
+        return Err(ConfigError::InvalidTranscodeEphemeralConfig {
+            field: "ephemeral.eviction_tick_seconds",
+            reason: "must be positive",
         });
     }
 
@@ -1109,6 +1222,13 @@ mod tests {
                 reserve_live_lane = "gpu_intel"
                 recovery_on_boot = false
 
+                [transcode.ephemeral]
+                enabled = false
+                cache_root = "{}/ephemeral-cache"
+                max_size_bytes = 123456
+                max_age_seconds = 120
+                eviction_tick_seconds = 10
+
                 [providers.disc_rip]
                 path = "{}"
                 preference = 30
@@ -1119,6 +1239,7 @@ mod tests {
                 stability_seconds = 7
             "#,
             database_path.display(),
+            library_root.display(),
             library_root.display(),
             library_root.display(),
             library_root.display(),
@@ -1175,6 +1296,17 @@ mod tests {
             assert_eq!(cfg.transcode.scheduler.backoff, Duration::from_secs(30));
             assert_eq!(cfg.transcode.scheduler.reserve_live_lane, "gpu_intel");
             assert!(!cfg.transcode.scheduler.recovery_on_boot);
+            assert!(!cfg.transcode.ephemeral.enabled);
+            assert_eq!(
+                cfg.transcode.ephemeral.cache_root,
+                fixture.library_root.join("ephemeral-cache")
+            );
+            assert_eq!(cfg.transcode.ephemeral.max_size_bytes, 123456);
+            assert_eq!(cfg.transcode.ephemeral.max_age, Duration::from_secs(120));
+            assert_eq!(
+                cfg.transcode.ephemeral.eviction_tick,
+                Duration::from_secs(10)
+            );
             let disc_rip = cfg.providers.disc_rip.expect("disc rip should parse");
             assert_eq!(disc_rip.path, fixture.library_root.join("rips"));
             assert_eq!(disc_rip.preference, 30);
@@ -1251,6 +1383,23 @@ mod tests {
             assert_eq!(cfg.transcode.scheduler.backoff, Duration::from_secs(60));
             assert_eq!(cfg.transcode.scheduler.reserve_live_lane, "cpu");
             assert!(cfg.transcode.scheduler.recovery_on_boot);
+            assert!(cfg.transcode.ephemeral.enabled);
+            assert_eq!(
+                cfg.transcode.ephemeral.cache_root,
+                fixture.library_root.join(".kino").join("ephemeral")
+            );
+            assert_eq!(
+                cfg.transcode.ephemeral.max_size_bytes,
+                25 * 1024 * 1024 * 1024
+            );
+            assert_eq!(
+                cfg.transcode.ephemeral.max_age,
+                Duration::from_secs(6 * 60 * 60)
+            );
+            assert_eq!(
+                cfg.transcode.ephemeral.eviction_tick,
+                Duration::from_secs(60)
+            );
             assert_eq!(
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::HardLink
@@ -1540,6 +1689,34 @@ mod tests {
             assert_eq!(cfg.transcode.scheduler.backoff, Duration::from_secs(15));
             assert_eq!(cfg.transcode.scheduler.reserve_live_lane, "gpu_intel");
             assert!(!cfg.transcode.scheduler.recovery_on_boot);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_transcode_ephemeral() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+            let cache_root = fixture.library_root.join("env-ephemeral");
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_TRANSCODE__EPHEMERAL__ENABLED", "false");
+            jail.set_env(
+                "KINO_TRANSCODE__EPHEMERAL__CACHE_ROOT",
+                cache_root.display(),
+            );
+            jail.set_env("KINO_TRANSCODE__EPHEMERAL__MAX_SIZE_BYTES", "1024");
+            jail.set_env("KINO_TRANSCODE__EPHEMERAL__MAX_AGE_SECONDS", "30");
+            jail.set_env("KINO_TRANSCODE__EPHEMERAL__EVICTION_TICK_SECONDS", "5");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert!(!cfg.transcode.ephemeral.enabled);
+            assert_eq!(cfg.transcode.ephemeral.cache_root, cache_root);
+            assert_eq!(cfg.transcode.ephemeral.max_size_bytes, 1024);
+            assert_eq!(cfg.transcode.ephemeral.max_age, Duration::from_secs(30));
+            assert_eq!(
+                cfg.transcode.ephemeral.eviction_tick,
+                Duration::from_secs(5)
+            );
             Ok(())
         });
     }
