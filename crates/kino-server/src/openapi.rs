@@ -40,7 +40,15 @@ use utoipa::openapi::server::Server;
         crate::request::reocr_subtitle_track,
         crate::token::create_token,
         crate::token::list_tokens,
-        crate::token::revoke_token
+        crate::token::revoke_token,
+        crate::transcode_admin::cache_stats,
+        crate::transcode_admin::cancel_job,
+        crate::transcode_admin::get_job,
+        crate::transcode_admin::list_encoders,
+        crate::transcode_admin::list_jobs,
+        crate::transcode_admin::purge_cache,
+        crate::transcode_admin::replan_source,
+        crate::transcode_admin::retranscode_source
     ),
     info(title = "Kino API", version = "0.1.0-phase-2"),
     tags(
@@ -69,4 +77,22 @@ pub(crate) fn spec(public_base_url: impl Into<String>) -> utoipa::openapi::OpenA
     let mut spec = ApiDoc::openapi();
     spec.servers = Some(vec![Server::new(public_base_url.into())]);
     spec
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs};
+
+    #[test]
+    #[ignore = "developer helper for sandboxed OpenAPI regeneration"]
+    fn write_openapi_json() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = env::var_os("KINO_OPENAPI_OUT") else {
+            return Ok(());
+        };
+        let public_base_url = env::var("KINO_OPENAPI_PUBLIC_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
+        let json = serde_json::to_vec(&super::spec(public_base_url))?;
+        fs::write(path, json)?;
+        Ok(())
+    }
 }
