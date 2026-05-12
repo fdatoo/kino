@@ -2,6 +2,7 @@
 
 pub mod downgrade;
 pub mod encoder;
+pub mod ephemeral;
 pub mod job;
 pub mod pipeline;
 pub mod plan;
@@ -19,6 +20,10 @@ pub use downgrade::DowngradeStore;
 pub use encoder::{
     Capabilities, DetectionConfig, Encoder, EncoderKind, EncoderRegistry, LaneId, VideoCodec,
     available_encoders,
+};
+pub use ephemeral::{
+    ActiveEncode, ActiveEncodeLease, ActiveEncodeRequest, ActiveEncodes, EphemeralOutput,
+    EphemeralStore, EvictionConfig, EvictionSweeper, NewEphemeralOutput,
 };
 pub use job::{
     JobState, JobStore, ListJobsFilter, NewJob, NewTranscodeOutput, Scheduler, SchedulerConfig,
@@ -72,6 +77,38 @@ pub enum Error {
     InvalidProfileHashLength {
         /// Actual persisted hash length.
         len: usize,
+    },
+    /// A stored ephemeral profile hash has the wrong byte length.
+    #[error("invalid ephemeral transcode profile hash length: {len}")]
+    InvalidEphemeralProfileHashLength {
+        /// Actual persisted hash length.
+        len: usize,
+    },
+    /// An ephemeral output row was not found.
+    #[error("ephemeral transcode output not found: {id}")]
+    EphemeralOutputNotFound {
+        /// Missing ephemeral output id.
+        id: Id,
+    },
+    /// A requested ephemeral output size cannot be persisted.
+    #[error("invalid ephemeral transcode size: {value}")]
+    InvalidEphemeralSize {
+        /// Requested size value.
+        value: u64,
+    },
+    /// A persisted ephemeral output size cannot be represented.
+    #[error("invalid persisted ephemeral transcode size: {value}")]
+    InvalidEphemeralPersistedSize {
+        /// Persisted size value.
+        value: i64,
+    },
+    /// Waiting for a live encode segment timed out.
+    #[error("timed out waiting for live transcode segment {segment} from {id}")]
+    LiveSegmentTimeout {
+        /// Active encode id.
+        id: Id,
+        /// Segment number.
+        segment: u64,
     },
     /// A stored job attempt count cannot be represented.
     #[error("invalid transcode job attempt value: {value}")]
@@ -190,6 +227,11 @@ impl Error {
             | Self::JobNotFound { .. }
             | Self::SourceFileNotFound { .. }
             | Self::InvalidProfileHashLength { .. }
+            | Self::InvalidEphemeralProfileHashLength { .. }
+            | Self::EphemeralOutputNotFound { .. }
+            | Self::InvalidEphemeralSize { .. }
+            | Self::InvalidEphemeralPersistedSize { .. }
+            | Self::LiveSegmentTimeout { .. }
             | Self::InvalidJobAttempt { .. }
             | Self::InvalidJobProgress { .. }
             | Self::InvalidProgressPct { .. }

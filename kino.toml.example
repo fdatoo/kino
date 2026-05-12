@@ -129,6 +129,30 @@ reserve_live_lane = "cpu"
 # Runtime override: KINO_TRANSCODE__SCHEDULER__RECOVERY_ON_BOOT.
 recovery_on_boot = true
 
+[transcode.ephemeral]
+# Allow starting new on-the-fly live encodes. Existing cached and durable hits
+# still serve when disabled. Optional. Defaults to true.
+# Runtime override: KINO_TRANSCODE__EPHEMERAL__ENABLED.
+enabled = true
+
+# Directory used for short-lived live encode outputs. Optional. Defaults to
+# <library_root>/.kino/ephemeral.
+# Runtime override: KINO_TRANSCODE__EPHEMERAL__CACHE_ROOT.
+cache_root = "/srv/media/.kino/ephemeral"
+
+# Maximum total ephemeral cache size in bytes. Optional. Defaults to 25 GiB.
+# Runtime override: KINO_TRANSCODE__EPHEMERAL__MAX_SIZE_BYTES.
+max_size_bytes = 26843545600
+
+# Seconds since last access before an ephemeral output is evicted. Optional.
+# Defaults to 21600.
+# Runtime override: KINO_TRANSCODE__EPHEMERAL__MAX_AGE_SECONDS.
+max_age_seconds = 21600
+
+# Seconds between eviction sweeps. Optional. Defaults to 60.
+# Runtime override: KINO_TRANSCODE__EPHEMERAL__EVICTION_TICK_SECONDS.
+eviction_tick_seconds = 60
+
 [providers.disc_rip]
 # Directory scanned for MakeMKV-style output files. Required when this provider
 # section is present, and validated at startup.

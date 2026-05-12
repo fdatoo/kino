@@ -15,9 +15,9 @@ use kino_db::Db;
 use kino_fulfillment::tmdb::TmdbClient;
 use kino_library::SubtitleReocrService;
 use kino_transcode::{
-    DefaultPolicy, DetectionConfig, EncoderRegistry, JobStore, OutputPolicy, PipelineRunner,
-    Scheduler, SchedulerConfig, TranscodeHandOff, TranscodeService, available_encoders,
-    encoder::SoftwareEncoder,
+    DefaultPolicy, DetectionConfig, EncoderRegistry, EphemeralStore, EvictionConfig,
+    EvictionSweeper, JobStore, OutputPolicy, PipelineRunner, Scheduler, SchedulerConfig,
+    TranscodeHandOff, TranscodeService, available_encoders, encoder::SoftwareEncoder,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -123,6 +123,7 @@ fn router_with_config_reocr_tmdb_and_transcode(
     let artwork_cache_dir = config.artwork_cache_dir();
     let canonical_transfer = config.library.canonical_transfer;
     let cors = cors_layer(&config.server);
+    let live_stream = live_stream_state(db.clone(), &config);
     let protected_api = Router::new()
         .merge(request::router_with_canonical_transfer(
             db.clone(),
@@ -137,7 +138,7 @@ fn router_with_config_reocr_tmdb_and_transcode(
             db.clone(),
             config.library_root.clone(),
         ))
-        .merge(stream::router(db.clone()))
+        .merge(stream::router_with_live(db.clone(), live_stream))
         .merge(token::router(db.clone()))
         .merge(playback::router(db.clone()))
         .merge(session_admin::router(db))
@@ -152,6 +153,18 @@ fn router_with_config_reocr_tmdb_and_transcode(
         .merge(protected_api)
         .merge(kino_admin::router())
         .layer(cors)
+}
+
+fn live_stream_state(db: Db, config: &Config) -> Option<stream::LiveStreamState> {
+    let live = stream::LiveStreamState::new(db.clone(), &config.transcode.ephemeral);
+    if config.transcode.ephemeral.enabled && tokio::runtime::Handle::try_current().is_ok() {
+        EvictionSweeper::new(
+            EphemeralStore::new(db),
+            EvictionConfig::from(&config.transcode.ephemeral),
+        )
+        .spawn();
+    }
+    Some(live)
 }
 
 /// Build the Kino HTTP router with an explicit TMDB client.

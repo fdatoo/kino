@@ -22,9 +22,9 @@ pub use catalog::{
     VariantCapabilities, VariantKind,
 };
 pub use config::{
-    CanonicalLayoutTransfer, Config, LibraryConfig, OcrConfig, SessionReaperConfig,
-    TranscodeConfig, TranscodePolicyCompatibilityConfig, TranscodePolicyConfig,
-    TranscodePolicyHighConfig, TranscodeSchedulerConfig,
+    CanonicalLayoutTransfer, Config, EphemeralConfig, LibraryConfig, OcrConfig,
+    SessionReaperConfig, TranscodeConfig, TranscodePolicyCompatibilityConfig,
+    TranscodePolicyConfig, TranscodePolicyHighConfig, TranscodeSchedulerConfig,
 };
 pub use device_token::DeviceToken;
 pub use id::Id;

@@ -1,5 +1,7 @@
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,9 +16,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kino_core::{FfprobeFileProbe, Id, ProbeAudioStream, ProbeResult, ProbeVideoStream};
 use kino_db::Db;
 use kino_library::{SubtitleFormat, SubtitleProvenance, SubtitleService, SubtitleSidecar};
+use kino_transcode::{
+    ActiveEncodeRequest, ActiveEncodes, AudioPolicy, ColorOutput, EphemeralStore,
+    FfmpegEncodeCommand, HlsOutputSpec, InputSpec, PipelineRunner, Preset, TranscodeProfile,
+    VideoFilter, VideoOutputSpec,
+    plan::{AudioPolicyKind, ColorTarget},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -33,9 +42,18 @@ const DEFAULT_HLS_BANDWIDTH: u64 = 2_000_000;
 pub(crate) struct StreamState {
     db: Db,
     subtitles: SubtitleService,
+    live: Option<LiveStreamState>,
 }
 
-pub(crate) fn router(db: Db) -> Router {
+#[derive(Clone)]
+pub(crate) struct LiveStreamState {
+    store: EphemeralStore,
+    active: ActiveEncodes,
+    enabled: bool,
+    cache_root: PathBuf,
+}
+
+pub(crate) fn router_with_live(db: Db, live: Option<LiveStreamState>) -> Router {
     let subtitles = SubtitleService::new(db.clone());
     Router::new()
         .route(
@@ -64,10 +82,39 @@ pub(crate) fn router(db: Db) -> Router {
             get(transcode_media_segment),
         )
         .route(
+            "/api/v1/stream/live/{source_file_id}/{profile}/media.m3u8",
+            get(live_media_playlist),
+        )
+        .route(
+            "/api/v1/stream/live/{source_file_id}/{profile}/init.mp4",
+            get(live_init_segment),
+        )
+        .route(
+            "/api/v1/stream/live/{source_file_id}/{profile}/{segment}",
+            get(live_media_segment),
+        )
+        .route(
             "/api/v1/stream/items/{id}/subtitles/{track_vtt}",
             get(subtitle_track),
         )
-        .with_state(StreamState { db, subtitles })
+        .with_state(StreamState {
+            db,
+            subtitles,
+            live,
+        })
+}
+
+impl LiveStreamState {
+    pub(crate) fn new(db: Db, config: &kino_core::EphemeralConfig) -> Self {
+        let store = EphemeralStore::new(db);
+        let active = ActiveEncodes::new(store.clone(), Arc::new(PipelineRunner::new()));
+        Self {
+            store,
+            active,
+            enabled: config.enabled,
+            cache_root: config.cache_root.clone(),
+        }
+    }
 }
 
 /// Serve an HLS master playlist for a media item.
@@ -372,6 +419,132 @@ pub(crate) async fn transcode_media_segment(
     .await
 }
 
+/// Serve a live transcode HLS media playlist.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/live/{source_file_id}/{profile}/media.m3u8",
+    tag = "stream",
+    params(
+        ("source_file_id" = Id, Path, description = "Source-file id"),
+        ("profile" = String, Path, description = "Base64url canonical TranscodeProfile JSON")
+    ),
+    responses(
+        (status = 200, description = "Live HLS media playlist", body = String, content_type = "application/vnd.apple.mpegurl"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Live profile or source file not found", body = StreamErrorResponse),
+        (status = 500, description = "Live media playlist failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn live_media_playlist(
+    State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
+    AxumPath((source_file_id, encoded_profile)): AxumPath<(Id, String)>,
+) -> StreamResult<Response> {
+    let live = state.live.clone().ok_or(StreamError::NotFound)?;
+    let request = live_request(&state.db, &live, source_file_id, &encoded_profile).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        request.media_item_id,
+        request.profile_hash_hex.clone(),
+    )
+    .await?;
+
+    let output = resolve_live_output(&live, request, Some(0)).await?;
+    let playlist = tokio::fs::read_to_string(output.directory_path.join("media.m3u8")).await?;
+    let playlist = rewrite_live_playlist_uris(source_file_id, &encoded_profile, &playlist)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HLS_CONTENT_TYPE)
+        .body(Body::from(playlist))
+        .map_err(StreamError::Response)
+}
+
+/// Serve a live transcode init segment.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/live/{source_file_id}/{profile}/init.mp4",
+    tag = "stream",
+    params(
+        ("source_file_id" = Id, Path, description = "Source-file id"),
+        ("profile" = String, Path, description = "Base64url canonical TranscodeProfile JSON"),
+        ("Range" = Option<String>, Header, description = "Single HTTP byte range")
+    ),
+    responses(
+        (status = 200, description = "Full live init segment", content_type = "video/mp4"),
+        (status = 206, description = "Requested init segment byte range", content_type = "video/mp4"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Live profile or source file not found", body = StreamErrorResponse),
+        (status = 416, description = "Requested range is not satisfiable", body = StreamErrorResponse),
+        (status = 500, description = "Live init segment failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn live_init_segment(
+    State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
+    AxumPath((source_file_id, encoded_profile)): AxumPath<(Id, String)>,
+    headers: HeaderMap,
+) -> StreamResult<Response> {
+    let live = state.live.clone().ok_or(StreamError::NotFound)?;
+    let request = live_request(&state.db, &live, source_file_id, &encoded_profile).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        request.media_item_id,
+        request.profile_hash_hex.clone(),
+    )
+    .await?;
+
+    let output = resolve_live_output(&live, request, Some(0)).await?;
+    stream_file(output.directory_path.join("init.mp4"), headers).await
+}
+
+/// Serve a live transcode media segment.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stream/live/{source_file_id}/{profile}/seg-{segment}.m4s",
+    tag = "stream",
+    params(
+        ("source_file_id" = Id, Path, description = "Source-file id"),
+        ("profile" = String, Path, description = "Base64url canonical TranscodeProfile JSON"),
+        ("segment" = String, Path, description = "Five-digit segment number"),
+        ("Range" = Option<String>, Header, description = "Single HTTP byte range")
+    ),
+    responses(
+        (status = 200, description = "Full live media segment"),
+        (status = 206, description = "Requested media segment byte range"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Live profile, source file, or segment not found", body = StreamErrorResponse),
+        (status = 416, description = "Requested range is not satisfiable", body = StreamErrorResponse),
+        (status = 500, description = "Live media segment failed", body = StreamErrorResponse)
+    )
+)]
+pub(crate) async fn live_media_segment(
+    State(state): State<StreamState>,
+    AuthenticatedUser { user, token_id }: AuthenticatedUser,
+    AxumPath((source_file_id, encoded_profile, segment)): AxumPath<(Id, String, String)>,
+    headers: HeaderMap,
+) -> StreamResult<Response> {
+    let segment_filename = route_segment_filename(&segment)?;
+    let segment_number = parse_route_segment_number(&segment_filename)?;
+    let live = state.live.clone().ok_or(StreamError::NotFound)?;
+    let request = live_request(&state.db, &live, source_file_id, &encoded_profile).await?;
+    session_service::heartbeat_or_open_session(
+        &state.db,
+        user.id,
+        token_id,
+        request.media_item_id,
+        request.profile_hash_hex.clone(),
+    )
+    .await?;
+
+    let output = resolve_live_output(&live, request, Some(segment_number)).await?;
+    stream_file(output.directory_path.join(segment_filename), headers).await
+}
+
 /// Serve a subtitle sidecar as a WebVTT rendition.
 #[utoipa::path(
     get,
@@ -461,6 +634,21 @@ struct PackagedTranscodeOutputRow {
     playlist_filename: Option<String>,
     init_filename: Option<String>,
     encode_metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveRequest {
+    source_file: SourceFileRow,
+    profile: TranscodeProfile,
+    profile_json: String,
+    profile_hash: [u8; 32],
+    profile_hash_hex: String,
+    media_item_id: Id,
+}
+
+#[derive(Debug, Clone)]
+struct LiveOutput {
+    directory_path: PathBuf,
 }
 
 impl PackagedTranscodeOutputRow {
@@ -644,6 +832,9 @@ pub(crate) enum StreamError {
     Library(#[from] kino_library::Error),
 
     #[error(transparent)]
+    Transcode(#[from] kino_transcode::Error),
+
+    #[error(transparent)]
     Session(#[from] session_service::Error),
 
     #[error("invalid subtitle sidecar {path}: {reason}", path = .path.display())]
@@ -673,6 +864,7 @@ impl IntoResponse for StreamError {
             | Self::Probe(_)
             | Self::Sqlx(_)
             | Self::Library(_)
+            | Self::Transcode(_)
             | Self::Session(_)
             | Self::InvalidSubtitle { .. }
             | Self::Response(_) => {
@@ -878,6 +1070,246 @@ fn packaged_transcode_output_row(
         init_filename: row.try_get("init_filename")?,
         encode_metadata_json: row.try_get("encode_metadata_json")?,
     })
+}
+
+async fn live_request(
+    db: &Db,
+    live: &LiveStreamState,
+    source_file_id: Id,
+    encoded_profile: &str,
+) -> StreamResult<LiveRequest> {
+    let profile = decode_live_profile(source_file_id, encoded_profile)?;
+    let source_file = lookup_source_file(db, source_file_id).await?;
+    let profile_json = profile.profile_json();
+    let profile_hash = profile.profile_hash();
+    let profile_hash_hex = hex_hash(&profile_hash);
+
+    tokio::fs::create_dir_all(&live.cache_root).await?;
+
+    Ok(LiveRequest {
+        media_item_id: source_file.media_item_id,
+        source_file,
+        profile,
+        profile_json,
+        profile_hash,
+        profile_hash_hex,
+    })
+}
+
+fn decode_live_profile(
+    source_file_id: Id,
+    encoded_profile: &str,
+) -> StreamResult<TranscodeProfile> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded_profile)
+        .map_err(|_| StreamError::NotFound)?;
+    let profile =
+        serde_json::from_slice::<TranscodeProfile>(&bytes).map_err(|_| StreamError::NotFound)?;
+    if profile.source_file_id != source_file_id {
+        return Err(StreamError::NotFound);
+    }
+    Ok(profile)
+}
+
+async fn resolve_live_output(
+    live: &LiveStreamState,
+    request: LiveRequest,
+    segment: Option<u64>,
+) -> StreamResult<LiveOutput> {
+    if let Some(output) =
+        lookup_durable_profile_output(&live.store, request.source_file.id, request.profile_hash)
+            .await?
+    {
+        return Ok(output);
+    }
+
+    if let Some(output) = live
+        .store
+        .fetch_by_key(request.source_file.id, request.profile_hash)
+        .await?
+    {
+        live.store.bump_access(output.id).await?;
+        return Ok(LiveOutput {
+            directory_path: output.directory_path,
+        });
+    }
+
+    if let Some(active) = live
+        .active
+        .get(request.source_file.id, request.profile_hash)
+    {
+        if let Some(segment) = segment {
+            live.active.await_segment(active.id, segment).await?;
+        }
+        return Ok(LiveOutput {
+            directory_path: active.output_dir.clone(),
+        });
+    }
+
+    if !live.enabled {
+        return Err(StreamError::NotFound);
+    }
+
+    let output_id = Id::new();
+    let output_dir = live.cache_root.join(output_id.to_string());
+    let command = live_encode_command(&request, &output_dir);
+    let active = live
+        .active
+        .get_or_spawn(ActiveEncodeRequest {
+            source_file_id: request.source_file.id,
+            profile_hash: request.profile_hash,
+            profile_json: request.profile_json,
+            output_dir,
+            command,
+        })
+        .await?;
+
+    if let Some(segment) = segment {
+        live.active.await_segment(active.id, segment).await?;
+    }
+
+    Ok(LiveOutput {
+        directory_path: active.output_dir.clone(),
+    })
+}
+
+async fn lookup_durable_profile_output(
+    store: &EphemeralStore,
+    source_file_id: Id,
+    profile_hash: [u8; 32],
+) -> StreamResult<Option<LiveOutput>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT transcode_outputs.directory_path
+        FROM transcode_jobs
+        JOIN transcode_outputs ON transcode_outputs.source_file_id = transcode_jobs.source_file_id
+        WHERE transcode_jobs.source_file_id = ?1
+          AND transcode_jobs.profile_hash = ?2
+          AND transcode_jobs.state = 'completed'
+          AND transcode_outputs.directory_path IS NOT NULL
+        ORDER BY transcode_outputs.created_at ASC, transcode_outputs.id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(source_file_id)
+    .bind(profile_hash.as_slice())
+    .fetch_optional(store.db().read_pool())
+    .await?;
+
+    rows.map(|row| {
+        let directory_path: String = row.try_get("directory_path")?;
+        Ok(LiveOutput {
+            directory_path: PathBuf::from(directory_path),
+        })
+    })
+    .transpose()
+}
+
+fn live_encode_command(request: &LiveRequest, output_dir: &Path) -> FfmpegEncodeCommand {
+    let (width, height) = live_dimensions(&request.profile);
+    let mut command =
+        FfmpegEncodeCommand::new("ffmpeg", InputSpec::file(request.source_file.path.clone()))
+            .video(VideoOutputSpec {
+                codec: request.profile.codec,
+                crf: request.profile.vmaf_target.map(|_| 23),
+                preset: Preset::Veryfast,
+                bit_depth: request.profile.bit_depth,
+                color: match request.profile.color {
+                    ColorTarget::Sdr => ColorOutput::SdrBt709,
+                    ColorTarget::Hdr10 => ColorOutput::CopyFromInput,
+                },
+                max_resolution: Some((width, height)),
+            })
+            .audio(match request.profile.audio {
+                AudioPolicyKind::StereoAac => AudioPolicy::StereoAac { bitrate_kbps: 192 },
+                AudioPolicyKind::StereoAacWithSurroundPassthrough => {
+                    AudioPolicy::StereoAacWithSurroundPassthrough { bitrate_kbps: 192 }
+                }
+                AudioPolicyKind::Copy => AudioPolicy::Copy,
+            });
+    if let Some(profile_width) = request.profile.width {
+        command = command.add_filter(VideoFilter::Scale(profile_width, height));
+    }
+    command.hls(HlsOutputSpec::cmaf_vod(
+        output_dir.to_path_buf(),
+        Duration::from_secs(HLS_SEGMENT_TARGET_SECONDS),
+    ))
+}
+
+fn live_dimensions(profile: &TranscodeProfile) -> (u32, u32) {
+    let width = profile.width.unwrap_or(1920);
+    let height = width.saturating_mul(9).div_ceil(16).max(1);
+    (width, height)
+}
+
+fn rewrite_live_playlist_uris(
+    source_file_id: Id,
+    encoded_profile: &str,
+    playlist: &str,
+) -> StreamResult<String> {
+    let mut rewritten = String::with_capacity(playlist.len());
+    for line in playlist.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#EXT-X-MAP:") {
+            rewritten.push_str(&rewrite_live_hls_map_uri(
+                source_file_id,
+                encoded_profile,
+                line,
+            )?);
+        } else if trimmed.is_empty() || trimmed.starts_with('#') {
+            rewritten.push_str(line);
+        } else {
+            let filename = segment_uri_filename(trimmed)?;
+            rewritten.push_str(&format!(
+                "/api/v1/stream/live/{source_file_id}/{encoded_profile}/{filename}"
+            ));
+        }
+        rewritten.push('\n');
+    }
+    Ok(rewritten)
+}
+
+fn rewrite_live_hls_map_uri(
+    source_file_id: Id,
+    encoded_profile: &str,
+    line: &str,
+) -> StreamResult<String> {
+    let Some(attribute_start) = line.find("URI=\"") else {
+        return Err(playlist_unavailable("media playlist EXT-X-MAP has no URI"));
+    };
+    let value_start = attribute_start + "URI=\"".len();
+    let Some(value_end) = line[value_start..]
+        .find('"')
+        .map(|offset| value_start + offset)
+    else {
+        return Err(playlist_unavailable(
+            "media playlist EXT-X-MAP URI is not quoted",
+        ));
+    };
+
+    let mut rewritten = String::with_capacity(line.len() + 96);
+    rewritten.push_str(&line[..value_start]);
+    rewritten.push_str(&format!(
+        "/api/v1/stream/live/{source_file_id}/{encoded_profile}/init.mp4"
+    ));
+    rewritten.push_str(&line[value_end..]);
+    Ok(rewritten)
+}
+
+fn parse_route_segment_number(filename: &str) -> StreamResult<u64> {
+    let segment = filename
+        .strip_prefix("seg-")
+        .and_then(|value| value.strip_suffix(".m4s"))
+        .ok_or(StreamError::NotFound)?;
+    segment.parse().map_err(|_| StreamError::NotFound)
+}
+
+fn hex_hash(hash: &[u8; 32]) -> String {
+    let mut value = String::with_capacity(64);
+    for byte in hash {
+        value.push_str(&format!("{byte:02x}"));
+    }
+    value
 }
 
 fn stream_error_response(error: &StreamError) -> StreamErrorResponse {
