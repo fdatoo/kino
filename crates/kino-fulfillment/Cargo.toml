@@ -14,7 +14,6 @@ kino-library = { path = "../kino-library" }
 kino-transcode = { path = "../kino-transcode" }
 reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

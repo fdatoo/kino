@@ -1,6 +1,7 @@
 use std::{io, path::PathBuf, time::Duration};
 
-use kino_fulfillment::{FfprobeFileProbe, ProbeError, ProbeSubtitleKind, ProbedFile};
+use kino_core::{FfprobeFileProbe, ProbeError, ProbeSubtitleKind};
+use kino_fulfillment::ProbedFile;
 
 #[tokio::test]
 async fn real_ffprobe_reads_mkv_fixture() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,7 +59,7 @@ async fn real_ffprobe_reads_mkv_fixture() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(result.subtitle_streams[0].language.as_deref(), Some("eng"));
 
     assert_eq!(
-        result.as_probed_file(),
+        ProbedFile::from_probe_result(&result),
         ProbedFile::new()
             .with_title("Kino Probe Fixture")
             .with_duration_seconds(1)

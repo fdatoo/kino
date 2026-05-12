@@ -12,8 +12,6 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::process::Command;
 
-use crate::ingestion::ProbedFile;
-
 /// Default ffprobe executable resolved from the process path.
 pub const DEFAULT_FFPROBE_PROGRAM: &str = "ffprobe";
 
@@ -65,7 +63,14 @@ impl FfprobeFileProbe {
                 source,
             })?;
 
-        let output = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            command.current_dir(parent);
+        }
+        let output = command
             .arg("-v")
             .arg("error")
             .arg("-print_format")
@@ -208,26 +213,6 @@ pub struct ProbeResult {
 }
 
 impl ProbeResult {
-    /// Project this rich probe result into request-matching facts.
-    pub fn as_probed_file(&self) -> ProbedFile {
-        let mut probed = ProbedFile::new();
-        probed.title = self.title.clone();
-        probed.duration_seconds = self
-            .duration
-            .and_then(|duration| u32::try_from(duration.as_secs()).ok());
-        probed.audio_languages = self
-            .audio_streams
-            .iter()
-            .filter_map(|stream| stream.language.clone())
-            .collect();
-        probed.subtitle_languages = self
-            .subtitle_streams
-            .iter()
-            .filter_map(|stream| stream.language.clone())
-            .collect();
-        probed
-    }
-
     fn from_ffprobe_output(
         source_path: PathBuf,
         output: FfprobeOutput,
@@ -266,6 +251,72 @@ impl ProbeResult {
             audio_streams,
             subtitle_streams,
         })
+    }
+}
+
+#[cfg(test)]
+impl ProbeResult {
+    fn as_probed_file(&self) -> ProbedFile {
+        let mut probed = ProbedFile::new();
+        probed.title = self.title.clone();
+        probed.duration_seconds = self
+            .duration
+            .and_then(|duration| u32::try_from(duration.as_secs()).ok());
+        probed.audio_languages = self
+            .audio_streams
+            .iter()
+            .filter_map(|stream| stream.language.clone())
+            .collect();
+        probed.subtitle_languages = self
+            .subtitle_streams
+            .iter()
+            .filter_map(|stream| stream.language.clone())
+            .collect();
+        probed
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ProbedFile {
+    title: Option<String>,
+    duration_seconds: Option<u32>,
+    audio_languages: Vec<String>,
+    subtitle_languages: Vec<String>,
+}
+
+#[cfg(test)]
+impl ProbedFile {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    const fn with_duration_seconds(mut self, duration_seconds: u32) -> Self {
+        self.duration_seconds = Some(duration_seconds);
+        self
+    }
+
+    fn with_audio_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.audio_languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn with_subtitle_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.subtitle_languages = languages.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -420,19 +471,6 @@ impl ProbeSubtitleKind {
             Some("dvd_subtitle") => Self::ImageVobSub,
             Some("dvb_subtitle") => Self::ImageDvb,
             _ => Self::Other,
-        }
-    }
-}
-
-impl From<ProbeSubtitleKind> for kino_library::ProbeSubtitleKind {
-    fn from(kind: ProbeSubtitleKind) -> Self {
-        match kind {
-            ProbeSubtitleKind::Srt => Self::Srt,
-            ProbeSubtitleKind::Ass => Self::Ass,
-            ProbeSubtitleKind::ImagePgs => Self::ImagePgs,
-            ProbeSubtitleKind::ImageVobSub => Self::ImageVobSub,
-            ProbeSubtitleKind::ImageDvb => Self::ImageDvb,
-            ProbeSubtitleKind::Other => Self::Other,
         }
     }
 }

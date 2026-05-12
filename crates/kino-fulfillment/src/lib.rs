@@ -5,7 +5,6 @@ pub mod ingestion;
 pub mod manual_import;
 pub mod movie;
 mod planning;
-pub mod probe;
 mod provider;
 mod request;
 pub mod tmdb;
@@ -24,10 +23,6 @@ pub use manual_import::{MANUAL_IMPORT_PROVIDER_ID, ManualImportProvider};
 pub use planning::{
     ComputedFulfillmentPlan, FulfillmentLibraryState, FulfillmentPlanningInput,
     FulfillmentProviderArgs, FulfillmentUserInputReason, compute_fulfillment_plan,
-};
-pub use probe::{
-    DEFAULT_FFPROBE_PROGRAM, FfprobeFileProbe, ProbeAudioStream, ProbeContainer, ProbeError,
-    ProbeResult, ProbeSubtitleKind, ProbeSubtitleStream, ProbeVideoStream,
 };
 pub use provider::{
     ConfiguredFulfillmentProvider, FulfillmentProvider, FulfillmentProviderCancelResult,

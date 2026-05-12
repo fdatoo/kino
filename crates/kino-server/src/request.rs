@@ -11,11 +11,12 @@ use axum::{
     routing::{get, post},
 };
 use kino_core::{
-    CanonicalIdentityId, CanonicalLayoutTransfer, Id, MediaItemKind, TmdbId, id::ParseIdError,
+    CanonicalIdentityId, CanonicalLayoutTransfer, FfprobeFileProbe, Id, MediaItemKind, TmdbId,
+    id::ParseIdError,
 };
 use kino_db::Db;
 use kino_fulfillment::{
-    FfprobeFileProbe, FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
+    FulfillmentPlanDecision, FulfillmentProvider, FulfillmentProviderArgs,
     FulfillmentProviderError, ManualImportProvider, NewFulfillmentPlan, NewRequest, RequestDetail,
     RequestEventActor, RequestListPage, RequestListQuery, RequestMatchCandidate,
     RequestMatchCandidateInput, RequestService, RequestState, RequestTransition,
@@ -820,7 +821,7 @@ pub(crate) enum ApiError {
     ManualImport(FulfillmentProviderError),
 
     #[error(transparent)]
-    Probe(#[from] kino_fulfillment::ProbeError),
+    Probe(#[from] kino_core::ProbeError),
 
     #[error(transparent)]
     Library(#[from] kino_library::Error),
