@@ -2,6 +2,7 @@
 
 pub mod encoder;
 pub mod job;
+pub mod pipeline;
 
 use std::{
     future::Future,
@@ -13,6 +14,10 @@ use std::{
 pub use encoder::{Capabilities, Encoder, EncoderKind, LaneId, VideoCodec};
 pub use job::state::JobState;
 use kino_core::Id;
+pub use pipeline::{
+    AudioPolicy, ColorOutput, FfmpegEncodeCommand, HlsOutputSpec, InputSpec, LogLevel, Preset,
+    VideoFilter, VideoOutputSpec,
+};
 
 /// Errors produced by `kino-transcode`.
 #[derive(Debug, thiserror::Error)]
