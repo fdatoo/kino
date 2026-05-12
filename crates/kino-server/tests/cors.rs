@@ -186,6 +186,7 @@ fn config_with_cors(temp: &Path, cors_allowed_origins: Vec<String>) -> Config {
         tmdb: TmdbConfig::default(),
         ocr: OcrConfig::default(),
         providers: ProvidersConfig::default(),
+        transcode: Default::default(),
         log_level: "info".to_owned(),
         log_format: LogFormat::Pretty,
     }

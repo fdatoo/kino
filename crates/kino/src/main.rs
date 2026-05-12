@@ -181,6 +181,7 @@ mod tests {
             tmdb: Default::default(),
             ocr: Default::default(),
             providers: Default::default(),
+            transcode: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
         };
@@ -196,6 +197,7 @@ mod tests {
             tmdb: Default::default(),
             ocr: Default::default(),
             providers: Default::default(),
+            transcode: Default::default(),
             log_level: "info".into(),
             log_format: Default::default(),
         })

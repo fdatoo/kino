@@ -55,6 +55,11 @@ pub struct Config {
     #[serde(default)]
     pub providers: ProvidersConfig,
 
+    /// Transcoding settings. Optional; defaults documented on
+    /// [`TranscodeConfig`].
+    #[serde(default)]
+    pub transcode: TranscodeConfig,
+
     /// Logging filter. Accepts any tracing-subscriber `EnvFilter` expression.
     /// Defaults to `"info"`.
     #[serde(default = "default_log_level")]
@@ -188,6 +193,67 @@ pub struct OcrConfig {
     pub language: String,
 }
 
+/// Transcoding configuration sections.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodeConfig {
+    /// Output policy settings. Defaults documented on
+    /// [`TranscodePolicyConfig`].
+    #[serde(default)]
+    pub policy: TranscodePolicyConfig,
+}
+
+/// Default output policy configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodePolicyConfig {
+    /// High-quality variant settings.
+    #[serde(default)]
+    pub high: TranscodePolicyHighConfig,
+
+    /// Compatibility variant settings.
+    #[serde(default)]
+    pub compat: TranscodePolicyCompatibilityConfig,
+}
+
+/// High-quality output policy variant settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodePolicyHighConfig {
+    /// Video codec key. Defaults to `hevc`.
+    #[serde(default = "default_transcode_high_codec")]
+    pub codec: String,
+
+    /// Video bit depth. Defaults to 10.
+    #[serde(default = "default_transcode_high_bit_depth")]
+    pub bit_depth: u8,
+
+    /// VMAF target. Defaults to 95.
+    #[serde(default = "default_transcode_high_vmaf_target")]
+    pub vmaf_target: f32,
+
+    /// Encoder preset key. Defaults to `medium`.
+    #[serde(default = "default_transcode_high_preset")]
+    pub preset: String,
+}
+
+/// Compatibility output policy variant settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodePolicyCompatibilityConfig {
+    /// Video codec key. Defaults to `h264`.
+    #[serde(default = "default_transcode_compat_codec")]
+    pub codec: String,
+
+    /// VMAF target. Defaults to 90.
+    #[serde(default = "default_transcode_compat_vmaf_target")]
+    pub vmaf_target: f32,
+
+    /// Maximum output height. Defaults to 1080.
+    #[serde(default = "default_transcode_compat_max_height")]
+    pub max_height: u32,
+}
+
 /// Fulfillment provider configuration sections.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,6 +335,34 @@ fn default_log_level() -> String {
     "info".into()
 }
 
+fn default_transcode_high_codec() -> String {
+    "hevc".into()
+}
+
+fn default_transcode_high_bit_depth() -> u8 {
+    10
+}
+
+fn default_transcode_high_vmaf_target() -> f32 {
+    95.0
+}
+
+fn default_transcode_high_preset() -> String {
+    "medium".into()
+}
+
+fn default_transcode_compat_codec() -> String {
+    "h264".into()
+}
+
+fn default_transcode_compat_vmaf_target() -> f32 {
+    90.0
+}
+
+fn default_transcode_compat_max_height() -> u32 {
+    1080
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -304,6 +398,27 @@ impl Default for OcrConfig {
         Self {
             tesseract_path: default_tesseract_path(),
             language: default_ocr_language(),
+        }
+    }
+}
+
+impl Default for TranscodePolicyHighConfig {
+    fn default() -> Self {
+        Self {
+            codec: default_transcode_high_codec(),
+            bit_depth: default_transcode_high_bit_depth(),
+            vmaf_target: default_transcode_high_vmaf_target(),
+            preset: default_transcode_high_preset(),
+        }
+    }
+}
+
+impl Default for TranscodePolicyCompatibilityConfig {
+    fn default() -> Self {
+        Self {
+            codec: default_transcode_compat_codec(),
+            vmaf_target: default_transcode_compat_vmaf_target(),
+            max_height: default_transcode_compat_max_height(),
         }
     }
 }
@@ -371,6 +486,15 @@ pub enum ConfigError {
     /// The configured OCR settings are invalid.
     #[error("invalid ocr config: {reason}")]
     InvalidOcrConfig {
+        /// Human-readable validation failure.
+        reason: &'static str,
+    },
+
+    /// The configured transcode policy settings are invalid.
+    #[error("invalid transcode policy config {field}: {reason}")]
+    InvalidTranscodePolicyConfig {
+        /// Transcode policy config field.
+        field: &'static str,
         /// Human-readable validation failure.
         reason: &'static str,
     },
@@ -460,6 +584,7 @@ impl Config {
         validate_server_config(&self.server)?;
         validate_tmdb_config(&self.tmdb)?;
         validate_ocr_config(&self.ocr)?;
+        validate_transcode_config(&self.transcode)?;
         validate_provider_configs(&self.providers)?;
         Ok(self)
     }
@@ -609,6 +734,55 @@ fn validate_ocr_config(config: &OcrConfig) -> Result<(), ConfigError> {
     if config.language.trim().is_empty() {
         return Err(ConfigError::InvalidOcrConfig {
             reason: "language is empty",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_transcode_config(config: &TranscodeConfig) -> Result<(), ConfigError> {
+    let policy = &config.policy;
+
+    if policy.high.codec.trim().is_empty() {
+        return Err(ConfigError::InvalidTranscodePolicyConfig {
+            field: "high.codec",
+            reason: "is empty",
+        });
+    }
+    if policy.high.bit_depth == 0 {
+        return Err(ConfigError::InvalidTranscodePolicyConfig {
+            field: "high.bit_depth",
+            reason: "must be positive",
+        });
+    }
+    if !policy.high.vmaf_target.is_finite() || policy.high.vmaf_target <= 0.0 {
+        return Err(ConfigError::InvalidTranscodePolicyConfig {
+            field: "high.vmaf_target",
+            reason: "must be positive and finite",
+        });
+    }
+    if policy.high.preset.trim().is_empty() {
+        return Err(ConfigError::InvalidTranscodePolicyConfig {
+            field: "high.preset",
+            reason: "is empty",
+        });
+    }
+    if policy.compat.codec.trim().is_empty() {
+        return Err(ConfigError::InvalidTranscodePolicyConfig {
+            field: "compat.codec",
+            reason: "is empty",
+        });
+    }
+    if !policy.compat.vmaf_target.is_finite() || policy.compat.vmaf_target <= 0.0 {
+        return Err(ConfigError::InvalidTranscodePolicyConfig {
+            field: "compat.vmaf_target",
+            reason: "must be positive and finite",
+        });
+    }
+    if policy.compat.max_height == 0 {
+        return Err(ConfigError::InvalidTranscodePolicyConfig {
+            field: "compat.max_height",
+            reason: "must be positive",
         });
     }
 
@@ -800,6 +974,15 @@ mod tests {
                 tesseract_path = "/usr/local/bin/tesseract"
                 language = "jpn"
 
+                [transcode.policy]
+                high.codec = "av1"
+                high.bit_depth = 12
+                high.vmaf_target = 96
+                high.preset = "slow"
+                compat.codec = "h264"
+                compat.vmaf_target = 91
+                compat.max_height = 720
+
                 [providers.disc_rip]
                 path = "{}"
                 preference = 30
@@ -851,6 +1034,13 @@ mod tests {
                 PathBuf::from("/usr/local/bin/tesseract")
             );
             assert_eq!(cfg.ocr.language, "jpn");
+            assert_eq!(cfg.transcode.policy.high.codec, "av1");
+            assert_eq!(cfg.transcode.policy.high.bit_depth, 12);
+            assert_eq!(cfg.transcode.policy.high.vmaf_target, 96.0);
+            assert_eq!(cfg.transcode.policy.high.preset, "slow");
+            assert_eq!(cfg.transcode.policy.compat.codec, "h264");
+            assert_eq!(cfg.transcode.policy.compat.vmaf_target, 91.0);
+            assert_eq!(cfg.transcode.policy.compat.max_height, 720);
             let disc_rip = cfg.providers.disc_rip.expect("disc rip should parse");
             assert_eq!(disc_rip.path, fixture.library_root.join("rips"));
             assert_eq!(disc_rip.preference, 30);
@@ -912,6 +1102,13 @@ mod tests {
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
             assert_eq!(cfg.ocr.tesseract_path, PathBuf::from("tesseract"));
             assert_eq!(cfg.ocr.language, "eng");
+            assert_eq!(cfg.transcode.policy.high.codec, "hevc");
+            assert_eq!(cfg.transcode.policy.high.bit_depth, 10);
+            assert_eq!(cfg.transcode.policy.high.vmaf_target, 95.0);
+            assert_eq!(cfg.transcode.policy.high.preset, "medium");
+            assert_eq!(cfg.transcode.policy.compat.codec, "h264");
+            assert_eq!(cfg.transcode.policy.compat.vmaf_target, 90.0);
+            assert_eq!(cfg.transcode.policy.compat.max_height, 1080);
             assert_eq!(
                 cfg.library.canonical_transfer,
                 CanonicalLayoutTransfer::HardLink
@@ -1152,6 +1349,31 @@ mod tests {
             let cfg = Config::load().map_err(|e| e.to_string())?;
             assert_eq!(cfg.ocr.tesseract_path, PathBuf::from("/opt/bin/tesseract"));
             assert_eq!(cfg.ocr.language, "spa");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn nested_env_override_for_transcode_policy() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_TRANSCODE__POLICY__HIGH__CODEC", "av1");
+            jail.set_env("KINO_TRANSCODE__POLICY__HIGH__BIT_DEPTH", "12");
+            jail.set_env("KINO_TRANSCODE__POLICY__HIGH__VMAF_TARGET", "96");
+            jail.set_env("KINO_TRANSCODE__POLICY__HIGH__PRESET", "slow");
+            jail.set_env("KINO_TRANSCODE__POLICY__COMPAT__CODEC", "h264");
+            jail.set_env("KINO_TRANSCODE__POLICY__COMPAT__VMAF_TARGET", "91");
+            jail.set_env("KINO_TRANSCODE__POLICY__COMPAT__MAX_HEIGHT", "720");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(cfg.transcode.policy.high.codec, "av1");
+            assert_eq!(cfg.transcode.policy.high.bit_depth, 12);
+            assert_eq!(cfg.transcode.policy.high.vmaf_target, 96.0);
+            assert_eq!(cfg.transcode.policy.high.preset, "slow");
+            assert_eq!(cfg.transcode.policy.compat.codec, "h264");
+            assert_eq!(cfg.transcode.policy.compat.vmaf_target, 91.0);
+            assert_eq!(cfg.transcode.policy.compat.max_height, 720);
             Ok(())
         });
     }
@@ -1532,6 +1754,35 @@ mod tests {
             let err = Config::load().unwrap_err();
             assert!(matches!(err, ConfigError::InvalidOcrConfig { .. }));
             assert!(err.to_string().contains("language"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_zero_transcode_policy_compat_height() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [transcode.policy]
+                        compat.max_height = 0
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::InvalidTranscodePolicyConfig { .. }
+            ));
+            assert!(err.to_string().contains("compat.max_height"), "got: {err}");
             Ok(())
         });
     }
