@@ -1,0 +1,5 @@
+---
+source: crates/kino-transcode/src/pipeline/ffmpeg.rs
+expression: "format!(\"{command}\")"
+---
+ffmpeg -hide_banner -nostdin -loglevel warning -ss 25 -t 12 -i '/library/Some Movie/source.mkv' -i /tmp/kino-vmaf/sample-0-crf-24.mkv -lavfi '[1:v][0:v]libvmaf=log_path=/tmp/kino-vmaf/sample-0-crf-24.vmaf.json:log_fmt=json' -f null -

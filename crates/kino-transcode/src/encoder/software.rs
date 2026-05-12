@@ -6,6 +6,7 @@ use super::{Capabilities, Encoder, EncoderKind, LaneId, VideoCodec};
 use crate::pipeline::{
     AudioPolicy, FfmpegEncodeCommand, HlsOutputSpec, InputSpec, VideoFilter, VideoOutputSpec,
 };
+use crate::plan::{VmafSampleEncoder, VmafTrialEncodeRequest};
 
 /// Software encode inputs used until the planner-owned encode context exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +97,23 @@ impl Encoder for SoftwareEncoder {
                 VideoCodec::H264 => bit_depth <= 8,
                 VideoCodec::Av1 => false,
             }
+    }
+}
+
+impl VmafSampleEncoder for SoftwareEncoder {
+    fn build_vmaf_trial_encode(
+        &self,
+        request: &VmafTrialEncodeRequest,
+    ) -> crate::Result<FfmpegEncodeCommand> {
+        let mut command = FfmpegEncodeCommand::new(self.binary.clone(), request.input.clone())
+            .video(request.video.clone())
+            .audio(AudioPolicy::None);
+
+        for filter in request.filters.iter().cloned() {
+            command = command.add_filter(filter);
+        }
+
+        Ok(command.file_output(request.output_path.clone()))
     }
 }
 

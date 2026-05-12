@@ -1,11 +1,13 @@
 //! Typed FFmpeg command builders for the transcode pipeline.
 
-use std::{ffi::OsString, fmt, path::PathBuf, time::Duration};
+use std::{ffi::OsString, fmt, path::Path, path::PathBuf, time::Duration};
 
 use kino_core::probe::{MasterDisplay, MaxCll};
+use serde::Deserialize;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
-use crate::VideoCodec;
+use crate::{Error, Result, VideoCodec, pipeline::PipelineRunner};
 
 /// Encoder speed/quality preset rendered as FFmpeg `-preset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +135,8 @@ pub enum AudioPolicy {
     },
     /// Render `-c:a copy` for audio passthrough.
     Copy,
+    /// Render `-an` to omit audio from the output.
+    None,
 }
 
 /// HLS fMP4/CMAF output settings rendered as FFmpeg HLS muxer flags.
@@ -249,6 +253,7 @@ pub struct FfmpegEncodeCommand {
     audio: AudioPolicy,
     filters: Vec<VideoFilter>,
     hls: Option<HlsOutputSpec>,
+    file_output: Option<PathBuf>,
     progress_pipe: bool,
     log_level: LogLevel,
 }
@@ -270,6 +275,7 @@ impl FfmpegEncodeCommand {
             audio: AudioPolicy::Copy,
             filters: Vec::new(),
             hls: None,
+            file_output: None,
             progress_pipe: true,
             log_level: LogLevel::Warning,
         }
@@ -304,6 +310,14 @@ impl FfmpegEncodeCommand {
     /// Set HLS output settings rendered by this command.
     pub fn hls(mut self, spec: HlsOutputSpec) -> Self {
         self.hls = Some(spec);
+        self.file_output = None;
+        self
+    }
+
+    /// Set a single-file output path rendered as the final FFmpeg argument.
+    pub fn file_output(mut self, path: impl Into<PathBuf>) -> Self {
+        self.file_output = Some(path.into());
+        self.hls = None;
         self
     }
 
@@ -347,6 +361,8 @@ impl FfmpegEncodeCommand {
 
         if let Some(hls) = &self.hls {
             render_hls_args(hls, &mut args);
+        } else if let Some(path) = &self.file_output {
+            args.push(path.as_os_str().to_owned());
         }
 
         args
@@ -451,7 +467,153 @@ fn render_audio_args(audio: &AudioPolicy, args: &mut Vec<OsString>) {
             push_arg(args, "-c:a");
             push_arg(args, "copy");
         }
+        AudioPolicy::None => {
+            push_arg(args, "-an");
+        }
     }
+}
+
+/// Typed FFmpeg libvmaf invocation rendered to argv, `Command`, or shell form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfmpegVmafCommand {
+    binary: PathBuf,
+    reference: InputSpec,
+    distorted: InputSpec,
+    log_path: PathBuf,
+    log_level: LogLevel,
+}
+
+impl FfmpegVmafCommand {
+    /// Construct a VMAF measurement command for a reference and distorted input.
+    pub fn new(binary: impl Into<PathBuf>, reference: InputSpec, distorted: InputSpec) -> Self {
+        Self {
+            binary: binary.into(),
+            reference,
+            distorted,
+            log_path: PathBuf::from("vmaf.json"),
+            log_level: LogLevel::Warning,
+        }
+    }
+
+    /// Set the libvmaf JSON log path parsed by [`Self::measure`].
+    pub fn log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.log_path = path.into();
+        self
+    }
+
+    /// Set the FFmpeg logging level rendered by this command.
+    pub fn log_level(mut self, level: LogLevel) -> Self {
+        self.log_level = level;
+        self
+    }
+
+    /// Return the libvmaf JSON log path.
+    pub fn vmaf_log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    /// Render the argv and construct a `tokio::process::Command`.
+    pub fn into_command(self) -> Command {
+        let mut command = Command::new(&self.binary);
+        command.args(self.to_args());
+        command
+    }
+
+    /// Render FFmpeg arguments after the binary for diagnostics and snapshot tests.
+    pub fn to_args(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        push_arg(&mut args, "-hide_banner");
+        push_arg(&mut args, "-nostdin");
+        push_arg(&mut args, "-loglevel");
+        push_arg(&mut args, self.log_level.as_ffmpeg());
+        args.extend(self.reference.to_args());
+        args.extend(self.distorted.to_args());
+        push_arg(&mut args, "-lavfi");
+        push_arg(
+            &mut args,
+            format!(
+                "[1:v][0:v]libvmaf=log_path={}:log_fmt=json",
+                escape_filter_value(&self.log_path)
+            ),
+        );
+        push_arg(&mut args, "-f");
+        push_arg(&mut args, "null");
+        push_arg(&mut args, "-");
+        args
+    }
+
+    /// Run FFmpeg, read the libvmaf JSON log, and return the pooled mean VMAF.
+    pub async fn measure(&self, runner: &PipelineRunner) -> Result<f32> {
+        if let Some(parent) = self
+            .log_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match tokio::fs::remove_file(&self.log_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Error::Io(err)),
+        }
+
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let result = runner
+            .run_process(self.clone().into_command(), cancel_rx)
+            .await;
+        drop(cancel_tx);
+        result?;
+
+        let json = tokio::fs::read_to_string(&self.log_path).await?;
+        parse_vmaf_mean(&json)
+    }
+}
+
+impl fmt::Display for FfmpegVmafCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let words = std::iter::once(self.binary.as_os_str().to_string_lossy().into_owned())
+            .chain(
+                self.to_args()
+                    .into_iter()
+                    .map(|arg| arg.to_string_lossy().into_owned()),
+            )
+            .map(|word| shell_words::quote(&word).into_owned())
+            .collect::<Vec<_>>();
+        f.write_str(&words.join(" "))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VmafLog {
+    pooled_metrics: VmafPooledMetrics,
+}
+
+#[derive(Debug, Deserialize)]
+struct VmafPooledMetrics {
+    vmaf: VmafMetric,
+}
+
+#[derive(Debug, Deserialize)]
+struct VmafMetric {
+    mean: f32,
+}
+
+fn parse_vmaf_mean(json: &str) -> Result<f32> {
+    let log: VmafLog = serde_json::from_str(json)
+        .map_err(|err| Error::VmafFailed(format!("invalid libvmaf json: {err}")))?;
+    if !log.pooled_metrics.vmaf.mean.is_finite() {
+        return Err(Error::VmafFailed(
+            "libvmaf mean score was not finite".to_owned(),
+        ));
+    }
+    Ok(log.pooled_metrics.vmaf.mean)
+}
+
+fn escape_filter_value(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
 }
 
 fn render_hls_args(hls: &HlsOutputSpec, args: &mut Vec<OsString>) {
@@ -534,6 +696,14 @@ mod tests {
 
     fn input() -> InputSpec {
         InputSpec::file("/library/Some Movie/source.mkv")
+    }
+
+    fn sample_input(path: &str, start_us: u64, duration_us: u64) -> InputSpec {
+        InputSpec {
+            path: PathBuf::from(path),
+            start_us: Some(start_us),
+            duration_us: Some(duration_us),
+        }
     }
 
     fn hls_output(name: &str) -> HlsOutputSpec {
@@ -630,5 +800,24 @@ mod tests {
             .hls(hls_output("h264-1080p-tonemap"));
 
         insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn snapshot_vmaf_measurement() {
+        let command = FfmpegVmafCommand::new(
+            "ffmpeg",
+            sample_input("/library/Some Movie/source.mkv", 25_000_000, 12_000_000),
+            InputSpec::file("/tmp/kino-vmaf/sample-0-crf-24.mkv"),
+        )
+        .log_path("/tmp/kino-vmaf/sample-0-crf-24.vmaf.json");
+
+        insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn parse_vmaf_mean_rejects_missing_mean() {
+        let err = parse_vmaf_mean(r#"{"pooled_metrics":{"vmaf":{}}}"#);
+
+        assert!(matches!(err, Err(Error::VmafFailed(_))));
     }
 }

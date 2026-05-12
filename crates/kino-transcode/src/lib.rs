@@ -17,11 +17,16 @@ pub use encoder::{Capabilities, Encoder, EncoderKind, EncoderRegistry, LaneId, V
 pub use job::{JobState, JobStore, ListJobsFilter, NewJob, TranscodeJob};
 use kino_core::Id;
 pub use pipeline::{
-    AudioPolicy, ColorOutput, FfmpegEncodeCommand, HlsOutputSpec, InputSpec, LogLevel,
-    PipelineRunner, Preset, Progress, RunOutcome, VideoFilter, VideoOutputSpec, verify_outputs,
+    AudioPolicy, ColorOutput, FfmpegEncodeCommand, FfmpegVmafCommand, HlsOutputSpec, InputSpec,
+    LogLevel, PipelineRunner, Preset, Progress, RunOutcome, VideoFilter, VideoOutputSpec,
+    verify_outputs,
 };
 pub use plan::VariantKind;
-pub use plan::{DefaultPolicy, OutputPolicy, PlannedVariant, SourceContext, TranscodeProfile};
+pub use plan::{
+    ColorDowngrade, DefaultPolicy, EncodeMetadata, OutputPolicy, PlannedVariant, SampleMeasurement,
+    SourceContext, TranscodeProfile, VideoRange, VmafSampleEncoder, VmafSamplingConfig,
+    VmafTrialEncodeRequest, fit_crf, measure_sample_crfs, select_samples,
+};
 
 /// Errors produced by `kino-transcode`.
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +105,9 @@ pub enum Error {
     /// Encoded output did not pass integrity checks.
     #[error("encoded output failed integrity check: {0}")]
     IntegrityFailed(String),
+    /// VMAF measurement could not be produced or parsed.
+    #[error("vmaf measurement failed: {0}")]
+    VmafFailed(String),
     /// FFmpeg exited with a non-zero status.
     #[error("ffmpeg exited with status {status}: {stderr_tail}")]
     FfmpegFailed {
@@ -152,7 +160,8 @@ impl Error {
             | Self::RecorderLock(_)
             | Self::Cancelled
             | Self::IntegrityFailed(_)
-            | Self::Sqlx(_) => false,
+            | Self::Sqlx(_)
+            | Self::VmafFailed(_) => false,
         }
     }
 }

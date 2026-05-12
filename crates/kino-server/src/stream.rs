@@ -542,11 +542,28 @@ impl VideoRange {
 #[derive(Debug, Deserialize)]
 struct EncodeMetadata {
     codecs: String,
-    resolution: Option<String>,
+    resolution: Option<EncodeMetadataResolution>,
     width: Option<u32>,
     height: Option<u32>,
     video_range: Option<String>,
     duration_seconds: Option<u64>,
+    duration_us: Option<u64>,
+}
+
+impl EncodeMetadata {
+    fn duration_seconds(&self) -> Option<u64> {
+        self.duration_seconds.or_else(|| {
+            self.duration_us
+                .map(|duration_us| duration_us.div_ceil(1_000_000))
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EncodeMetadataResolution {
+    Text(String),
+    Pair((u32, u32)),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1173,16 +1190,17 @@ async fn packaged_stream_variants(
             .join(playlist_filename(Some(media_playlist_filename))?);
         let playlist = tokio::fs::read_to_string(&playlist_path).await?;
         let metrics = packaged_playlist_metrics(output, &playlist).await?;
+        let metadata_duration = metadata.duration_seconds();
         let resolution = encode_metadata_resolution(output.id, &metadata)?;
         let codecs = required_metadata_text(output.id, "codecs", metadata.codecs)?;
-        let video_range = encode_metadata_video_range(output.id, metadata.video_range)?;
+        let video_range = encode_metadata_video_range(output.id, metadata.video_range.as_deref())?;
         variants.push(StreamVariant {
             uri: transcode_media_playlist_uri(output.id),
             bandwidth: estimate_bandwidth(
                 metrics.bytes,
                 metrics
                     .duration_seconds
-                    .or(metadata.duration_seconds)
+                    .or(metadata_duration)
                     .filter(|duration| *duration > 0),
             ),
             codecs,
@@ -1212,17 +1230,28 @@ fn encode_metadata_resolution(
     id: Id,
     metadata: &EncodeMetadata,
 ) -> StreamResult<Option<(u32, u32)>> {
-    if let Some(resolution) = metadata.resolution.as_deref() {
-        let resolution = required_metadata_text(id, "resolution", resolution.to_owned())?;
-        let Some((width, height)) = resolution.split_once('x') else {
-            return Err(invalid_encode_metadata(
+    if let Some(resolution) = &metadata.resolution {
+        return match resolution {
+            EncodeMetadataResolution::Text(resolution) => {
+                let resolution = required_metadata_text(id, "resolution", resolution.to_owned())?;
+                let Some((width, height)) = resolution.split_once('x') else {
+                    return Err(invalid_encode_metadata(
+                        id,
+                        "resolution must be formatted as WIDTHxHEIGHT",
+                    ));
+                };
+                let width = parse_positive_u32(id, "resolution width", width)?;
+                let height = parse_positive_u32(id, "resolution height", height)?;
+                Ok(Some((width, height)))
+            }
+            EncodeMetadataResolution::Pair((width, height)) if *width > 0 && *height > 0 => {
+                Ok(Some((*width, *height)))
+            }
+            EncodeMetadataResolution::Pair(_) => Err(invalid_encode_metadata(
                 id,
-                "resolution must be formatted as WIDTHxHEIGHT",
-            ));
+                "resolution width and height must be positive",
+            )),
         };
-        let width = parse_positive_u32(id, "resolution width", width)?;
-        let height = parse_positive_u32(id, "resolution height", height)?;
-        return Ok(Some((width, height)));
     }
 
     match (metadata.width, metadata.height) {
@@ -1235,9 +1264,9 @@ fn encode_metadata_resolution(
     }
 }
 
-fn encode_metadata_video_range(id: Id, value: Option<String>) -> StreamResult<Option<VideoRange>> {
+fn encode_metadata_video_range(id: Id, value: Option<&str>) -> StreamResult<Option<VideoRange>> {
     let value = value.ok_or_else(|| invalid_encode_metadata(id, "video_range is missing"))?;
-    let value = required_metadata_text(id, "video_range", value)?;
+    let value = required_metadata_text(id, "video_range", value.to_owned())?;
     VideoRange::parse(&value)
         .map(Some)
         .ok_or_else(|| invalid_encode_metadata(id, "video_range must be SDR, PQ, or HLG"))
