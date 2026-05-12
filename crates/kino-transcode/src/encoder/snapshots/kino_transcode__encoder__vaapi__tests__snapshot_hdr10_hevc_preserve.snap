@@ -1,6 +1,5 @@
 ---
 source: crates/kino-transcode/src/encoder/vaapi.rs
-assertion_line: 195
 expression: "format!(\"{command}\")"
 ---
-ffmpeg -hide_banner -nostdin -loglevel warning -progress pipe:1 -init_hw_device 'vaapi=hw:/dev/dri/renderD128' -filter_hw_device hw -hwaccel vaapi -hwaccel_output_format vaapi -i '/library/Some Movie/source.mkv' -map 0:v:0 -c:v hevc_vaapi -qp 20 -pix_fmt vaapi -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -map 0:a:0 -c:a aac -ac 2 -b:a 256k -f hls -hls_segment_type fmp4 -hls_time 6 -hls_playlist_type vod -hls_segment_filename '/library/Some Movie/transcodes/vaapi-hevc-4k-hdr10/seg-%05d.m4s' -hls_fmp4_init_filename init.mp4 '/library/Some Movie/transcodes/vaapi-hevc-4k-hdr10/media.m3u8'
+ffmpeg -hide_banner -nostdin -loglevel warning -progress pipe:1 -init_hw_device 'vaapi=hw:/dev/dri/renderD128' -filter_hw_device hw -hwaccel vaapi -hwaccel_output_format vaapi -i '/library/Some Movie/source.mkv' -map 0:v:0 -c:v hevc_vaapi -qp 20 -pix_fmt vaapi -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -map '0:a:0?' -c:a aac -ac 2 -b:a 256k -f hls -hls_segment_type fmp4 -hls_time 6 -hls_playlist_type vod -hls_segment_filename '/library/Some Movie/transcodes/vaapi-hevc-4k-hdr10/seg-%05d.m4s' -hls_fmp4_init_filename init.mp4 '/library/Some Movie/transcodes/vaapi-hevc-4k-hdr10/media.m3u8'
