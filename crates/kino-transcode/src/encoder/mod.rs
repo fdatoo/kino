@@ -4,16 +4,20 @@ mod backend;
 mod capabilities;
 pub mod detect;
 mod kind;
+pub mod qsv;
 pub mod registry;
 pub mod software;
+pub mod vaapi;
 mod video;
 
 pub use backend::Encoder;
 pub use capabilities::Capabilities;
 pub use detect::{DetectionConfig, available_encoders};
 pub use kind::{EncoderKind, LaneId};
+pub use qsv::QsvEncoder;
 pub use registry::EncoderRegistry;
 pub use software::{SoftwareEncodeContext, SoftwareEncoder};
+pub use vaapi::VaapiEncoder;
 pub use video::VideoCodec;
 
 #[cfg(test)]

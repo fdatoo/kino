@@ -7,6 +7,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+hwaccel-tests = []
+
 [dependencies]
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
