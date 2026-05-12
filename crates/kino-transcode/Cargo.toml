@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 kino-core = { path = "../kino-core" }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
