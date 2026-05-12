@@ -122,6 +122,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use kino_core::probe::{MasterDisplay, MaxCll};
+
     use crate::pipeline::{ColorOutput, Preset};
 
     fn hls_output(name: &str) -> HlsOutputSpec {
@@ -182,6 +184,65 @@ mod tests {
             audio: AudioPolicy::StereoAac { bitrate_kbps: 192 },
             filters: vec![VideoFilter::Scale(1920, 1080)],
             hls: hls_output("h264-1080p"),
+        });
+
+        insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn snapshot_hdr10_4k_hevc_preserve_cmaf_vod() {
+        let encoder = SoftwareEncoder::new();
+        let command = encoder.build_command(&SoftwareEncodeContext {
+            input_path: PathBuf::from("/library/Some Movie/source.mkv"),
+            video: VideoOutputSpec {
+                codec: VideoCodec::Hevc,
+                crf: Some(20),
+                preset: Preset::Slow,
+                bit_depth: 10,
+                color: ColorOutput::Hdr10 {
+                    master_display: MasterDisplay {
+                        red_x: 34_000,
+                        red_y: 16_000,
+                        green_x: 13_250,
+                        green_y: 34_500,
+                        blue_x: 7_500,
+                        blue_y: 3_000,
+                        white_x: 15_635,
+                        white_y: 16_450,
+                        min_luminance: 50,
+                        max_luminance: 10_000_000,
+                    },
+                    max_cll: MaxCll {
+                        max_content: 1_000,
+                        max_average: 400,
+                    },
+                },
+                max_resolution: Some((3840, 2160)),
+            },
+            audio: AudioPolicy::StereoAac { bitrate_kbps: 256 },
+            filters: Vec::new(),
+            hls: hls_output("hevc-4k-hdr10"),
+        });
+
+        insta::assert_snapshot!(format!("{command}"));
+    }
+
+    #[test]
+    fn snapshot_hdr_to_sdr_1080p_hevc_8_bit_tonemap_cmaf_vod() {
+        let encoder = SoftwareEncoder::new();
+        let command = encoder.build_command(&SoftwareEncodeContext {
+            input_path: PathBuf::from("/library/Some Movie/source.mkv"),
+            video: VideoOutputSpec {
+                codec: VideoCodec::Hevc,
+                crf: Some(24),
+                preset: Preset::Medium,
+                bit_depth: 8,
+                color: ColorOutput::SdrBt709,
+                max_resolution: Some((1920, 1080)),
+            },
+            audio: AudioPolicy::StereoAac { bitrate_kbps: 192 },
+            filters: vec![VideoFilter::HdrToSdrTonemap, VideoFilter::Scale(1920, 1080)],
+            hls: hls_output("hevc-1080p-tonemap"),
         });
 
         insta::assert_snapshot!(format!("{command}"));

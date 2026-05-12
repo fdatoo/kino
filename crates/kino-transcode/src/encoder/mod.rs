@@ -2,6 +2,7 @@
 
 mod backend;
 mod capabilities;
+pub mod detect;
 mod kind;
 pub mod registry;
 pub mod software;
@@ -9,6 +10,7 @@ mod video;
 
 pub use backend::Encoder;
 pub use capabilities::Capabilities;
+pub use detect::{DetectionConfig, available_encoders};
 pub use kind::{EncoderKind, LaneId};
 pub use registry::EncoderRegistry;
 pub use software::{SoftwareEncodeContext, SoftwareEncoder};

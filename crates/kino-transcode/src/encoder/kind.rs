@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 
 /// Concrete FFmpeg encoder backend family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EncoderKind {
     /// CPU software encoder backend.
     Software,
