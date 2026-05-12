@@ -86,6 +86,22 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// A persisted library path is outside Kino's configured library root.
+    #[error("library path {path} is outside library root {library_root}")]
+    PathOutsideLibraryRoot {
+        /// Persisted path that must not be removed.
+        path: PathBuf,
+        /// Configured library root that bounds deletion.
+        library_root: PathBuf,
+    },
+
+    /// A persisted library path exists but is not a regular file.
+    #[error("library path is not a file: {path}")]
+    LibraryPathNotFile {
+        /// Existing path that is not a regular file.
+        path: PathBuf,
+    },
+
     /// A canonical path segment became empty after normalization.
     #[error("canonical path segment {field} is empty")]
     EmptyPathSegment {
@@ -1337,12 +1353,36 @@ impl CatalogService {
         self.source_file(source_file_id).await
     }
 
-    /// Delete a media item and cascading library rows.
+    /// Delete a media item, its cascading database rows, and owned library files.
+    pub async fn delete_media_item(
+        &self,
+        media_item_id: Id,
+        library_root: impl AsRef<Path>,
+    ) -> Result<()> {
+        let mut tx = self.db.write_pool().begin().await?;
+        let paths = media_item_file_paths(&mut tx, media_item_id).await?;
+        let result = sqlx::query("DELETE FROM media_items WHERE id = ?1")
+            .bind(media_item_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(Error::MediaItemNotFound { id: media_item_id });
+        }
+
+        delete_library_files(library_root.as_ref(), paths).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete a media item row and cascading library rows without touching the filesystem.
     pub async fn remove_media_item(&self, media_item_id: Id) -> Result<()> {
-        sqlx::query("DELETE FROM media_items WHERE id = ?1")
+        let result = sqlx::query("DELETE FROM media_items WHERE id = ?1")
             .bind(media_item_id)
             .execute(self.db.write_pool())
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(Error::MediaItemNotFound { id: media_item_id });
+        }
 
         Ok(())
     }
@@ -3128,6 +3168,224 @@ impl SubtitleService {
 
         rows.iter().map(subtitle_sidecar_from_row).collect()
     }
+}
+
+async fn media_item_file_paths(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    media_item_id: Id,
+) -> Result<Vec<PathBuf>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT path
+        FROM source_files
+        WHERE media_item_id = ?1
+        UNION
+        SELECT subtitle_sidecars.path
+        FROM subtitle_sidecars
+        WHERE media_item_id = ?1
+        UNION
+        SELECT transcode_outputs.path
+        FROM transcode_outputs
+        JOIN source_files
+            ON source_files.id = transcode_outputs.source_file_id
+        WHERE source_files.media_item_id = ?1
+        "#,
+    )
+    .bind(media_item_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let path: String = row.try_get("path")?;
+            Ok(PathBuf::from(path))
+        })
+        .collect()
+}
+
+async fn delete_library_files(library_root: &Path, paths: Vec<PathBuf>) -> Result<()> {
+    let library_root = canonicalize_library_root(library_root).await?;
+    let mut files = Vec::new();
+    for path in paths {
+        files.push(checked_library_file_path(&library_root, &path).await?);
+    }
+    files.sort();
+    files.dedup();
+
+    let mut parents = files
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+
+    for path in files {
+        remove_library_file(&path).await?;
+    }
+
+    parents.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    parents.dedup();
+    for parent in parents {
+        remove_empty_parent_directories(&library_root, parent).await?;
+    }
+
+    Ok(())
+}
+
+async fn canonicalize_library_root(library_root: &Path) -> Result<PathBuf> {
+    tokio::fs::canonicalize(library_root)
+        .await
+        .map_err(|source| Error::Io {
+            path: library_root.to_path_buf(),
+            source,
+        })
+}
+
+async fn checked_library_file_path(library_root: &Path, path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        library_root.join(path)
+    };
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(Error::PathOutsideLibraryRoot {
+            path,
+            library_root: library_root.to_path_buf(),
+        });
+    }
+
+    if try_exists(&path).await? {
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if !metadata.is_file() {
+            return Err(Error::LibraryPathNotFile { path });
+        }
+
+        let canonical_path = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if !canonical_path.starts_with(library_root) {
+            return Err(Error::PathOutsideLibraryRoot {
+                path,
+                library_root: library_root.to_path_buf(),
+            });
+        }
+        if !path.starts_with(library_root) {
+            return Ok(canonical_path);
+        }
+    } else if !path.starts_with(library_root) {
+        return Err(Error::PathOutsideLibraryRoot {
+            path,
+            library_root: library_root.to_path_buf(),
+        });
+    }
+
+    Ok(path)
+}
+
+async fn remove_library_file(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+async fn remove_empty_parent_directories(library_root: &Path, parent: PathBuf) -> Result<()> {
+    let mut current = parent;
+    while current.starts_with(library_root) && current != library_root {
+        remove_empty_descendant_directories(&current).await?;
+        match tokio::fs::remove_dir(&current).await {
+            Ok(()) => {}
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(source) => {
+                return Err(Error::Io {
+                    path: current,
+                    source,
+                });
+            }
+        }
+
+        let Some(parent) = current.parent() else {
+            return Ok(());
+        };
+        current = parent.to_path_buf();
+    }
+
+    Ok(())
+}
+
+async fn remove_empty_descendant_directories(root: &Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut directories = Vec::new();
+
+    while let Some(directory) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        };
+
+        while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Io {
+            path: directory.clone(),
+            source,
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_dir() {
+                stack.push(path.clone());
+                directories.push(path);
+            }
+        }
+    }
+
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        match tokio::fs::remove_dir(&directory).await {
+            Ok(()) => {}
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(source) => {
+                return Err(Error::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn create_dir_all(path: &Path) -> Result<()> {
