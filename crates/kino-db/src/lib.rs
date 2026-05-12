@@ -474,6 +474,7 @@ mod tests {
                 (23, String::from("source file probe data")),
                 (24, String::from("subtitle forced flag")),
                 (25, String::from("transcode jobs")),
+                (26, String::from("transcode outputs packaging")),
             ]
         );
 
@@ -1075,6 +1076,7 @@ mod tests {
                 (23, String::from("source file probe data")),
                 (24, String::from("subtitle forced flag")),
                 (25, String::from("transcode jobs")),
+                (26, String::from("transcode outputs packaging")),
             ]
         );
 
