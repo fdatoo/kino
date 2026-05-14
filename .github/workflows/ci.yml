@@ -9,19 +9,23 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   ci:
     name: ci
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/fdatoo/kino-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg just tesseract-ocr
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
