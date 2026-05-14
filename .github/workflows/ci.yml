@@ -80,7 +80,7 @@ jobs:
       - name: Check OpenAPI drift
         run: |
           just openapi
-          if ! git diff --exit-code -- crates/kino-server/openapi.json; then
+          if ! git -C "$GITHUB_WORKSPACE" diff --exit-code -- crates/kino-server/openapi.json; then
             echo "::error::OpenAPI spec drifted. Run \`just openapi\` and commit the result."
             exit 1
           fi
