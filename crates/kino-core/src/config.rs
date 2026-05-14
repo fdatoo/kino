@@ -1175,6 +1175,20 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        let Ok(output) = std::process::Command::new("id").arg("-u").output() else {
+            return false;
+        };
+
+        output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "0"
+    }
+
+    #[cfg(not(unix))]
+    fn running_as_root() -> bool {
+        false
+    }
+
     fn full_toml(database_path: &Path, library_root: &Path) -> String {
         let disc_rip = library_root.join("rips");
         let watch_folder = library_root.join("incoming");
@@ -2305,6 +2319,11 @@ mod tests {
     #[test]
     fn rejects_database_parent_that_is_not_writable() {
         Jail::expect_with(|jail| {
+            if running_as_root() {
+                eprintln!("skipping non-writable parent check while running as root");
+                return Ok(());
+            }
+
             let fixture = ConfigFixture::new()?;
             let original_permissions = fs::metadata(&fixture.database_dir)
                 .map_err(|e| e.to_string())?
