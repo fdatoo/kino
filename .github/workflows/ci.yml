@@ -39,11 +39,25 @@ jobs:
           cache: pnpm
           cache-dependency-path: crates/kino-admin/web/pnpm-lock.yaml
 
+      - name: Install admin SPA dependencies
+        working-directory: crates/kino-admin/web
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate admin API client
+        working-directory: crates/kino-admin/web
+        run: pnpm gen
+
+      - name: Typecheck admin SPA
+        working-directory: crates/kino-admin/web
+        run: pnpm typecheck
+
+      - name: Lint admin SPA
+        working-directory: crates/kino-admin/web
+        run: pnpm lint
+
       - name: Build admin SPA
         working-directory: crates/kino-admin/web
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
+        run: pnpm build
 
       - name: Install Rust
         run: |
@@ -74,52 +88,5 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Build
-        run: cargo build --workspace
-
       - name: Check OpenAPI drift
-        run: |
-          just openapi
-          if ! git diff --exit-code -- crates/kino-server/openapi.json; then
-            echo "::error::OpenAPI spec drifted. Run \`just openapi\` and commit the result."
-            exit 1
-          fi
-
-  spa:
-    name: spa
-    runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: crates/kino-admin/web
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - name: Install Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: crates/kino-admin/web/pnpm-lock.yaml
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Generate API client
-        run: pnpm gen
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Build
-        run: pnpm build
+        run: .github/scripts/check-openapi-drift.sh
