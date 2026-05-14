@@ -19,7 +19,7 @@ build:
     cargo build --workspace
 
 run:
-    cargo run
+    cargo run -p kino
 
 openapi:
     tmp="$(mktemp -d)"; \
