@@ -56,6 +56,11 @@ pub(crate) struct ListTokensResponse {
     tokens: Vec<TokenSummary>,
 }
 
+pub(crate) struct MintedDeviceToken {
+    pub(crate) plaintext: String,
+    pub(crate) token: DeviceToken,
+}
+
 pub(crate) fn router(db: Db) -> Router {
     Router::new()
         .route("/api/v1/admin/tokens", post(create_token).get(list_tokens))
@@ -82,47 +87,15 @@ pub(crate) async fn create_token(
         return Err(TokenApiError::EmptyLabel);
     }
 
-    let plaintext = generate_plaintext_token()?;
-    let hash = crate::auth::hash_token(&plaintext);
-    let token = DeviceToken::new(
-        Id::new(),
-        SEEDED_USER_ID,
-        payload.label,
-        hash,
-        Timestamp::now(),
-    );
-
-    sqlx::query(
-        r#"
-        INSERT INTO device_tokens (
-            id,
-            user_id,
-            label,
-            hash,
-            last_seen_at,
-            revoked_at,
-            created_at
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        "#,
-    )
-    .bind(token.id)
-    .bind(token.user_id)
-    .bind(&token.label)
-    .bind(&token.hash)
-    .bind(token.last_seen_at)
-    .bind(token.revoked_at)
-    .bind(token.created_at)
-    .execute(state.db.write_pool())
-    .await?;
+    let minted = mint_device_token(&state.db, SEEDED_USER_ID, payload.label).await?;
 
     Ok((
         StatusCode::CREATED,
         Json(CreateTokenResponse {
-            token: plaintext,
-            token_id: token.id,
-            label: token.label,
-            created_at: token.created_at,
+            token: minted.plaintext,
+            token_id: minted.token.id,
+            label: minted.token.label,
+            created_at: minted.token.created_at,
         }),
     ))
 }
@@ -261,6 +234,47 @@ fn generate_plaintext_token() -> TokenResult<String> {
     let mut bytes = [0_u8; 32];
     OsRng.try_fill_bytes(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub(crate) async fn mint_device_token(
+    db: &Db,
+    user_id: Id,
+    label: impl Into<String>,
+) -> TokenResult<MintedDeviceToken> {
+    let label = label.into();
+    if label.trim().is_empty() {
+        return Err(TokenApiError::EmptyLabel);
+    }
+
+    let plaintext = generate_plaintext_token()?;
+    let hash = crate::auth::hash_token(&plaintext);
+    let token = DeviceToken::new(Id::new(), user_id, label, hash, Timestamp::now());
+
+    sqlx::query(
+        r#"
+        INSERT INTO device_tokens (
+            id,
+            user_id,
+            label,
+            hash,
+            last_seen_at,
+            revoked_at,
+            created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(token.id)
+    .bind(token.user_id)
+    .bind(&token.label)
+    .bind(&token.hash)
+    .bind(token.last_seen_at)
+    .bind(token.revoked_at)
+    .bind(token.created_at)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(MintedDeviceToken { plaintext, token })
 }
 
 fn token_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> TokenResult<TokenSummary> {

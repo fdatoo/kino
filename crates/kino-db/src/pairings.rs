@@ -119,13 +119,13 @@ pub async fn link_token(db: &Db, id: Id, token_id: Id) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
-/// Atomically approve a pairing and attach the minted device token.
+/// Atomically approve a pending pairing and attach the minted device token.
 pub async fn approve(db: &Db, id: Id, token_id: Id, approved_at: Timestamp) -> Result<u64> {
     let result = sqlx::query(
         r#"
         UPDATE pairings
         SET status = ?1, token_id = ?2, approved_at = ?3
-        WHERE id = ?4
+        WHERE id = ?4 AND status = 'pending'
         "#,
     )
     .bind(PairingStatus::Approved.as_str())

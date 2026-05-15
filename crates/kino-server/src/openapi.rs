@@ -7,8 +7,11 @@ use utoipa::openapi::server::Server;
     paths(
         crate::admin_config::get_config,
         crate::catalog_admin::delete_catalog_item,
+        crate::pairing::approve_pairing,
         crate::pairing::create_pairing,
         crate::pairing::get_pairing,
+        crate::pairing::list_pairings,
+        crate::pairing::reject_pairing,
         crate::playback::get_progress,
         crate::playback::mark_watched,
         crate::playback::record_progress,

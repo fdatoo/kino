@@ -197,6 +197,7 @@ fn router_with_config_reocr_tmdb_transcode_and_token_store(
         ))
         .merge(stream::router_with_live(db.clone(), live_stream))
         .merge(token::router(db.clone()))
+        .merge(pairing::admin_router(db.clone(), token_store.clone()))
         .merge(playback::router(db.clone()))
         .merge(session_admin::router(db.clone()))
         .merge(admin_config::router(config))
