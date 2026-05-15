@@ -9,6 +9,7 @@ pub mod config;
 pub mod device_token;
 pub mod id;
 pub mod identity;
+pub mod pairing;
 pub mod playback_session;
 pub mod playback_state;
 pub mod probe;
@@ -32,6 +33,7 @@ pub use identity::{
     CanonicalIdentity, CanonicalIdentityId, CanonicalIdentityKind, CanonicalIdentityProvider,
     CanonicalIdentitySource, TmdbId,
 };
+pub use pairing::{Pairing, PairingPlatform, PairingStatus};
 pub use playback_session::{PlaybackSession, PlaybackSessionStatus};
 pub use playback_state::{InvalidPlaybackPosition, PlaybackProgress, Watched, WatchedSource};
 pub use probe::{
