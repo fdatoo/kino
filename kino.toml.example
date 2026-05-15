@@ -59,6 +59,16 @@ active_to_idle_seconds = 60
 # Runtime override: KINO_SERVER__SESSION_REAPER__IDLE_TO_ENDED_SECONDS.
 idle_to_ended_seconds = 300
 
+[server.pairing_reaper]
+# Seconds between pairing reaper sweeps. Optional. Defaults to 60.
+# Runtime override: KINO_SERVER__PAIRING_REAPER__TICK_SECONDS.
+tick_seconds = 60
+
+# Seconds after which terminal pairing rows are deleted. Optional. Defaults to
+# 86400.
+# Runtime override: KINO_SERVER__PAIRING_REAPER__RETENTION_SECONDS.
+retention_seconds = 86400
+
 [tmdb]
 # TMDB v3 API key. Optional until request resolution is enabled.
 # Runtime override: KINO_TMDB__API_KEY.
