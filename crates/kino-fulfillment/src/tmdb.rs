@@ -46,6 +46,13 @@ pub enum Error {
         year: i32,
     },
 
+    /// A page parameter cannot be represented by TMDB search endpoints.
+    #[error("tmdb page {page} is invalid")]
+    InvalidPage {
+        /// Invalid page value.
+        page: u32,
+    },
+
     /// A configured URL could not be parsed.
     #[error("invalid tmdb base url {value}: {source}")]
     InvalidBaseUrl {
@@ -207,6 +214,47 @@ pub struct TmdbTvSeriesDetails {
     pub popularity: f64,
 }
 
+/// TMDB media kind accepted by the discover endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TmdbDiscoverKind {
+    /// Movie search candidates.
+    Movie,
+    /// TV series search candidates.
+    Series,
+}
+
+/// Paged TMDB discover response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmdbDiscoverPage {
+    /// Search candidates returned for the requested page.
+    pub candidates: Vec<TmdbDiscoverCandidate>,
+    /// TMDB response page number.
+    pub page: u32,
+    /// Whether TMDB reports additional pages after this page.
+    pub has_more: bool,
+}
+
+/// Candidate returned by TMDB discover search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmdbDiscoverCandidate {
+    /// TMDB id for the movie or TV series.
+    pub tmdb_id: u32,
+    /// TMDB media kind.
+    pub kind: TmdbDiscoverKind,
+    /// Display title.
+    pub title: String,
+    /// Release or first-air year when TMDB provided a parseable date.
+    pub year: Option<i32>,
+    /// TMDB overview text.
+    pub overview: Option<String>,
+    /// Original-size poster image URL when TMDB provided a poster path.
+    pub poster_url: Option<Url>,
+    /// Original-size backdrop image URL when TMDB provided a backdrop path.
+    pub backdrop_url: Option<Url>,
+    /// TMDB popularity score.
+    pub popularity: f64,
+}
+
 /// HTTP client for TMDB movie and TV endpoints.
 #[derive(Clone, Debug)]
 pub struct TmdbClient {
@@ -279,6 +327,49 @@ impl TmdbClient {
             .into_iter()
             .map(TvSearchItem::try_into_result)
             .collect()
+    }
+
+    /// Discover TMDB movies or TV series by query and page.
+    pub async fn discover(
+        &self,
+        query: &str,
+        kind: TmdbDiscoverKind,
+        page: u32,
+    ) -> Result<TmdbDiscoverPage> {
+        let query = validate_query(query)?;
+        validate_page(page)?;
+
+        let params = [("query", query.to_owned()), ("page", page.to_string())];
+        match kind {
+            TmdbDiscoverKind::Movie => {
+                let response: SearchResponse<MovieDiscoverItem> =
+                    self.get_json("search/movie", &params).await?;
+                let candidates = response
+                    .results
+                    .into_iter()
+                    .map(|item| item.try_into_candidate(self))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(TmdbDiscoverPage {
+                    candidates,
+                    page: response.page,
+                    has_more: response.page < response.total_pages,
+                })
+            }
+            TmdbDiscoverKind::Series => {
+                let response: SearchResponse<TvDiscoverItem> =
+                    self.get_json("search/tv", &params).await?;
+                let candidates = response
+                    .results
+                    .into_iter()
+                    .map(|item| item.try_into_candidate(self))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(TmdbDiscoverPage {
+                    candidates,
+                    page: response.page,
+                    has_more: response.page < response.total_pages,
+                })
+            }
+        }
     }
 
     /// Fetch top-level TMDB movie details, using the in-session cache by movie id.
@@ -473,6 +564,10 @@ struct TmdbCache {
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse<T> {
+    #[serde(default)]
+    page: u32,
+    #[serde(default)]
+    total_pages: u32,
     results: Vec<T>,
 }
 
@@ -519,6 +614,84 @@ impl TvSearchItem {
             self.first_air_date.as_deref(),
             self.popularity,
         ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MovieDiscoverItem {
+    id: u32,
+    title: String,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    popularity: f64,
+}
+
+impl MovieDiscoverItem {
+    fn try_into_candidate(self, client: &TmdbClient) -> Result<TmdbDiscoverCandidate> {
+        if self.id == 0 {
+            return Err(Error::InvalidResponse {
+                reason: "movie id is not positive",
+            });
+        }
+
+        Ok(TmdbDiscoverCandidate {
+            tmdb_id: self.id,
+            kind: TmdbDiscoverKind::Movie,
+            title: self.title,
+            year: self
+                .release_date
+                .as_deref()
+                .and_then(release_year_from_date),
+            overview: self.overview,
+            poster_url: optional_image_url(client, self.poster_path)?,
+            backdrop_url: optional_image_url(client, self.backdrop_path)?,
+            popularity: self.popularity,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TvDiscoverItem {
+    id: u32,
+    name: String,
+    #[serde(default)]
+    first_air_date: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    popularity: f64,
+}
+
+impl TvDiscoverItem {
+    fn try_into_candidate(self, client: &TmdbClient) -> Result<TmdbDiscoverCandidate> {
+        if self.id == 0 {
+            return Err(Error::InvalidResponse {
+                reason: "series id is not positive",
+            });
+        }
+
+        Ok(TmdbDiscoverCandidate {
+            tmdb_id: self.id,
+            kind: TmdbDiscoverKind::Series,
+            title: self.name,
+            year: self
+                .first_air_date
+                .as_deref()
+                .and_then(first_air_year_from_date),
+            overview: self.overview,
+            poster_url: optional_image_url(client, self.poster_path)?,
+            backdrop_url: optional_image_url(client, self.backdrop_path)?,
+            popularity: self.popularity,
+        })
     }
 }
 
@@ -698,6 +871,22 @@ fn required_image_path(value: Option<String>, field: &'static str) -> Result<Str
         .ok_or(Error::InvalidResponse { reason: field })
 }
 
+fn optional_image_url(client: &TmdbClient, value: Option<String>) -> Result<Option<Url>> {
+    let Some(path) = value
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    client
+        .config
+        .image_base_url
+        .join(path.trim_start_matches('/'))
+        .map(Some)
+        .map_err(|source| Error::InvalidRequestPath { path, source })
+}
+
 async fn optional_logo_asset(
     client: &TmdbClient,
     images: ImagesResponse,
@@ -742,6 +931,14 @@ fn validate_year(year: i32) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidYear { year })
+    }
+}
+
+fn validate_page(page: u32) -> Result<()> {
+    if page == 0 {
+        Err(Error::InvalidPage { page })
+    } else {
+        Ok(())
     }
 }
 
@@ -836,6 +1033,93 @@ mod tests {
         assert!(requests[0].contains("api_key=test-api-key"));
         assert!(requests[0].contains("query=Game+of+Thrones"));
         assert!(requests[0].contains("first_air_date_year=2011"));
+    }
+
+    #[tokio::test]
+    async fn discover_movies_maps_paged_candidates_and_image_urls() {
+        let server = TestServer::new(vec![TestResponse::json(
+            StatusCode::OK,
+            r#"{"page":1,"total_pages":2,"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15","overview":"A dream heist.","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","popularity":83.1}]}"#,
+        )])
+        .await;
+        let client = test_client(&server);
+
+        let page = client
+            .discover(" Inception ", TmdbDiscoverKind::Movie, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(page.page, 1);
+        assert!(page.has_more);
+        assert_eq!(page.candidates.len(), 1);
+        let candidate = &page.candidates[0];
+        assert_eq!(candidate.tmdb_id, 27205);
+        assert_eq!(candidate.kind, TmdbDiscoverKind::Movie);
+        assert_eq!(candidate.title, "Inception");
+        assert_eq!(candidate.year, Some(2010));
+        assert_eq!(candidate.overview.as_deref(), Some("A dream heist."));
+        assert_eq!(
+            candidate.poster_url.as_ref().map(Url::as_str),
+            Some("https://image.tmdb.org/t/p/original/poster.jpg")
+        );
+        assert_eq!(
+            candidate.backdrop_url.as_ref().map(Url::as_str),
+            Some("https://image.tmdb.org/t/p/original/backdrop.jpg")
+        );
+        assert_eq!(candidate.popularity, 83.1);
+
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("/3/search/movie?"));
+        assert!(requests[0].contains("api_key=test-api-key"));
+        assert!(requests[0].contains("query=Inception"));
+        assert!(requests[0].contains("page=1"));
+    }
+
+    #[tokio::test]
+    async fn discover_series_maps_missing_optional_fields_to_none() {
+        let server = TestServer::new(vec![TestResponse::json(
+            StatusCode::OK,
+            r#"{"page":1,"total_pages":1,"results":[{"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17","overview":null,"poster_path":"","backdrop_path":null,"popularity":126.5}]}"#,
+        )])
+        .await;
+        let client = test_client(&server);
+
+        let page = client
+            .discover("Game of Thrones", TmdbDiscoverKind::Series, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(page.page, 1);
+        assert!(!page.has_more);
+        assert_eq!(page.candidates.len(), 1);
+        let candidate = &page.candidates[0];
+        assert_eq!(candidate.tmdb_id, 1399);
+        assert_eq!(candidate.kind, TmdbDiscoverKind::Series);
+        assert_eq!(candidate.title, "Game of Thrones");
+        assert_eq!(candidate.year, Some(2011));
+        assert_eq!(candidate.overview, None);
+        assert_eq!(candidate.poster_url, None);
+        assert_eq!(candidate.backdrop_url, None);
+    }
+
+    #[tokio::test]
+    async fn discover_page_past_total_pages_has_no_more_results() {
+        let server = TestServer::new(vec![TestResponse::json(
+            StatusCode::OK,
+            r#"{"page":5,"total_pages":3,"results":[]}"#,
+        )])
+        .await;
+        let client = test_client(&server);
+
+        let page = client
+            .discover("Inception", TmdbDiscoverKind::Movie, 5)
+            .await
+            .unwrap();
+
+        assert_eq!(page.page, 5);
+        assert!(!page.has_more);
+        assert!(page.candidates.is_empty());
     }
 
     #[tokio::test]
