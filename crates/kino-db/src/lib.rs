@@ -30,6 +30,7 @@ use sqlx::sqlite::{
 use thiserror::Error;
 
 pub mod pairings;
+pub mod server_identity;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const READER_CONNECTIONS: u32 = 8;
@@ -480,6 +481,7 @@ mod tests {
                 (27, String::from("transcode color downgrades")),
                 (28, String::from("ephemeral transcodes")),
                 (29, String::from("pairings")),
+                (30, String::from("server identity")),
             ]
         );
 
@@ -1085,6 +1087,7 @@ mod tests {
                 (27, String::from("transcode color downgrades")),
                 (28, String::from("ephemeral transcodes")),
                 (29, String::from("pairings")),
+                (30, String::from("server identity")),
             ]
         );
 

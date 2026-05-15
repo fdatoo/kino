@@ -239,6 +239,7 @@ mod tests {
                 (27, String::from("transcode color downgrades")),
                 (28, String::from("ephemeral transcodes")),
                 (29, String::from("pairings")),
+                (30, String::from("server identity")),
             ]
         );
 

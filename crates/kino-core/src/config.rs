@@ -132,6 +132,11 @@ pub struct ServerConfig {
     #[serde(default, deserialize_with = "comma_separated_strings")]
     pub cors_allowed_origins: Vec<String>,
 
+    /// LAN service discovery settings. Defaults documented on
+    /// [`DiscoveryConfig`].
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+
     /// Playback session background reaper settings. Defaults documented on
     /// [`SessionReaperConfig`].
     #[serde(default)]
@@ -141,6 +146,19 @@ pub struct ServerConfig {
     /// [`PairingReaperConfig`].
     #[serde(default)]
     pub pairing_reaper: PairingReaperConfig,
+}
+
+/// Bonjour/mDNS discovery settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    /// Whether the server advertises itself on the LAN. Defaults to true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Bonjour instance name. Defaults to the system hostname when omitted.
+    #[serde(default)]
+    pub instance_name: Option<String>,
 }
 
 /// Playback session background reaper settings.
@@ -512,8 +530,18 @@ impl Default for ServerConfig {
             listen: default_listen(),
             public_base_url: default_public_base_url(),
             cors_allowed_origins: Vec::new(),
+            discovery: DiscoveryConfig::default(),
             session_reaper: SessionReaperConfig::default(),
             pairing_reaper: PairingReaperConfig::default(),
+        }
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            instance_name: None,
         }
     }
 }
