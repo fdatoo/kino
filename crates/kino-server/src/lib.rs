@@ -27,6 +27,7 @@ mod catalog_admin;
 mod ingestion_orchestrator;
 mod openapi;
 mod pairing;
+pub mod pairing_reaper;
 mod playback;
 mod request;
 mod session_admin;
@@ -293,6 +294,7 @@ pub async fn serve(config: &Config, db: Db) -> Result<()> {
     let transcode = build_transcode_service(db.clone(), config).await?;
     let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &config.library_root);
     let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
+    let token_store = PairingTokenStore::new();
     let intake = config.providers.watch_folder.as_ref().map(|provider| {
         watch_folder_intake::spawn(
             watch_folder_intake::WatchFolderIntakeDeps {
@@ -309,17 +311,17 @@ pub async fn serve(config: &Config, db: Db) -> Result<()> {
     });
 
     tracing::info!(listen = %local_addr, "server listening");
-    let serve_result = axum::serve(
-        listener,
-        router_with_config_reocr_tmdb_and_transcode(
-            db,
-            config.clone(),
-            subtitle_reocr,
-            tmdb_client,
-            transcode,
-        ),
-    )
-    .await;
+    let app = router_with_config_reocr_tmdb_transcode_and_token_store(
+        db.clone(),
+        config.clone(),
+        subtitle_reocr,
+        tmdb_client,
+        transcode,
+        token_store.clone(),
+    );
+    let _pairing_reaper =
+        pairing_reaper::spawn(db, token_store, config.server.pairing_reaper.into());
+    let serve_result = axum::serve(listener, app).await;
 
     if let Some(intake) = intake {
         intake.shutdown().await;

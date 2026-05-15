@@ -136,6 +136,11 @@ pub struct ServerConfig {
     /// [`SessionReaperConfig`].
     #[serde(default)]
     pub session_reaper: SessionReaperConfig,
+
+    /// Pairing background reaper settings. Defaults documented on
+    /// [`PairingReaperConfig`].
+    #[serde(default)]
+    pub pairing_reaper: PairingReaperConfig,
 }
 
 /// Playback session background reaper settings.
@@ -165,6 +170,27 @@ pub struct SessionReaperConfig {
         deserialize_with = "duration_seconds"
     )]
     pub idle_to_ended: Duration,
+}
+
+/// Pairing background reaper settings.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairingReaperConfig {
+    /// Interval between pairing reaper sweeps. Defaults to 60 seconds.
+    #[serde(
+        default = "default_pairing_reaper_tick_interval",
+        rename = "tick_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub tick_interval: Duration,
+
+    /// Age after which terminal pairing rows are deleted. Defaults to 24 hours.
+    #[serde(
+        default = "default_pairing_reaper_retention",
+        rename = "retention_seconds",
+        deserialize_with = "duration_seconds"
+    )]
+    pub retention: Duration,
 }
 
 /// TMDB API client settings.
@@ -400,6 +426,14 @@ fn default_session_reaper_idle_to_ended() -> Duration {
     Duration::from_secs(300)
 }
 
+fn default_pairing_reaper_tick_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_pairing_reaper_retention() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
 fn default_tesseract_path() -> PathBuf {
     PathBuf::from("tesseract")
 }
@@ -479,6 +513,7 @@ impl Default for ServerConfig {
             public_base_url: default_public_base_url(),
             cors_allowed_origins: Vec::new(),
             session_reaper: SessionReaperConfig::default(),
+            pairing_reaper: PairingReaperConfig::default(),
         }
     }
 }
@@ -489,6 +524,15 @@ impl Default for SessionReaperConfig {
             tick_interval: default_session_reaper_tick_interval(),
             active_to_idle: default_session_reaper_active_to_idle(),
             idle_to_ended: default_session_reaper_idle_to_ended(),
+        }
+    }
+}
+
+impl Default for PairingReaperConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval: default_pairing_reaper_tick_interval(),
+            retention: default_pairing_reaper_retention(),
         }
     }
 }
@@ -604,6 +648,15 @@ pub enum ConfigError {
     #[error("invalid session reaper config {field}: {reason}")]
     InvalidSessionReaperConfig {
         /// Session reaper config field.
+        field: &'static str,
+        /// Human-readable validation failure.
+        reason: &'static str,
+    },
+
+    /// The configured pairing reaper settings are invalid.
+    #[error("invalid pairing reaper config {field}: {reason}")]
+    InvalidPairingReaperConfig {
+        /// Pairing reaper config field.
         field: &'static str,
         /// Human-readable validation failure.
         reason: &'static str,
@@ -773,6 +826,7 @@ fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     })?;
     validate_session_reaper_config(&config.session_reaper)?;
+    validate_pairing_reaper_config(&config.pairing_reaper)?;
     Ok(())
 }
 
@@ -794,6 +848,24 @@ fn validate_session_reaper_config(config: &SessionReaperConfig) -> Result<(), Co
     if config.idle_to_ended.is_zero() {
         return Err(ConfigError::InvalidSessionReaperConfig {
             field: "idle_to_ended_seconds",
+            reason: "must be positive",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_pairing_reaper_config(config: &PairingReaperConfig) -> Result<(), ConfigError> {
+    if config.tick_interval.is_zero() {
+        return Err(ConfigError::InvalidPairingReaperConfig {
+            field: "tick_seconds",
+            reason: "must be positive",
+        });
+    }
+
+    if config.retention.is_zero() {
+        return Err(ConfigError::InvalidPairingReaperConfig {
+            field: "retention_seconds",
             reason: "must be positive",
         });
     }
@@ -1378,6 +1450,14 @@ mod tests {
                 cfg.server.session_reaper.idle_to_ended,
                 Duration::from_secs(300)
             );
+            assert_eq!(
+                cfg.server.pairing_reaper.tick_interval,
+                Duration::from_secs(60)
+            );
+            assert_eq!(
+                cfg.server.pairing_reaper.retention,
+                Duration::from_secs(24 * 60 * 60)
+            );
             assert_eq!(cfg.tmdb.api_key, None);
             assert_eq!(cfg.tmdb.max_requests_per_second, 20);
             assert_eq!(cfg.ocr.tesseract_path, PathBuf::from("tesseract"));
@@ -1562,6 +1642,27 @@ mod tests {
     }
 
     #[test]
+    fn nested_env_override_for_pairing_reaper() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file("kino.toml", &fixture.required_only_toml())?;
+            jail.set_env("KINO_SERVER__PAIRING_REAPER__TICK_SECONDS", "5");
+            jail.set_env("KINO_SERVER__PAIRING_REAPER__RETENTION_SECONDS", "86401");
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            assert_eq!(
+                cfg.server.pairing_reaper.tick_interval,
+                Duration::from_secs(5)
+            );
+            assert_eq!(
+                cfg.server.pairing_reaper.retention,
+                Duration::from_secs(86401)
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
     fn invalid_server_public_base_url_is_rejected() {
         Jail::expect_with(|jail| {
             let fixture = ConfigFixture::new()?;
@@ -1611,6 +1712,34 @@ mod tests {
             let err = Config::load().unwrap_err();
             assert!(
                 matches!(err, ConfigError::InvalidSessionReaperConfig { .. }),
+                "got: {err:?}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn invalid_pairing_reaper_zero_interval_is_rejected() {
+        Jail::expect_with(|jail| {
+            let fixture = ConfigFixture::new()?;
+
+            jail.create_file(
+                "kino.toml",
+                &format!(
+                    r#"
+                        database_path = "{}"
+                        library_root = "{}"
+
+                        [server.pairing_reaper]
+                        tick_seconds = 0
+                    "#,
+                    fixture.database_path.display(),
+                    fixture.library_root.display()
+                ),
+            )?;
+            let err = Config::load().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidPairingReaperConfig { .. }),
                 "got: {err:?}"
             );
             Ok(())
