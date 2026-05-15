@@ -238,6 +238,7 @@ mod tests {
                 (26, String::from("transcode outputs packaging")),
                 (27, String::from("transcode color downgrades")),
                 (28, String::from("ephemeral transcodes")),
+                (29, String::from("pairings")),
             ]
         );
 
