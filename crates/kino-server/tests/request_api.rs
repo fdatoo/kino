@@ -186,7 +186,7 @@ async fn openapi_json_serves_valid_spec() -> Result<(), Box<dyn std::error::Erro
     let catalog_params = body["paths"]["/api/v1/library/items"]["get"]["parameters"]
         .as_array()
         .ok_or("catalog list parameters should be an array")?;
-    for param in ["kind", "year", "watched", "sort", "cursor"] {
+    for param in ["kind", "year", "watched", "sort", "q", "cursor"] {
         assert!(
             catalog_params
                 .iter()
@@ -2332,6 +2332,144 @@ async fn catalog_item_detail_includes_multiple_source_file_probe_tracks()
 }
 
 #[tokio::test]
+async fn library_items_q_matches_movie_title() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let matrix_identity = identity(603);
+    let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
+    insert_catalog_title(&db, matrix, matrix_identity, "The Matrix").await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?q=Matrix")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["items"][0]["id"], matrix.to_string());
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_items_q_matches_series_via_episode() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let breaking_bad_identity = tv_identity(1396);
+    let pilot = insert_tmdb_media_item(&db, breaking_bad_identity).await?;
+    let felina = insert_media_item_for_existing_identity(&db, breaking_bad_identity, 5, 16).await?;
+    insert_catalog_title(&db, pilot, breaking_bad_identity, "Breaking Bad").await?;
+    insert_catalog_title(&db, felina, breaking_bad_identity, "Felina").await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?q=breaking")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    let items = body["items"].as_array().ok_or("items should be an array")?;
+    assert!(items.iter().any(|item| item["id"] == felina.to_string()));
+    assert_eq!(items.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_items_q_matches_year() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let movie_identity = identity(110);
+    let movie = insert_tmdb_media_item(&db, movie_identity).await?;
+    insert_catalog_title_with_release_date(
+        &db,
+        movie,
+        movie_identity,
+        "Whiplash",
+        Some("2014-09-01"),
+    )
+    .await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?q=2014")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["items"][0]["id"], movie.to_string());
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_items_q_no_match_returns_empty() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let movie_identity = identity(603);
+    let movie = insert_tmdb_media_item(&db, movie_identity).await?;
+    insert_catalog_title(&db, movie, movie_identity, "The Matrix").await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?q=missing")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_items_q_escapes_wildcards() -> Result<(), Box<dyn std::error::Error>> {
+    let db = kino_db::test_db().await?;
+    let auth = common::issued_token(&db).await?;
+    let movie_identity = identity(603);
+    let movie = insert_tmdb_media_item(&db, movie_identity).await?;
+    insert_catalog_title(&db, movie, movie_identity, "Plain").await?;
+    let app = kino_server::router(db);
+
+    let response = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/api/v1/library/items?q=%25")
+                .bearer(&auth)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response_json(response).await?;
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_api_filters_sorts_and_cursor_paginates() -> Result<(), Box<dyn std::error::Error>>
 {
     let db = kino_db::test_db().await?;
@@ -3121,6 +3259,42 @@ async fn insert_tmdb_media_item(
     .bind(canonical_identity_id)
     .bind(media_item_season_number(canonical_identity_id))
     .bind(media_item_episode_number(canonical_identity_id))
+    .bind(now)
+    .bind(now)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(id)
+}
+
+async fn insert_media_item_for_existing_identity(
+    db: &kino_db::Db,
+    canonical_identity_id: CanonicalIdentityId,
+    season_number: i64,
+    episode_number: i64,
+) -> Result<Id, sqlx::Error> {
+    let id = Id::new();
+    let now = Timestamp::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO media_items (
+            id,
+            media_kind,
+            canonical_identity_id,
+            season_number,
+            episode_number,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(id)
+    .bind(media_item_kind_for_identity(canonical_identity_id).as_str())
+    .bind(canonical_identity_id)
+    .bind(season_number)
+    .bind(episode_number)
     .bind(now)
     .bind(now)
     .execute(db.write_pool())
