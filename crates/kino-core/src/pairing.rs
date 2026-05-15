@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Id, Timestamp};
 
 /// Client platform requesting a pairing code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PairingPlatform {
     /// iOS client.
@@ -59,7 +59,7 @@ impl FromStr for PairingPlatform {
 pub struct ParsePairingPlatformError;
 
 /// Lifecycle state for a pairing request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PairingStatus {
     /// Pairing code is waiting for admin approval.
