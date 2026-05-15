@@ -7,6 +7,7 @@ import {
 } from 'react-router-dom';
 import { ConfigPage } from './admin/config/ConfigPage';
 import { ItemDetailPage } from './admin/items/ItemDetailPage';
+import { PairingsPage } from './admin/pairings/PairingsPage';
 import { RequestDetail } from './admin/requests/RequestDetail';
 import { RequestsPage } from './admin/requests/RequestsPage';
 import { SessionsPage } from './admin/sessions/SessionsPage';
@@ -31,6 +32,10 @@ const router = createBrowserRouter(
                 {
                     path: '/tokens',
                     element: <TokensPage />,
+                },
+                {
+                    path: '/pairings',
+                    element: <PairingsPage />,
                 },
                 {
                     path: '/requests',

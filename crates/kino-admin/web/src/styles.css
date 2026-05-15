@@ -252,6 +252,22 @@ code {
     color: #b42318;
 }
 
+.status-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.secondary-button {
+    border-color: #9aa6b2;
+    background: #ffffff;
+    color: #26384f;
+}
+
+.secondary-button:hover:not(:disabled) {
+    background: #eef2f6;
+}
+
 .muted {
     margin-top: 16px;
     color: #617083;
@@ -349,6 +365,17 @@ tr:last-child td {
 .table-action {
     width: 1%;
     white-space: nowrap;
+}
+
+.pairing-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.pairing-code {
+    font-size: 1.35rem;
+    font-weight: 700;
 }
 
 .selected-row {
