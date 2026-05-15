@@ -43,3 +43,4 @@ monotonic, and the slug describes the decision in a few words.
 - [ADR-0002 — Request UX semantics: visible-on-demand fulfillment](0002-request-ux-semantics.md)
 - [ADR-0003 — Metadata provider strategy: TMDB-only with overrides](0003-metadata-provider-strategy.md)
 - [ADR-0004 — API versioning policy](0004-api-versioning-policy.md)
+- [ADR-0005 — mDNS responder crate choice](0005-mdns-responder-crate-choice.md)

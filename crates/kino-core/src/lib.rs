@@ -23,7 +23,7 @@ pub use catalog::{
     VariantCapabilities, VariantKind,
 };
 pub use config::{
-    CanonicalLayoutTransfer, Config, EphemeralConfig, LibraryConfig, OcrConfig,
+    CanonicalLayoutTransfer, Config, DiscoveryConfig, EphemeralConfig, LibraryConfig, OcrConfig,
     SessionReaperConfig, TranscodeConfig, TranscodePolicyCompatibilityConfig,
     TranscodePolicyConfig, TranscodePolicyHighConfig, TranscodeSchedulerConfig,
 };

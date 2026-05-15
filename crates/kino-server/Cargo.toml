@@ -9,17 +9,20 @@ workspace = true
 
 [features]
 acceptance-tests = []
+mdns-tests = []
 
 [dependencies]
 axum = "0.8"
 base64 = "0.22"
 figment = { workspace = true }
+hostname = "=0.4.2"
 kino-admin = { path = "../kino-admin" }
 kino-core = { path = "../kino-core" }
 kino-db = { path = "../kino-db" }
 kino-fulfillment = { path = "../kino-fulfillment" }
 kino-library = { path = "../kino-library" }
 kino-transcode = { path = "../kino-transcode" }
+mdns-sd = "=0.19.1"
 rand = "0.8"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

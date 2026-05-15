@@ -44,6 +44,15 @@ public_base_url = "http://127.0.0.1:8080"
 # Runtime override: KINO_SERVER__CORS_ALLOWED_ORIGINS.
 cors_allowed_origins = []
 
+[server.discovery]
+# Advertise this server on the LAN with Bonjour/mDNS. Optional. Defaults to true.
+# Runtime override: KINO_SERVER__DISCOVERY__ENABLED.
+enabled = true
+
+# Bonjour service instance name. Optional. Defaults to the system hostname.
+# Runtime override: KINO_SERVER__DISCOVERY__INSTANCE_NAME.
+# instance_name = "your hostname here"
+
 [server.session_reaper]
 # Seconds between playback session reaper sweeps. Optional. Defaults to 30.
 # Runtime override: KINO_SERVER__SESSION_REAPER__TICK_SECONDS.

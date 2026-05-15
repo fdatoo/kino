@@ -24,6 +24,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 mod admin_config;
 pub mod auth;
 mod catalog_admin;
+pub mod discovery;
 mod ingestion_orchestrator;
 mod openapi;
 mod pairing;
@@ -320,7 +321,8 @@ pub async fn serve(config: &Config, db: Db) -> Result<()> {
         token_store.clone(),
     );
     let _pairing_reaper =
-        pairing_reaper::spawn(db, token_store, config.server.pairing_reaper.into());
+        pairing_reaper::spawn(db.clone(), token_store, config.server.pairing_reaper.into());
+    let _discovery = spawn_discovery(config, &db).await;
     let serve_result = axum::serve(listener, app).await;
 
     if let Some(intake) = intake {
@@ -328,6 +330,33 @@ pub async fn serve(config: &Config, db: Db) -> Result<()> {
     }
     serve_result?;
     Ok(())
+}
+
+async fn spawn_discovery(config: &Config, db: &Db) -> Option<tokio::task::JoinHandle<()>> {
+    let instance_id = if config.server.discovery.enabled {
+        match kino_db::server_identity::get_or_create(db).await {
+            Ok(instance_id) => instance_id,
+            Err(err) => {
+                tracing::error!(error = %err, "mdns discovery identity lookup failed");
+                return None;
+            }
+        }
+    } else {
+        kino_core::Id::new()
+    };
+
+    match discovery::DiscoveryConfig::from_config_and_runtime(
+        &config.server.discovery,
+        config.server.listen.port(),
+        env!("CARGO_PKG_VERSION"),
+        instance_id,
+    ) {
+        Ok(discovery_config) => Some(discovery::spawn(discovery_config)),
+        Err(err) => {
+            tracing::error!(error = %err, "mdns discovery config failed");
+            None
+        }
+    }
 }
 
 /// Serve the Kino HTTP API on an explicit socket address.
