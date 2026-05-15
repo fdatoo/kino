@@ -835,6 +835,8 @@ pub struct CatalogListQuery {
     pub sort: Option<CatalogSort>,
     /// Optional full-text search across metadata title and cast names.
     pub search: Option<String>,
+    /// Optional LIKE search across title, sibling titles, and release year.
+    pub q: Option<String>,
     /// Optional case-insensitive metadata title substring filter.
     pub title_contains: Option<String>,
     /// Optional filter for items with or without at least one source file.
@@ -881,6 +883,12 @@ impl CatalogListQuery {
     /// Search cached metadata title and cast names.
     pub fn with_search(mut self, search: impl Into<String>) -> Self {
         self.search = Some(search.into());
+        self
+    }
+
+    /// Filter by text across cached title, sibling titles, and release year.
+    pub fn with_q(mut self, q: impl Into<String>) -> Self {
+        self.q = Some(q.into());
         self
     }
 
@@ -1672,6 +1680,42 @@ impl CatalogService {
             builder.push(r#" AND media_metadata_cache.title LIKE "#);
             builder.push_bind(like_contains_pattern(title_contains));
             builder.push(r#" ESCAPE '\' "#);
+        }
+
+        if let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+            let pattern = like_contains_pattern(q);
+            builder.push(
+                r#"
+                AND (
+                    media_metadata_cache.title LIKE
+                "#,
+            );
+            builder.push_bind(pattern.clone());
+            builder.push(
+                r#"
+                    ESCAPE '\'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM media_metadata_cache AS sibling
+                        WHERE sibling.canonical_identity_id = media_items.canonical_identity_id
+                          AND sibling.title LIKE
+                "#,
+            );
+            builder.push_bind(pattern.clone());
+            builder.push(
+                r#"
+                          ESCAPE '\'
+                    )
+                    OR substr(media_metadata_cache.release_date, 1, 4) LIKE
+                "#,
+            );
+            builder.push_bind(pattern);
+            builder.push(
+                r#"
+                    ESCAPE '\'
+                )
+                "#,
+            );
         }
 
         if let Some(has_source_file) = query.has_source_file {
@@ -5198,6 +5242,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_q_matches_movie_title() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let db = kino_db::test_db().await?;
+        let matrix_identity = movie_identity(603);
+        let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
+        insert_catalog_title(&db, matrix, matrix_identity, "The Matrix").await?;
+        let service = CatalogService::new(db);
+
+        let page = service
+            .list(CatalogListQuery::new().with_q("Matrix"))
+            .await?;
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, matrix);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_q_matches_tv_episode_by_sibling_title()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let breaking_bad_identity = tv_identity(1396);
+        let pilot = insert_tmdb_media_item(&db, breaking_bad_identity).await?;
+        let felina =
+            insert_media_item_for_existing_identity(&db, breaking_bad_identity, 5, 16).await?;
+        insert_catalog_title(&db, pilot, breaking_bad_identity, "Breaking Bad").await?;
+        insert_catalog_title(&db, felina, breaking_bad_identity, "Felina").await?;
+        let service = CatalogService::new(db);
+
+        let page = service
+            .list(CatalogListQuery::new().with_q("breaking"))
+            .await?;
+
+        assert_eq!(page.items.len(), 2);
+        assert!(page.items.iter().any(|item| item.id == pilot));
+        assert!(page.items.iter().any(|item| item.id == felina));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_q_matches_year() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let movie_identity = movie_identity(110);
+        let movie = insert_tmdb_media_item(&db, movie_identity).await?;
+        insert_catalog_title_with_release_date(
+            &db,
+            movie,
+            movie_identity,
+            "Whiplash",
+            Some("2014-09-01"),
+        )
+        .await?;
+        let service = CatalogService::new(db);
+
+        let page = service.list(CatalogListQuery::new().with_q("2014")).await?;
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, movie);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_q_escapes_like_wildcards()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let plain_identity = movie_identity(1001);
+        let literal_identity = movie_identity(1002);
+        let plain = insert_tmdb_media_item(&db, plain_identity).await?;
+        let literal = insert_tmdb_media_item(&db, literal_identity).await?;
+        insert_catalog_title(&db, plain, plain_identity, "Plain TV").await?;
+        insert_catalog_title(&db, literal, literal_identity, "Literal %TV%").await?;
+        let service = CatalogService::new(db);
+
+        let page = service.list(CatalogListQuery::new().with_q("%TV%")).await?;
+
+        assert_eq!(
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![literal]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_q_no_match_returns_empty()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let matrix_identity = movie_identity(603);
+        let matrix = insert_tmdb_media_item(&db, matrix_identity).await?;
+        insert_catalog_title(&db, matrix, matrix_identity, "The Matrix").await?;
+        let service = CatalogService::new(db);
+
+        let page = service
+            .list(CatalogListQuery::new().with_q("not-present"))
+            .await?;
+
+        assert!(page.items.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_q_combines_with_kind_and_year_filters()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = kino_db::test_db().await?;
+        let shared_movie_identity = movie_identity(1001);
+        let older_movie_identity = movie_identity(1002);
+        let show_identity = tv_identity(1003);
+        let movie = insert_tmdb_media_item(&db, shared_movie_identity).await?;
+        let older_movie = insert_tmdb_media_item(&db, older_movie_identity).await?;
+        let show = insert_tmdb_media_item(&db, show_identity).await?;
+        insert_catalog_title_with_release_date(
+            &db,
+            movie,
+            shared_movie_identity,
+            "Shared Title",
+            Some("2020-01-01"),
+        )
+        .await?;
+        insert_catalog_title_with_release_date(
+            &db,
+            older_movie,
+            older_movie_identity,
+            "Shared Title",
+            Some("2019-01-01"),
+        )
+        .await?;
+        insert_catalog_title_with_release_date(
+            &db,
+            show,
+            show_identity,
+            "Shared Title",
+            Some("2020-02-01"),
+        )
+        .await?;
+        let service = CatalogService::new(db);
+
+        let page = service
+            .list(
+                CatalogListQuery::new()
+                    .with_q("Shared")
+                    .with_media_kind(MediaItemKind::Movie)
+                    .with_year(2020),
+            )
+            .await?;
+
+        assert_eq!(
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![movie]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn register_transcode_output_persists_row_visible_in_catalog_read()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = kino_db::test_db().await?;
@@ -5489,6 +5685,42 @@ mod tests {
         .bind(canonical_identity_id)
         .bind(media_item_season_number(canonical_identity_id))
         .bind(media_item_episode_number(canonical_identity_id))
+        .bind(now)
+        .bind(now)
+        .execute(db.write_pool())
+        .await?;
+
+        Ok(media_item_id)
+    }
+
+    async fn insert_media_item_for_existing_identity(
+        db: &Db,
+        canonical_identity_id: CanonicalIdentityId,
+        season_number: i64,
+        episode_number: i64,
+    ) -> std::result::Result<Id, sqlx::Error> {
+        let media_item_id = Id::new();
+        let now = Timestamp::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id,
+                media_kind,
+                canonical_identity_id,
+                season_number,
+                episode_number,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(media_item_id)
+        .bind(media_item_kind_for_identity(canonical_identity_id).as_str())
+        .bind(canonical_identity_id)
+        .bind(season_number)
+        .bind(episode_number)
         .bind(now)
         .bind(now)
         .execute(db.write_pool())

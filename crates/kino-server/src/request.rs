@@ -90,6 +90,8 @@ pub(crate) struct ListCatalogItemsQuery {
     pub(crate) sort: Option<String>,
     /// Full-text search across title and cast names.
     pub(crate) search: Option<String>,
+    /// Text search across title, TV sibling titles, and release year.
+    pub(crate) q: Option<String>,
     /// Case-insensitive title substring.
     pub(crate) title_contains: Option<String>,
     /// Filter by source-file presence.
@@ -713,6 +715,9 @@ pub(crate) async fn list_catalog_items(
     }
     if let Some(search) = query.search {
         catalog_query = catalog_query.with_search(search);
+    }
+    if let Some(q) = query.q {
+        catalog_query = catalog_query.with_q(q);
     }
     if let Some(title_contains) = query.title_contains {
         catalog_query = catalog_query.with_title_contains(title_contains);
