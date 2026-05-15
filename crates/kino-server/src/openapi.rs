@@ -7,6 +7,7 @@ use utoipa::openapi::server::Server;
     paths(
         crate::admin_config::get_config,
         crate::catalog_admin::delete_catalog_item,
+        crate::discover::discover,
         crate::pairing::approve_pairing,
         crate::pairing::create_pairing,
         crate::pairing::get_pairing,
@@ -62,6 +63,7 @@ use utoipa::openapi::server::Server;
         (name = "library", description = "Library catalog operations"),
         (name = "playback", description = "Playback state operations"),
         (name = "pairings", description = "Client pairing flow"),
+        (name = "discover", description = "TMDB search proxy"),
         (name = "admin", description = "Administrative operations")
     )
 )]

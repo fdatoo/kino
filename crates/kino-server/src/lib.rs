@@ -24,6 +24,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 mod admin_config;
 pub mod auth;
 mod catalog_admin;
+mod discover;
 pub mod discovery;
 mod ingestion_orchestrator;
 mod openapi;
@@ -184,6 +185,7 @@ fn router_with_config_reocr_tmdb_transcode_and_token_store(
     let live_stream = live_stream_state(db.clone(), &config);
     let transcode_handoff: Arc<dyn TranscodeHandOff> = transcode.service.clone();
     let protected_api = Router::new()
+        .merge(discover::router(tmdb_client.clone()))
         .merge(request::router_with_canonical_transfer(
             db.clone(),
             library_root,

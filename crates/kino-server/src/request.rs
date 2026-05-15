@@ -852,7 +852,8 @@ pub(crate) enum ApiError {
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub(crate) struct ErrorResponse {
-    error: String,
+    /// Human-readable error message.
+    pub(crate) error: String,
 }
 
 impl IntoResponse for ApiError {
