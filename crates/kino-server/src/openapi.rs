@@ -7,6 +7,8 @@ use utoipa::openapi::server::Server;
     paths(
         crate::admin_config::get_config,
         crate::catalog_admin::delete_catalog_item,
+        crate::pairing::create_pairing,
+        crate::pairing::get_pairing,
         crate::playback::get_progress,
         crate::playback::mark_watched,
         crate::playback::record_progress,
@@ -56,6 +58,7 @@ use utoipa::openapi::server::Server;
         (name = "stream", description = "Source media streaming operations"),
         (name = "library", description = "Library catalog operations"),
         (name = "playback", description = "Playback state operations"),
+        (name = "pairings", description = "Client pairing flow"),
         (name = "admin", description = "Administrative operations")
     )
 )]

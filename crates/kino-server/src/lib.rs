@@ -26,6 +26,7 @@ pub mod auth;
 mod catalog_admin;
 mod ingestion_orchestrator;
 mod openapi;
+mod pairing;
 mod playback;
 mod request;
 mod session_admin;
@@ -36,6 +37,8 @@ mod token;
 mod transcode_admin;
 pub mod variant_select;
 pub mod watch_folder_intake;
+
+pub use pairing::{PairingTokenStore, PendingToken};
 
 /// Errors produced by `kino-server`.
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +95,16 @@ pub fn router_with_config(db: Db, config: Config) -> Router {
     router_with_config_and_reocr(db, config, subtitle_reocr)
 }
 
+/// Build the Kino HTTP router with a provided pairing token store.
+pub fn router_with_config_and_token_store(
+    db: Db,
+    config: Config,
+    token_store: PairingTokenStore,
+) -> Router {
+    let subtitle_reocr = SubtitleReocrService::with_default_tools(db.clone(), &config.library_root);
+    router_with_config_reocr_and_token_store(db, config, subtitle_reocr, token_store)
+}
+
 fn router_with_config_and_reocr(
     db: Db,
     config: Config,
@@ -100,6 +113,24 @@ fn router_with_config_and_reocr(
     let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
     let transcode = local_transcode_runtime(db.clone(), &config);
     router_with_config_reocr_tmdb_and_transcode(db, config, subtitle_reocr, tmdb_client, transcode)
+}
+
+fn router_with_config_reocr_and_token_store(
+    db: Db,
+    config: Config,
+    subtitle_reocr: SubtitleReocrService,
+    token_store: PairingTokenStore,
+) -> Router {
+    let tmdb_client = TmdbClient::from_core(&config.tmdb).ok();
+    let transcode = local_transcode_runtime(db.clone(), &config);
+    router_with_config_reocr_tmdb_transcode_and_token_store(
+        db,
+        config,
+        subtitle_reocr,
+        tmdb_client,
+        transcode,
+        token_store,
+    )
 }
 
 fn router_with_config_reocr_and_tmdb(
@@ -123,6 +154,24 @@ fn router_with_config_reocr_tmdb_and_transcode(
     subtitle_reocr: SubtitleReocrService,
     tmdb_client: Option<TmdbClient>,
     transcode: TranscodeRuntime,
+) -> Router {
+    router_with_config_reocr_tmdb_transcode_and_token_store(
+        db,
+        config,
+        subtitle_reocr,
+        tmdb_client,
+        transcode,
+        PairingTokenStore::new(),
+    )
+}
+
+fn router_with_config_reocr_tmdb_transcode_and_token_store(
+    db: Db,
+    config: Config,
+    subtitle_reocr: SubtitleReocrService,
+    tmdb_client: Option<TmdbClient>,
+    transcode: TranscodeRuntime,
+    token_store: PairingTokenStore,
 ) -> Router {
     let auth_state = auth::AuthState { db: db.clone() };
     let public_base_url = config.server.public_base_url.clone();
@@ -152,7 +201,7 @@ fn router_with_config_reocr_tmdb_and_transcode(
         .merge(session_admin::router(db.clone()))
         .merge(admin_config::router(config))
         .merge(transcode_admin::router(
-            db,
+            db.clone(),
             transcode.service,
             transcode.encoders,
         ))
@@ -163,6 +212,7 @@ fn router_with_config_reocr_tmdb_and_transcode(
 
     Router::new()
         .merge(openapi::router(public_base_url))
+        .merge(pairing::router(db, token_store))
         .merge(protected_api)
         .merge(kino_admin::router())
         .layer(cors)

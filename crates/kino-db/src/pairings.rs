@@ -138,6 +138,23 @@ pub async fn approve(db: &Db, id: Id, token_id: Id, approved_at: Timestamp) -> R
     Ok(result.rows_affected())
 }
 
+/// Mark an approved pairing consumed without changing its approval metadata.
+pub async fn mark_consumed(db: &Db, id: Id) -> Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE pairings
+        SET status = ?1
+        WHERE id = ?2 AND status = 'approved'
+        "#,
+    )
+    .bind(PairingStatus::Consumed.as_str())
+    .bind(id)
+    .execute(db.write_pool())
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 /// Delete old terminal pairings.
 pub async fn delete_expired(db: &Db, older_than: Timestamp) -> Result<u64> {
     let result = sqlx::query(
@@ -265,8 +282,7 @@ mod tests {
         assert_eq!(approved_pairing.token_id, Some(replacement_token_id));
         assert_eq!(approved_pairing.approved_at, Some(approved_at));
 
-        let consumed =
-            update_status(&db, pairing.id, PairingStatus::Consumed, Some(approved_at)).await?;
+        let consumed = mark_consumed(&db, pairing.id).await?;
         assert_eq!(consumed, 1);
 
         let consumed_pairing = find_by_code(&db, "123456").await?.unwrap();
@@ -438,7 +454,7 @@ mod tests {
         approve(&db, consumed.id, consumed_token, approved_at).await?;
         update_status(&db, expired_old.id, PairingStatus::Expired, None).await?;
         update_status(&db, expired_new.id, PairingStatus::Expired, None).await?;
-        update_status(&db, consumed.id, PairingStatus::Consumed, Some(approved_at)).await?;
+        mark_consumed(&db, consumed.id).await?;
 
         let deleted = delete_expired(&db, cutoff).await?;
 
